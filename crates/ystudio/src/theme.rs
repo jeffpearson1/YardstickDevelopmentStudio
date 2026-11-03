@@ -376,6 +376,47 @@ pub fn card(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     });
 }
 
+/// Gap between cards, both between rows and between cards in a row.
+pub const CARD_GAP: f32 = 16.0;
+
+/// A row of equal-width, equal-height cards. Each card has a body and a footer;
+/// bodies are padded to the tallest body so footers (usually the card's action)
+/// line up across the row. Heights are measured each frame and applied on the next.
+pub fn card_row<T>(
+    ui: &mut Ui,
+    state: &mut T,
+    id_salt: &str,
+    count: usize,
+    body: impl Fn(&mut T, usize, &mut Ui),
+    footer: impl Fn(&mut T, usize, &mut Ui),
+) {
+    let id = ui.make_persistent_id(("card-row", id_salt));
+    let target: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(0.0);
+    let width = ((ui.available_width() - CARD_GAP * (count as f32 - 1.0)) / count as f32).floor();
+    let mut tallest = 0.0f32;
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = CARD_GAP;
+        for i in 0..count {
+            ui.allocate_ui_with_layout(vec2(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(width);
+                card(ui, |ui| {
+                    let natural = ui.scope(|ui| body(state, i, ui)).response.rect.height();
+                    tallest = tallest.max(natural);
+                    if target > natural {
+                        ui.add_space(target - natural);
+                    }
+                    ui.add_space(4.0);
+                    footer(state, i, ui);
+                });
+            });
+        }
+    });
+    if (tallest - target).abs() > 0.5 {
+        ui.data_mut(|d| d.insert_temp(id, tallest));
+        ui.ctx().request_repaint();
+    }
+}
+
 /// Fluent "Title": the one large heading at the top of a page.
 pub fn page_title(ui: &mut Ui, text: &str) -> Response {
     ui.label(RichText::new(text).size(28.0).family(semibold_family()))
