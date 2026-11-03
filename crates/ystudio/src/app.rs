@@ -871,7 +871,9 @@ impl StudioApp {
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
+        // Every item uses the Caption style so the row shares one baseline.
+        ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 24.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.style_mut().override_text_style = Some(egui::TextStyle::Small);
             match &self.ws {
                 Some(ws) => {
                     let color = match ws.kind {
@@ -880,7 +882,7 @@ impl StudioApp {
                         WorkspaceKind::Production { .. } => theme::red(),
                     };
                     theme::badge(ui, ws.kind.label(), color);
-                    ui.label(RichText::new(ws.root.display().to_string()).small().monospace());
+                    ui.label(RichText::new(ws.root.display().to_string()).weak());
                 }
                 None => {
                     theme::badge(ui, "No workspace", theme::grey());
@@ -895,7 +897,7 @@ impl StudioApp {
             if self.perf.show {
                 ui.separator();
                 let paint = self.perf.paint_ms.map(|p| format!(", paint {p:.1} ms")).unwrap_or_default();
-                ui.label(RichText::new(format!("UI {:.1} ms (max {:.1}){paint}", self.perf.avg_ms, self.perf.max_ms)).small().monospace())
+                ui.label(RichText::new(format!("UI {:.1} ms (max {:.1}){paint}", self.perf.avg_ms, self.perf.max_ms)).weak())
                     .on_hover_text(format!("Time to build (and paint) the last frames, renderer: {}. Ctrl+Shift+P hides this.", self.perf.renderer));
             }
             if let Some(at) = self.status.at
@@ -903,7 +905,7 @@ impl StudioApp {
             {
                 ui.separator();
                 let color = if self.status.error { theme::red() } else { ui.visuals().text_color() };
-                ui.label(RichText::new(&self.status.text).color(color));
+                ui.add(egui::Label::new(RichText::new(&self.status.text).color(color)).truncate());
             }
         });
     }
