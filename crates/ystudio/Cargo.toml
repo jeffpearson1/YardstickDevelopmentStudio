@@ -1,0 +1,26 @@
+[package]
+name = "ystudio"
+description = "Yardstick Development Studio - a GUI IDE for designing, testing and agentically authoring Yardstick recipes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yardstick-studio"
+path = "src/main.rs"
+
+[dependencies]
+ystudio-core = { path = "../ystudio-core" }
+eframe = { version = "0.37", default-features = false, features = ["clipboard", "default_fonts", "links", "wgpu", "persistence"] }
+# Software renderer (used when wgpu only finds a CPU adapter such as WARP).
+egui-winit = { version = "0.37", default-features = false, features = ["clipboard", "links"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+softbuffer = { version = "0.4", default-features = false }
+rayon = "1"
+pollster = "1"
+egui_commonmark = "0.26"
+rfd = "0.17"
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+regex.workspace = true
