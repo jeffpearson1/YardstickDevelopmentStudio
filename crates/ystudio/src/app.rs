@@ -818,10 +818,17 @@ impl StudioApp {
         let pad = egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 0));
         pad.show(ui, |ui| {
             ui.add_space(6.0);
-            ui.label(RichText::new("Yardstick").semibold());
-            ui.label(RichText::new("Development Studio").small().weak());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                theme::brand::image(ui, theme::brand::Art::Mark, 34.0, "Yardstick logo");
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    theme::brand::image(ui, theme::brand::Art::Wordmark, 19.0, "Yardstick");
+                    ui.label(RichText::new("Development Studio").small().weak());
+                });
+            });
         });
-        ui.add_space(12.0);
+        ui.add_space(14.0);
         ui.spacing_mut().item_spacing.y = 0.0;
         for (view, icon, name) in View::NAV {
             let busy = match view {

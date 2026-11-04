@@ -17,11 +17,11 @@
 ```
 yardstick-studio.exe
 ├─ crates/ystudio        GUI (eframe/egui 0.37; wgpu, or a CPU renderer without a GPU)
-│   ├─ main.rs           renderer selection
+│   ├─ main.rs           renderer selection, window icon
 │   ├─ soft/             winit + softbuffer runner and parallel damage-tracking rasterizer
 │   ├─ app.rs            StudioApp: state, job registry, caches, navigation shell
 │   ├─ highlight.rs      YAML/PowerShell syntax highlighting (egui LayoutJob)
-│   ├─ theme.rs          Fluent tokens (light/dark), fonts, nav items, badges, cards, info bars, accent buttons
+│   ├─ theme.rs          Fluent tokens (light/dark), brand art, fonts, nav items, badges, cards, info bars, accent buttons
 │   └─ views/            home, recipes, designer, editor, testbench, agent, batch, icons, runs, docs, promote
 └─ crates/ystudio-core   headless engine; no GUI types; unit tested
     ├─ workspace.rs      open + classify a Yardstick folder, layout from Yardstick.Project.psd1, recipe metadata
@@ -161,6 +161,18 @@ Enforcement:
   WinUI signal colours for success, caution, critical and informational states. Colours
   come from `theme::palette()`; call `theme::green()`/`red()`/`amber()`/`blue()`/`grey()`
   rather than hard-coding values, because they differ between light and dark.
+- **Branding.** The accent is Yardstick orange: `#FE700A` in dark mode and `#C15101`
+  (buttons) / `#AD4901` (text) in light mode, the same hue darkened so white button text
+  and orange text on light surfaces stay above 4.5:1. The artwork in `assets/branding`
+  is derived from the master files (GIMP `.xcf`, kept outside the repo): `mark-*` (drone)
+  and `wordmark-*` for the navigation header, `logo-*` for the README, and
+  `yardstick.ico`/`icon-256.png` (the light mark on a charcoal tile, simplified to the box
+  and ruler arms at 32 px and below). `-dark` files are for dark backgrounds. The
+  binary embeds the PNGs (`theme::brand`), sets the window icon at runtime, and
+  `crates/ystudio/build.rs` embeds the `.ico` with `winresource` for Explorer and the
+  taskbar. `theme::brand::image` resamples the artwork with premultiplied alpha to the
+  exact device-pixel size and caches the texture, because neither renderer builds
+  mipmaps.
 - **Fonts.** `theme::install_fonts` loads Segoe UI Variable twice from `%WINDIR%\Fonts`, at
   `wght` 400 for body text and 600 for the `semibold` family (`FluentText::semibold`; Fluent
   uses weight, not colour, for emphasis), falling back to static Segoe UI on Windows 10.

@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/branding/logo-dark.png">
+    <img src="assets/branding/logo-light.png" alt="Yardstick" width="280">
+  </picture>
+</p>
+
 # Yardstick Development Studio
 
 A desktop IDE, written in Rust with [egui](https://github.com/emilk/egui), for building

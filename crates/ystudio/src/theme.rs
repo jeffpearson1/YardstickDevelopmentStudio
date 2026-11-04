@@ -35,6 +35,8 @@ pub struct Palette {
     pub accent_pressed: Color32,
     pub on_accent: Color32,
     pub accent_text: Color32,
+    /// Tint behind accent-coloured text, e.g. numbered badges.
+    pub accent_bg: Color32,
     pub overlay: Color32,
     pub overlay_stroke: Color32,
     pub success: Color32,
@@ -69,11 +71,12 @@ pub const DARK: Palette = Palette {
     subtle_pressed: hex(0x292929),
     text: hex(0xFFFFFF),
     text_secondary: hex(0xC5C5C5),
-    accent: hex(0x60CDFF),
-    accent_hover: hex(0x5AB9E6),
-    accent_pressed: hex(0x52A5CC),
+    accent: hex(0xFE700A),
+    accent_hover: hex(0xE8670A),
+    accent_pressed: hex(0xD05E0C),
     on_accent: hex(0x000000),
-    accent_text: hex(0x99EBFF),
+    accent_text: hex(0xFE700A),
+    accent_bg: hex(0x3A2614),
     overlay: hex(0x2C2C2C),
     overlay_stroke: hex(0x454545),
     success: hex(0x6CCB5F),
@@ -104,11 +107,12 @@ pub const LIGHT: Palette = Palette {
     subtle_pressed: hex(0xEDEDED),
     text: hex(0x1A1A1A),
     text_secondary: hex(0x5F5F5F),
-    accent: hex(0x005FB8),
-    accent_hover: hex(0x196EBF),
-    accent_pressed: hex(0x3380C6),
+    accent: hex(0xC15101),
+    accent_hover: hex(0xAD4901),
+    accent_pressed: hex(0x9E4301),
     on_accent: hex(0xFFFFFF),
-    accent_text: hex(0x005FB8),
+    accent_text: hex(0xAD4901),
+    accent_bg: hex(0xFFE8D6),
     overlay: hex(0xFFFFFF),
     overlay_stroke: hex(0xDDDDDD),
     success: hex(0x0F7B0F),
@@ -151,7 +155,7 @@ pub fn accent() -> Color32 {
 /// The background that pairs with a signal colour, for badges and info bars.
 pub fn signal_bg(color: Color32) -> Color32 {
     let p = palette();
-    [(p.success, p.success_bg), (p.caution, p.caution_bg), (p.critical, p.critical_bg), (p.info, p.info_bg), (p.neutral, p.neutral_bg), (p.accent_text, p.info_bg)]
+    [(p.success, p.success_bg), (p.caution, p.caution_bg), (p.critical, p.critical_bg), (p.info, p.info_bg), (p.neutral, p.neutral_bg), (p.accent_text, p.accent_bg)]
         .into_iter()
         .find(|(fg, _)| *fg == color)
         .map(|(_, bg)| bg)
@@ -172,6 +176,80 @@ pub mod icon {
     pub const BOOK: &str = "\u{E736}";
     pub const UPLOAD: &str = "\u{E898}";
     pub const CONSOLE: &str = "\u{E756}";
+}
+
+/// Yardstick brand artwork (assets/branding), embedded in the binary.
+pub mod brand {
+    use std::sync::OnceLock;
+
+    use eframe::egui::{self, Response, Ui, vec2};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum Art {
+        /// The drone carrying a checked box.
+        Mark,
+        /// The two-tone "yardstick" logotype.
+        Wordmark,
+    }
+
+    /// Brand orange is `#FE700A`; the palette's `accent` uses it in dark mode and
+    /// a darker shade of the same hue in light mode, for text contrast.
+    const ICON_PNG: &[u8] = include_bytes!("../../../assets/branding/icon-256.png");
+
+    fn png(art: Art, dark: bool) -> &'static [u8] {
+        match (art, dark) {
+            (Art::Mark, true) => include_bytes!("../../../assets/branding/mark-dark.png"),
+            (Art::Mark, false) => include_bytes!("../../../assets/branding/mark-light.png"),
+            (Art::Wordmark, true) => include_bytes!("../../../assets/branding/wordmark-dark.png"),
+            (Art::Wordmark, false) => include_bytes!("../../../assets/branding/wordmark-light.png"),
+        }
+    }
+
+    /// Decoded once, with premultiplied alpha so resampling doesn't pull in the
+    /// colour of transparent pixels (dark fringes around light artwork).
+    fn source(art: Art, dark: bool) -> &'static image::RgbaImage {
+        static CELLS: [OnceLock<image::RgbaImage>; 4] = [const { OnceLock::new() }; 4];
+        let slot = (art as usize) * 2 + dark as usize;
+        CELLS[slot].get_or_init(|| {
+            let mut img = image::load_from_memory(png(art, dark)).map(|i| i.to_rgba8()).unwrap_or_else(|_| image::RgbaImage::new(1, 1));
+            for p in img.pixels_mut() {
+                let a = p[3] as u16;
+                for c in 0..3 {
+                    p[c] = ((p[c] as u16 * a + 127) / 255) as u8;
+                }
+            }
+            img
+        })
+    }
+
+    /// Paints `art` at `height` points for the current theme. The artwork is
+    /// resampled on the CPU to the exact device pixel size (and cached), so it
+    /// stays sharp on both renderers, which don't generate mipmaps.
+    pub fn image(ui: &mut Ui, art: Art, height: f32, label: &str) -> Response {
+        let dark = ui.visuals().dark_mode;
+        let src = source(art, dark);
+        let size = vec2((height * src.width() as f32 / src.height() as f32).round(), height);
+        let ppp = ui.ctx().pixels_per_point();
+        let (w, h) = (((size.x * ppp).round() as u32).max(1), ((size.y * ppp).round() as u32).max(1));
+        let id = egui::Id::unique(("brand-art", art, dark, w, h));
+        let tex = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(id)).unwrap_or_else(|| {
+            let scaled = image::imageops::resize(src, w, h, image::imageops::FilterType::Lanczos3);
+            let ci = egui::ColorImage::from_rgba_premultiplied([w as usize, h as usize], scaled.as_raw());
+            let tex = ui.ctx().load_texture(format!("brand-{w}x{h}"), ci, egui::TextureOptions::LINEAR);
+            ui.ctx().data_mut(|d| d.insert_temp(id, tex.clone()));
+            tex
+        });
+        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, label));
+        egui::Image::new((tex.id(), size)).paint_at(ui, rect);
+        resp
+    }
+
+    /// The app icon for the window title bar and taskbar.
+    pub fn window_icon() -> Option<egui::IconData> {
+        let img = image::load_from_memory(ICON_PNG).ok()?.to_rgba8();
+        Some(egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() })
+    }
 }
 
 /// Family names registered by [`install_fonts`].

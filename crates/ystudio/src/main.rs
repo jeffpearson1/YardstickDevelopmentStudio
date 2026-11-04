@@ -9,10 +9,13 @@ mod views;
 use eframe::{egui, wgpu};
 
 fn main() -> anyhow::Result<()> {
-    let viewport = egui::ViewportBuilder::default()
+    let mut viewport = egui::ViewportBuilder::default()
         .with_title("Yardstick Development Studio")
         .with_inner_size([1400.0, 900.0])
         .with_min_inner_size([900.0, 600.0]);
+    if let Some(icon) = theme::brand::window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
 
     if let Some(reason) = software_reason() {
         return soft::run(viewport, &reason);
