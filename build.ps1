@@ -6,9 +6,10 @@ Builds, tests or runs Yardstick Development Studio with the Rust toolchain on PA
 .\build.ps1             # release build -> target\release\yardstick-studio.exe
 .\build.ps1 -Task test  # run the unit tests
 .\build.ps1 -Task run   # build and launch (debug)
+.\build.ps1 -Task installer  # release build + MSI -> target\installer\
 #>
 param(
-    [ValidateSet('build', 'test', 'run', 'check', 'clippy')]
+    [ValidateSet('build', 'test', 'run', 'check', 'clippy', 'installer')]
     [string]$Task = 'build',
     [switch]$Debug,
     # Extra arguments passed through to cargo, e.g. -CargoArgs '--', '--ignored'
@@ -48,6 +49,11 @@ try {
         'run'    { cargo run -p ystudio @CargoArgs }
         'check'  { cargo check --workspace @CargoArgs }
         'clippy' { cargo clippy --workspace --all-targets @CargoArgs -- -D warnings }
+        'installer' {
+            cargo build --release @CargoArgs
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            & (Join-Path $PSScriptRoot 'installer\build-installer.ps1')
+        }
     }
     exit $LASTEXITCODE
 }

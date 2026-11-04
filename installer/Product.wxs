@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Yardstick Development Studio installer (WiX Toolset v5).
+  Build with: .\build.ps1 -Task installer
+
+  A per-machine x64 MSI: silent installs (msiexec /i <msi> /qn) and Intune
+  line-of-business deployment work out of the box, and installing a newer
+  version upgrades in place.
+
+  The UpgradeCode identifies the product across versions and must never change.
+  The ProductCode is generated per build, so every version is a major upgrade.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="Yardstick Development Studio"
+           Manufacturer="Yardstick contributors"
+           Version="$(var.Version)"
+           UpgradeCode="EFCBC455-6792-43E0-9E60-42CD976092C6"
+           Scope="perMachine"
+           Compressed="yes"
+           Language="1033">
+    <SummaryInformation Description="Yardstick Development Studio $(var.Version)" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="AppIcon.ico" SourceFile="$(var.Assets)\yardstick.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/jeffpearson1/YardstickDevelopmentStudio" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/jeffpearson1/YardstickDevelopmentStudio/issues" />
+    <!-- WixUI_Minimal sets ARPNOMODIFY; there is nothing to repair beyond reinstalling. -->
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Yardstick Development Studio" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Component Id="StudioExe" Bitness="always64">
+        <File Id="StudioExe" Source="$(var.Exe)" Name="yardstick-studio.exe" KeyPath="yes">
+          <Shortcut Id="StartMenuShortcut"
+                    Directory="ProgramMenuFolder"
+                    Name="Yardstick Development Studio"
+                    Description="Design, test and agentically author Yardstick recipes"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Icon="AppIcon.ico"
+                    Advertise="yes" />
+        </File>
+      </Component>
+      <Component Id="LicenseFile" Bitness="always64">
+        <File Id="LicenseFile" Source="$(var.RepoRoot)\LICENSE" Name="LICENSE.txt" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="Yardstick Development Studio" Level="1">
+      <ComponentGroupRef Id="AppFiles" />
+    </Feature>
+
+    <!-- Welcome + licence, progress, finish. Silent installs skip the UI. -->
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+    <WixVariable Id="WixUIDialogBmp" Value="$(var.InstallerDir)\dialog.bmp" />
+    <WixVariable Id="WixUIBannerBmp" Value="$(var.InstallerDir)\banner.bmp" />
+  </Package>
+</Wix>

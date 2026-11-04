@@ -55,6 +55,7 @@ See [docs/DESIGN.md](docs/DESIGN.md) for the architecture and the safety model.
 .\build.ps1 -Task run       # debug build and launch
 .\build.ps1 -Task test      # unit tests (headless engine + GUI helpers)
 .\build.ps1 -Task clippy    # lint with -D warnings
+.\build.ps1 -Task installer # release build + MSI (see Installer below)
 .\build.ps1 -Task build -Debug
 ```
 
@@ -77,6 +78,38 @@ $env:YSTUDIO_TEST_PRODUCTION = 'C:\Intune\Yardstick'  # used read-only, for icon
 
 > If a build fails with `os error 32 ... being used by another process`, real-time
 > antivirus scanning is locking a file in `target\`. Run the build again.
+
+## Installer
+
+```powershell
+.\build.ps1 -Task installer   # release build + MSI -> target\installer\YardstickDevelopmentStudio-<version>-x64.msi
+```
+
+The installer is a per-machine x64 MSI built with [WiX Toolset](https://wixtoolset.org)
+5.0.2, which is MS-RL licensed. WiX 6 and later charge an Open Source Maintenance Fee, so
+the version is pinned. The first run downloads WiX, checks its SHA-256, and unpacks it into
+`.tools\`. This needs no admin rights and installs nothing system-wide. The executable only
+uses DLLs that ship with Windows, so the MSI installs just `yardstick-studio.exe` and
+`LICENSE.txt` into `Program Files\Yardstick Development Studio`, plus a Start menu shortcut.
+
+| Task | Command |
+| --- | --- |
+| Interactive install | Double-click the MSI. It shows the licence, then asks for admin rights. |
+| Silent install | `msiexec /i YardstickDevelopmentStudio-<version>-x64.msi /qn` |
+| Silent uninstall | `msiexec /x YardstickDevelopmentStudio-<version>-x64.msi /qn` |
+
+To deploy with Intune, add the MSI as a *Line-of-business app* (or wrap it as a Win32
+app), install it in the device context, and detect it by its MSI product code. Every
+build gets a new product code and shares one UpgradeCode, so installing a newer version
+replaces the old one, and installing an older version over a newer one is refused. Bump
+`version` in the root `Cargo.toml` for each release; it becomes the MSI version.
+
+Settings in `%APPDATA%\YardstickStudio` are left in place on uninstall. The MSI and
+executable aren't code-signed yet, so SmartScreen may warn on first run. Sign both with
+`signtool` before distributing widely.
+
+The installer artwork in `installer\*.bmp` comes from `assets\branding`. To regenerate it,
+run `python installer\make-art.py`, which needs Pillow.
 
 ## Performance
 
