@@ -26,6 +26,17 @@ pub struct Settings {
     pub powershell_path: Option<PathBuf>,
     pub dark_mode: bool,
     pub editor_font_size: f32,
+    /// Line numbers in the YAML editor and the Designer's script fields.
+    pub line_numbers: bool,
+    /// `git fetch` when a workspace opens and on every recipe Refresh.
+    pub auto_git_fetch: bool,
+    /// Run Yardstick's shared icon/recipe-override sync on open and Refresh
+    /// (only for workspaces with `syncSharedContent: true`).
+    pub auto_sync_shared: bool,
+    /// Check GitHub Releases for a newer Studio at startup.
+    pub auto_check_updates: bool,
+    /// A version the user chose to skip; startup checks stay quiet about it.
+    pub skipped_update: String,
 }
 
 impl Default for Settings {
@@ -41,6 +52,11 @@ impl Default for Settings {
             powershell_path: None,
             dark_mode: true,
             editor_font_size: 13.5,
+            line_numbers: true,
+            auto_git_fetch: true,
+            auto_sync_shared: true,
+            auto_check_updates: true,
+            skipped_update: String::new(),
         }
     }
 }

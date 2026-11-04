@@ -40,6 +40,9 @@ pub struct ProcessSpec {
     /// Open in its own visible console instead of capturing output
     /// (for interactive scripts such as Install-Yardstick.ps1).
     pub new_console: bool,
+    /// The program writes progress, not errors, to stderr (git does), so the
+    /// log should not colour it as an error.
+    pub stderr_is_progress: bool,
 }
 
 impl ProcessSpec {
@@ -51,7 +54,13 @@ impl ProcessSpec {
             cwd: cwd.to_path_buf(),
             env: Vec::new(),
             new_console: false,
+            stderr_is_progress: false,
         }
+    }
+
+    pub fn stderr_is_progress(mut self) -> Self {
+        self.stderr_is_progress = true;
+        self
     }
 
     pub fn arg(mut self, a: impl Into<String>) -> Self {
@@ -196,6 +205,28 @@ impl RunningProcess {
     }
 }
 
+/// Runs a short command to completion without a window and returns its stdout.
+/// Fails with stderr when it exits non-zero.
+pub fn run_capture(spec: &ProcessSpec) -> Result<String> {
+    let mut cmd = spec.command();
+    cmd.stdin(Stdio::null());
+    let out = cmd.output().with_context(|| format!("starting {}", spec.program.display()))?;
+    if !out.status.success() {
+        anyhow::bail!("{}", decode(&out.stderr).trim());
+    }
+    Ok(decode(&out.stdout))
+}
+
+/// Starts a process without a window and does not track it; it outlives the Studio.
+pub fn spawn_hidden(spec: &ProcessSpec) -> Result<()> {
+    let mut spec = spec.clone();
+    spec.new_console = false;
+    let mut cmd = spec.command();
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.spawn().with_context(|| format!("starting {}", spec.program.display()))?;
+    Ok(())
+}
+
 /// Launches a process in its own console window and does not track it.
 pub fn launch_detached(spec: &ProcessSpec) -> Result<()> {
     let mut spec = spec.clone();
@@ -218,8 +249,7 @@ fn pump<R: Read + Send + 'static>(
             match reader.read_until(b'\n', &mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
-                    let text = strip_ansi(&decode(&buf));
-                    let text = text.trim_end_matches(['\r', '\n']).to_string();
+                    let text = clean_line(&decode(&buf));
                     if tx.send(Event::Line(LogLine { stream, text })).is_err() {
                         break;
                     }
@@ -230,6 +260,14 @@ fn pump<R: Read + Send + 'static>(
             }
         }
     })
+}
+
+/// Strips colours and the line ending. Progress meters (git --progress) redraw
+/// with '\r', so only the final state of such a line is kept.
+fn clean_line(raw: &str) -> String {
+    let text = strip_ansi(raw);
+    let text = text.trim_end_matches(['\r', '\n']);
+    text.rsplit('\r').next().unwrap_or(text).to_string()
 }
 
 /// Decodes console bytes: UTF-8 when valid, otherwise Windows-1252-ish lossy.
@@ -304,6 +342,44 @@ pub fn which(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Re-reads the machine and user PATH from the registry into this process, so
+/// tools installed while the Studio is open (git from Company Portal, say) are
+/// found without a restart. Entries only this process had are kept at the end.
+#[cfg(windows)]
+pub fn refresh_path() -> Result<()> {
+    let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    let ps = PathBuf::from(system_root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    let script = "foreach ($t in 'Machine', 'User') { [Environment]::ExpandEnvironmentVariables([string][Environment]::GetEnvironmentVariable('Path', $t)) }";
+    let spec = ProcessSpec::new("refresh PATH", ps, &std::env::temp_dir()).args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    let fresh = run_capture(&spec)?;
+    let current = std::env::var("PATH").unwrap_or_default();
+    let merged = merge_path(&fresh.lines().collect::<Vec<_>>().join(";"), &current);
+    // SAFETY: Windows environment access is serialised by the OS and std; the
+    // Studio's other threads only read process output and never PATH.
+    unsafe { std::env::set_var("PATH", merged) };
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn refresh_path() -> Result<()> {
+    Ok(())
+}
+
+/// `fresh` entries in order, then entries of `current` not already present
+/// (compared case-insensitively, ignoring a trailing backslash).
+fn merge_path(fresh: &str, current: &str) -> String {
+    let key = |s: &str| s.trim().trim_end_matches(['\\', '/']).to_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for entry in fresh.split(';').chain(current.split(';')) {
+        let e = entry.trim();
+        if !e.is_empty() && seen.insert(key(e)) {
+            out.push(e.to_string());
+        }
+    }
+    out.join(";")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +419,18 @@ mod tests {
         }
         assert!(!p.is_running());
         assert!(p.cancelled);
+    }
+
+    #[test]
+    fn merges_path_fresh_first_without_duplicates() {
+        let merged = merge_path(r"C:\Windows;C:\Program Files\Git\cmd\;;", r"C:\windows\;C:\Users\me\bin;C:\Program Files\Git\cmd");
+        assert_eq!(merged, r"C:\Windows;C:\Program Files\Git\cmd\;C:\Users\me\bin");
+    }
+
+    #[test]
+    fn keeps_last_progress_frame() {
+        assert_eq!(clean_line("Receiving objects:  10%\rReceiving objects: 100% (5/5), done.\r\n"), "Receiving objects: 100% (5/5), done.");
+        assert_eq!(clean_line("plain\r\n"), "plain");
     }
 
     #[test]

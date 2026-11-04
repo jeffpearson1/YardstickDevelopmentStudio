@@ -8,6 +8,7 @@ use std::time::{Instant, SystemTime};
 use eframe::egui::{self, RichText, Ui};
 use egui_commonmark::CommonMarkCache;
 use ystudio_core::agent::{Change, Snapshot};
+use ystudio_core::git;
 use ystudio_core::harness::{self, InstallTestOptions};
 use ystudio_core::lint::{self, Diagnostic, LintContext};
 use ystudio_core::process::{ProcessSpec, RunningProcess, Stream, Waker, fmt_duration};
@@ -104,6 +105,9 @@ pub enum JobKind {
     BatchExtract { batch_id: String, backend: String },
     Clone { dest: PathBuf },
     Publish { what_if: bool },
+    GitFetch,
+    GitPull,
+    SyncShared,
 }
 
 pub struct Job {
@@ -260,7 +264,8 @@ pub struct StudioApp {
     pub verdicts: BTreeMap<String, (Verdict, String)>,
     pub runs: Vec<InstallRun>,
     pub perf: Perf,
-
+    /// Branch and ahead/behind of the open workspace; `None` if it is not a git clone.
+    pub git_status: Option<Result<git::Status, String>>,
     pub home: views::home::HomeState,
     pub library: views::recipes::LibraryState,
     pub bench: BenchState,
@@ -270,6 +275,7 @@ pub struct StudioApp {
     pub runs_ui: views::runs::RunsState,
     pub docs: views::docs::DocsState,
     pub promote: views::promote::PromoteState,
+    pub update: views::update::UpdateState,
 }
 
 pub struct BenchState {
@@ -335,6 +341,7 @@ impl StudioApp {
             verdicts: BTreeMap::new(),
             runs: Vec::new(),
             perf: Perf::new(),
+            git_status: None,
             library: Default::default(),
             bench: Default::default(),
             agent: Default::default(),
@@ -343,6 +350,7 @@ impl StudioApp {
             runs_ui: Default::default(),
             docs: Default::default(),
             promote: Default::default(),
+            update: Default::default(),
         };
         theme::install_fonts(egui_ctx);
         app.apply_theme(egui_ctx);
@@ -357,6 +365,9 @@ impl StudioApp {
             app.open_workspace(&path);
         }
         app.handle_args(std::env::args().skip(1).collect());
+        if app.settings.auto_check_updates {
+            views::update::start_check(&mut app, true);
+        }
         app
     }
 
@@ -366,6 +377,12 @@ impl StudioApp {
         let mut it = args.into_iter();
         while let Some(a) = it.next() {
             match a.as_str() {
+                "--updated" => {
+                    if let Some(code) = it.next() {
+                        let log = it.next();
+                        views::update::report_installed(self, &code, log.as_deref());
+                    }
+                }
                 "--icons" => {
                     if let Some(name) = it.next() {
                         self.icons.prepare(&name, "", "", "");
@@ -429,6 +446,8 @@ impl StudioApp {
                 self.refresh_recipes();
                 self.refresh_runs();
                 self.notify(format!("Opened {} - {label}", path.display()));
+                self.refresh_git_status();
+                self.refresh_remote(false);
             }
             Err(e) => {
                 self.ws_error = Some(format!("{e:#}"));
@@ -465,6 +484,81 @@ impl StudioApp {
             has_skill: ws.has_skill(),
             documents: ws.documents(),
         };
+    }
+
+    /// Reads the branch and ahead/behind counts (local only, no network).
+    pub fn refresh_git_status(&mut self) {
+        self.git_status = self
+            .ws
+            .as_ref()
+            .filter(|w| git::is_repo(&w.root))
+            .map(|w| git::status(&w.root).map_err(|e| format!("{e:#}")));
+    }
+
+    fn job_running(&self, pred: impl Fn(&JobKind) -> bool) -> bool {
+        self.jobs.iter().any(|j| pred(&j.kind) && j.proc.is_running())
+    }
+
+    /// Brings the workspace up to date with its remotes: `git fetch` and
+    /// Yardstick's shared icon/override sync. `manual` runs both regardless of
+    /// the automatic settings; otherwise each follows its setting. Production
+    /// folders and folders without git/sync are skipped quietly.
+    pub fn refresh_remote(&mut self, manual: bool) {
+        if manual || self.settings.auto_git_fetch {
+            self.start_git_fetch(manual);
+        }
+        if manual || self.settings.auto_sync_shared {
+            self.start_shared_sync(manual);
+        }
+    }
+
+    /// `git fetch`. With `report`, explains why it could not run.
+    pub fn start_git_fetch(&mut self, report: bool) {
+        let Some(ws) = &self.ws else { return };
+        if !ws.is_writable() || !git::is_repo(&ws.root) || self.job_running(|k| matches!(k, JobKind::GitFetch | JobKind::GitPull)) {
+            if report && !ws.is_writable() {
+                self.notify("Not fetching: production folders are read-only in the Studio.");
+            }
+            return;
+        }
+        match git::fetch(ws) {
+            Ok(spec) => {
+                self.start_background_job(spec, JobKind::GitFetch);
+            }
+            Err(e) if report => self.error(format!("{e:#}")),
+            Err(_) => {}
+        }
+    }
+
+    pub fn start_git_pull(&mut self) {
+        let Some(ws) = &self.ws else { return };
+        if self.job_running(|k| matches!(k, JobKind::GitFetch | JobKind::GitPull)) {
+            return;
+        }
+        match git::pull(ws) {
+            Ok(spec) => {
+                self.start_job(spec, JobKind::GitPull);
+            }
+            Err(e) => self.error(format!("{e:#}")),
+        }
+    }
+
+    /// Yardstick's shared-content sync. With `report`, explains why it could not run.
+    pub fn start_shared_sync(&mut self, report: bool) {
+        let Some(ws) = &self.ws else { return };
+        if !ws.is_writable() || !ws.sync_shared_content || self.job_running(|k| matches!(k, JobKind::SyncShared)) {
+            if report && ws.is_writable() && !ws.sync_shared_content {
+                self.notify("Shared sync is off for this workspace (syncSharedContent in Local\\preferences.yaml).");
+            }
+            return;
+        }
+        match harness::sync_shared_content(ws, &self.pwsh()) {
+            Ok(spec) => {
+                self.start_background_job(spec, JobKind::SyncShared);
+            }
+            Err(e) if report => self.error(format!("{e:#}")),
+            Err(_) => {}
+        }
     }
 
     pub fn refresh_runs(&mut self) {
@@ -607,6 +701,16 @@ impl StudioApp {
         }
     }
 
+    /// Like [`Self::start_job`], but leaves the console on the job it was showing.
+    pub fn start_background_job(&mut self, spec: ProcessSpec, kind: JobKind) -> Option<u64> {
+        let shown = self.console_job;
+        let id = self.start_job(spec, kind);
+        if shown.is_some() {
+            self.console_job = shown;
+        }
+        id
+    }
+
     pub fn job(&self, id: u64) -> Option<&Job> {
         self.jobs.iter().find(|j| j.id == id)
     }
@@ -722,6 +826,55 @@ impl StudioApp {
                     self.error(format!("{label} failed - see the console."));
                 }
             }
+            JobKind::GitFetch => {
+                self.refresh_git_status();
+                match (&self.git_status, ok) {
+                    (_, false) => self.error("git fetch failed - see the console."),
+                    (Some(Ok(s)), true) if s.behind > 0 => {
+                        let msg = format!("{} new commit(s) on {} - Pull to update.", s.behind, s.upstream.as_deref().unwrap_or("upstream"));
+                        self.notify(msg);
+                    }
+                    _ => {}
+                }
+            }
+            JobKind::GitPull => {
+                self.refresh_git_status();
+                if ok {
+                    self.refresh_recipes();
+                    self.reload_clean_recipe();
+                    self.notify("Pulled the latest Yardstick.");
+                } else {
+                    self.console_job = Some(id);
+                    self.console_open = true;
+                    self.error("git pull failed (it only fast-forwards) - see the console.");
+                }
+            }
+            JobKind::SyncShared => {
+                self.refresh_recipes();
+                if let Some(r) = &mut self.recipe {
+                    // Icon existence may have changed.
+                    r.lint_rev = 0;
+                }
+                if ok {
+                    let summary = text.lines().rev().find(|l| l.starts_with("Synced ")).map(str::to_string);
+                    self.notify(summary.unwrap_or_else(|| "Synced shared icons and recipe overrides.".into()));
+                } else {
+                    self.error("Shared icon/override sync failed - see the console.");
+                }
+            }
+        }
+    }
+
+    /// Re-reads the open recipe from disk when it has no unsaved edits.
+    fn reload_clean_recipe(&mut self) {
+        let Some(r) = &self.recipe else { return };
+        if r.dirty() {
+            return;
+        }
+        let on_disk = ystudio_core::read_text(&r.path).ok();
+        if on_disk.as_deref() != Some(r.saved.as_str()) && r.path.is_file() {
+            let p = r.path.clone();
+            self.open_recipe(&p);
         }
     }
 
@@ -901,6 +1054,7 @@ impl StudioApp {
             if ui.selectable_label(self.console_open, console_label).clicked() {
                 self.console_open = !self.console_open;
             }
+            views::update::badge(self, ui);
             if self.perf.show {
                 ui.separator();
                 let paint = self.perf.paint_ms.map(|p| format!(", paint {p:.1} ms")).unwrap_or_default();
@@ -1016,6 +1170,7 @@ pub fn job_log(ui: &mut Ui, proc: &mut RunningProcess, salt: &str) {
     let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
     let n = proc.lines.len();
     let normal = ui.visuals().text_color();
+    let stderr_color = if proc.spec.stderr_is_progress { ui.visuals().weak_text_color() } else { theme::red() };
     egui::ScrollArea::both()
         .id_salt(("job-log", salt, proc.pid))
         .stick_to_bottom(true)
@@ -1024,7 +1179,7 @@ pub fn job_log(ui: &mut Ui, proc: &mut RunningProcess, salt: &str) {
             for line in &proc.lines[range] {
                 let color = match line.stream {
                     Stream::Stdout => normal,
-                    Stream::Stderr => theme::red(),
+                    Stream::Stderr => stderr_color,
                     Stream::Studio => theme::blue(),
                 };
                 ui.label(RichText::new(&line.text).monospace().color(color));
@@ -1048,6 +1203,7 @@ impl StudioApp {
         let frame_start = Instant::now();
         let ctx = ui.ctx().clone();
         self.poll_jobs();
+        views::update::poll(self);
         self.shortcuts(&ctx);
         self.relint();
         if self.running_jobs() > 0 {

@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod fields;
+pub mod git;
 pub mod harness;
 pub mod icons;
 pub mod intake;
@@ -13,6 +14,7 @@ pub mod process;
 pub mod recipe;
 pub mod results;
 pub mod settings;
+pub mod update;
 pub mod workspace;
 
 pub use workspace::{Workspace, WorkspaceKind};

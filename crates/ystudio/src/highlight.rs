@@ -3,7 +3,7 @@
 use std::sync::{Arc, LazyLock};
 
 use eframe::egui::cache::{ComputerMut, FrameCache};
-use eframe::egui::{Color32, FontId, Galley, TextFormat, Ui, text::LayoutJob};
+use eframe::egui::{self, Color32, FontId, Galley, TextFormat, Ui, text::LayoutJob};
 use regex::Regex;
 
 struct Palette {
@@ -107,6 +107,44 @@ pub fn yaml_galley(ui: &Ui, text: &str, font_size: f32, dark: bool, wrap: f32) -
     });
     job.wrap.max_width = wrap;
     ui.ctx().fonts_mut(|f| f.layout_job(job))
+}
+
+/// Shows a code `TextEdit` with an optional line-number gutter on its left.
+/// `line_count` sizes the gutter before the text is laid out. Wrapped
+/// continuation rows are not numbered.
+pub fn code_edit(ui: &mut Ui, edit: egui::TextEdit<'_>, line_numbers: bool, line_count: usize, font_size: f32) -> egui::Response {
+    if !line_numbers {
+        return edit.show(ui).response.response;
+    }
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let font = FontId::monospace(font_size);
+        let color = ui.visuals().weak_text_color();
+        let widest = ui.painter().layout_no_wrap(line_count.max(1).to_string(), font.clone(), color).size().x;
+        let (gutter, _) = ui.allocate_exact_size(egui::vec2(widest + 8.0, 0.0), egui::Sense::hover());
+        let out = edit.show(ui);
+        let clip = ui.clip_rect();
+        let painter = ui.painter();
+        let mut line = 1usize;
+        let mut line_start = true;
+        for row in &out.galley.rows {
+            let y = out.galley_pos.y + row.pos.y;
+            if line_start && y <= clip.max.y && y + row.rect().height() >= clip.min.y {
+                painter.text(egui::pos2(gutter.right() - 4.0, y), egui::Align2::RIGHT_TOP, line.to_string(), font.clone(), color);
+            }
+            line_start = row.ends_with_newline;
+            if line_start {
+                line += 1;
+            }
+        }
+        out.response.response
+    })
+    .inner
+}
+
+/// Number of lines in `text`, as the gutter numbers them.
+pub fn line_count(text: &str) -> usize {
+    text.bytes().filter(|b| *b == b'\n').count() + 1
 }
 
 #[cfg(test)]

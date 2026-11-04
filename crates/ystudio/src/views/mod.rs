@@ -9,8 +9,9 @@ pub mod promote;
 pub mod recipes;
 pub mod runs;
 pub mod testbench;
+pub mod update;
 
-use eframe::egui::{RichText, Ui};
+use eframe::egui::{self, RichText, Ui};
 
 use crate::app::StudioApp;
 use crate::theme::{self, FluentText as _};
@@ -66,6 +67,82 @@ pub fn production_banner(app: &StudioApp, ui: &mut Ui) {
             ));
         });
         ui.add_space(6.0);
+    }
+}
+
+/// Branch, ahead/behind, and Fetch / Pull / Sync buttons for the open workspace.
+pub fn git_bar(app: &mut StudioApp, ui: &mut Ui) {
+    use crate::app::JobKind;
+    let Some(ws) = &app.ws else { return };
+    let writable = ws.is_writable();
+    let sync_on = ws.sync_shared_content;
+    let running = |k: fn(&JobKind) -> bool| app.jobs.iter().any(|j| k(&j.kind) && j.proc.is_running());
+    let fetching = running(|k| matches!(k, JobKind::GitFetch));
+    let pulling = running(|k| matches!(k, JobKind::GitPull));
+    let syncing = running(|k| matches!(k, JobKind::SyncShared));
+    let (mut fetch, mut pull, mut sync) = (false, false, false);
+    ui.horizontal_wrapped(|ui| {
+        match &app.git_status {
+            None => {
+                ui.label(RichText::new("Not a git clone").small().weak());
+            }
+            Some(Err(e)) => {
+                ui.label(RichText::new("\u{E7BA}  git unavailable").small().color(theme::amber())).on_hover_text(e);
+            }
+            Some(Ok(s)) => {
+                let up = s.upstream.as_deref().unwrap_or("no upstream");
+                ui.label(RichText::new(format!("{} → {up}", s.branch)).small().monospace());
+                if s.upstream.is_some() {
+                    if s.behind > 0 {
+                        theme::badge(ui, format!("{} behind", s.behind), theme::amber());
+                    }
+                    if s.ahead > 0 {
+                        theme::badge(ui, format!("{} ahead", s.ahead), theme::blue());
+                    }
+                    if s.behind == 0 && s.ahead == 0 {
+                        ui.label(RichText::new("up to date as of last fetch").small().weak());
+                    }
+                }
+                if writable {
+                    if ui.add_enabled(!fetching && !pulling, egui::Button::new("\u{E895}  Fetch").small()).on_hover_text("git fetch --prune").clicked() {
+                        fetch = true;
+                    }
+                    if s.behind > 0
+                        && ui
+                            .add_enabled(!fetching && !pulling, egui::Button::new(format!("\u{E896}  Pull {}", s.behind)).small())
+                            .on_hover_text("git pull --ff-only. Recipes\\Development is git-ignored, so your work there is untouched.")
+                            .clicked()
+                    {
+                        pull = true;
+                    }
+                }
+                if fetching || pulling {
+                    ui.spinner();
+                }
+            }
+        }
+        if writable && sync_on {
+            ui.separator();
+            if ui
+                .add_enabled(!syncing, egui::Button::new("\u{E895}  Sync icons & overrides").small())
+                .on_hover_text("Yardstick's shared-content sync (SharedIcons / SharedRecipeOverrides in preferences.yaml)")
+                .clicked()
+            {
+                sync = true;
+            }
+            if syncing {
+                ui.spinner();
+            }
+        }
+    });
+    if fetch {
+        app.start_git_fetch(true);
+    }
+    if pull {
+        app.start_git_pull();
+    }
+    if sync {
+        app.start_shared_sync(true);
     }
 }
 

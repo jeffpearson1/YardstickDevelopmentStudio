@@ -46,11 +46,14 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         if ui.add_enabled(writable, egui::Button::new("\u{E710}  New recipe")).clicked() {
             app.library.new_open = true;
         }
-        if ui.button("\u{E72C}  Refresh").clicked() {
+        if ui.button("\u{E72C}  Refresh").on_hover_text("Rescan recipes; also git fetch and sync shared icons/overrides when enabled in Settings").clicked() {
             app.refresh_recipes();
             app.refresh_runs();
+            app.refresh_git_status();
+            app.refresh_remote(false);
         }
     });
+    super::git_bar(app, ui);
     ui.horizontal(|ui| {
         ui.add(egui::TextEdit::singleline(&mut app.library.filter).hint_text("Filter by id…").desired_width(240.0));
         ui.selectable_value(&mut app.library.location, LocationFilter::All, "All");

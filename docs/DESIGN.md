@@ -28,12 +28,14 @@ yardstick-studio.exe
     ├─ recipe.rs         ordered YAML document model (key order kept, scripts as literal blocks) + templates
     ├─ fields.rs         field catalogue mirroring Test-RecipeSchema's known fields/enums + skill guidance
     ├─ lint.rs           instant Rust-side checks mirroring the skill's rules
-    ├─ harness.rs        builds pwsh invocations of Tests/RecipeHarness/*.ps1 and Publish-Yardstick
+    ├─ harness.rs        builds pwsh invocations of Tests/RecipeHarness/*.ps1, Publish-Yardstick and the shared-content sync
+    ├─ git.rs            git clone/fetch/pull (ff-only) and ahead/behind status; finds git after a PATH refresh
+    ├─ update.rs         self-update: latest GitHub release, SHA-256-verified MSI download, install-and-relaunch helper
     ├─ results.rs        parses _install-tests/<ts>/summary.json into verdicts and phases
     ├─ agent.rs          prompt (guardrails + task) and CLI command for Copilot CLI / Claude Code
     ├─ intake.rs         request-list readers, quick-scan extraction, recipe matching, Batch persistence
     ├─ icons.rs          multi-source icon search, scoring, dedupe, image clean-up
-    ├─ process.rs        child processes with streamed stdout/stderr, cancel (taskkill /T)
+    ├─ process.rs        child processes with streamed stdout/stderr, cancel (taskkill /T), PATH reload from the registry
     └─ settings.rs       %APPDATA%\YardstickStudio\settings.json
 ```
 
@@ -42,8 +44,10 @@ rule that matters for safety lives in `ystudio-core` and is tested there.
 
 ### Jobs
 
-Every external action runs as a `RunningProcess`: harness steps, agent runs, git clone and
-publish. Reader threads pump stdout and stderr into a channel and wake the egui context.
+Every external action runs as a `RunningProcess`: harness steps, agent runs, git clone,
+fetch and pull, the shared icon/override sync, and publish. Reader threads pump stdout and stderr into a channel and wake the egui context.
+Git writes progress to stderr, so its specs set `stderr_is_progress` and the console shows
+those lines dimmed instead of red.
 The UI calls `poll()` each frame. `poll()` returns *whether anything changed*; use
 `is_running()` to find out whether the process is still alive. Cancelling kills the whole
 process tree with `taskkill /T /F`. When a job finishes, `StudioApp::on_job_finished`
@@ -54,7 +58,20 @@ dispatches on `JobKind`:
   `STUDIO-RECIPES:` line;
 - publish previews record whether the `-WhatIf` run succeeded for the current selection;
 - batch extraction jobs load the agent's `agent-items.json` into the batch;
-- agent jobs started from a batch item record that item's outcome, then start the next queued item.
+- agent jobs started from a batch item record that item's outcome, then start the next queued item;
+- git fetch/pull jobs refresh the ahead/behind status (a pull also rescans recipes and reloads an
+  unedited open recipe); shared-sync jobs rescan icons and re-lint.
+
+When a writable workspace opens, and on the library's *Refresh*, the Studio runs `git fetch`
+and Yardstick's `Sync-RecipeHarnessSharedContent` (only when `syncSharedContent: true`), each
+switchable in Settings. Production folders are never fetched or synced.
+
+Self-update runs outside the job system. Background threads check for and download the
+release, and the result is verified before anything is installed. To install, the Studio starts a hidden
+Windows PowerShell helper (`update::installer_helper`) and exits. The helper waits for
+the Studio's PID to exit, runs `msiexec /i … /passive` elevated (`-Verb RunAs`), and starts
+the Studio again with `--updated <exit code> <log>`, which the new process reports in the
+status bar.
 
 Only one agent process runs at a time, whether it came from the Agent view, a batch, or an extraction.
 

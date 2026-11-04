@@ -246,14 +246,23 @@ pub fn install_development_only(ws: &Workspace, pwsh: &Path) -> Result<ProcessSp
     Ok(spec)
 }
 
-/// `git clone <url> <dest>` for a fresh development workspace.
-pub fn git_clone(url: &str, dest: &Path) -> Result<ProcessSpec> {
-    if dest.exists() && std::fs::read_dir(dest).map(|mut d| d.next().is_some()).unwrap_or(true) {
-        bail!("'{}' already exists and is not empty.", dest.display());
+/// Syncs icons and `Local\recipeOverrides.yaml` with the shared location using
+/// Yardstick's own sync (`Sync-RecipeHarnessSharedContent`), exactly as a
+/// harness run would. Only meaningful when `syncSharedContent: true`.
+pub fn sync_shared_content(ws: &Workspace, pwsh: &Path) -> Result<ProcessSpec> {
+    ws.ensure_writable("sync shared icons and recipe overrides into")?;
+    if !ws.sync_shared_content {
+        bail!("syncSharedContent is not on in this workspace's preferences.yaml.");
     }
-    let git = which("git").ok_or_else(|| anyhow::anyhow!("git was not found on PATH."))?;
-    let parent = dest.parent().filter(|p| p.is_dir()).ok_or_else(|| anyhow::anyhow!("The parent folder of '{}' does not exist.", dest.display()))?;
-    Ok(ProcessSpec::new("git clone", git, parent).args(["clone", "--progress", url, &dest.to_string_lossy()]))
+    let root = ps_quote(&ws.root.to_string_lossy());
+    let body = format!(
+        ". (Join-Path {root} 'ProjectLayout.ps1'); \
+         Import-Module (Join-Path {root} 'Yardstick.psd1') -Force -ErrorAction Stop; \
+         Import-Module {support} -Force -ErrorAction Stop; \
+         Sync-RecipeHarnessSharedContent -YardstickDevPath {root} -Verbose",
+        support = ps_quote(&ws.layout.harness.join("RecipeTestSupport.psm1").to_string_lossy()),
+    );
+    Ok(pwsh_spec("Sync icons & overrides".into(), ws, pwsh, &body))
 }
 
 /// Copies icons that the destination lacks (icons are not in Git). Reads the
@@ -359,6 +368,18 @@ mod tests {
         assert!(body(&real).contains("-Confirm:$false"));
         assert!(publish(&ws, &ids, &ws.root, true, Consent::None, Path::new("pwsh")).is_err());
         assert!(publish(&ws, &["a;rm".to_string()], prod.path(), true, Consent::None, Path::new("pwsh")).is_err());
+    }
+
+    #[test]
+    fn shared_sync_needs_preference() {
+        let (_d, ws) = dev_ws();
+        assert!(sync_shared_content(&ws, Path::new("pwsh")).is_err());
+        let d = fake_workspace(Some("developmentOnly: true\nsyncSharedContent: true\n"));
+        let ws = Workspace::open(d.path(), &[], &[]).unwrap();
+        let spec = sync_shared_content(&ws, Path::new("pwsh")).unwrap();
+        assert!(body(&spec).contains("Sync-RecipeHarnessSharedContent"));
+        let prod = Workspace::open(d.path(), &[d.path().to_path_buf()], &[]).unwrap();
+        assert!(sync_shared_content(&prod, Path::new("pwsh")).is_err());
     }
 
     #[test]

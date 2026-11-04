@@ -154,6 +154,9 @@ pub struct Workspace {
     pub layout: Layout,
     pub kind: WorkspaceKind,
     pub development_only: bool,
+    /// `syncSharedContent: true` in preferences: icons and recipe overrides are
+    /// shared with a team location.
+    pub sync_shared_content: bool,
 }
 
 /// Parses the flat `@{ Key = 'value' }` hashtable in `Yardstick.Project.psd1`.
@@ -180,14 +183,12 @@ impl Workspace {
         let psd1 = read_text(&root.join("Yardstick.Project.psd1")).context("reading Yardstick.Project.psd1")?;
         let layout = Layout::resolve(root, &parse_project_psd1(&psd1));
         let prefs = read_preferences(&layout.preferences);
-        let development_only = prefs
-            .as_ref()
-            .and_then(|p| p.get("developmentOnly"))
-            .and_then(serde_yaml::Value::as_bool)
-            .unwrap_or(false);
+        let flag = |key: &str| prefs.as_ref().and_then(|p| p.get(key)).and_then(serde_yaml::Value::as_bool).unwrap_or(false);
+        let development_only = flag("developmentOnly");
+        let sync_shared_content = flag("syncSharedContent");
 
         let kind = classify(root, prefs.is_some(), development_only, production_paths, trusted_dev_paths);
-        Ok(Workspace { root: root.to_path_buf(), layout, kind, development_only })
+        Ok(Workspace { root: root.to_path_buf(), layout, kind, development_only, sync_shared_content })
     }
 
     pub fn is_writable(&self) -> bool {

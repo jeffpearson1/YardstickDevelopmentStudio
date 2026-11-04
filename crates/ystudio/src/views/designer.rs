@@ -73,6 +73,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
 
     let font_size = app.settings.editor_font_size;
     let dark = app.settings.dark_mode;
+    let mut line_numbers = app.settings.line_numbers;
     let icons = std::mem::take(&mut app.ws_cache.icons);
     let mut goto = None;
     let r = app.recipe.as_mut().unwrap();
@@ -169,23 +170,32 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     });
 
     let mut changed: Vec<String> = Vec::new();
+    let assigned = ystudio_core::lint::script_assignments(&doc);
+    let editor = EditorOpts { icons: &icons, font_size, dark, line_numbers };
     egui::ScrollArea::vertical().id_salt(("designer-fields", r.section)).auto_shrink(false).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.checkbox(&mut r.show_all_fields, "Show all fields in this step");
+            ui.checkbox(&mut line_numbers, "Line numbers");
             ui.label(RichText::new("Blank fields are removed so they inherit from preferences.yaml.").small().weak());
         });
         ui.add_space(4.0);
         ui.add_enabled_ui(!locked, |ui| {
             for spec in fields::fields_in(section) {
                 let present = doc.contains(spec.name);
-                let required = is_required(spec.name, &doc);
-                if !(spec.common || r.show_all_fields || present || required) {
+                let set_by = match spec.kind {
+                    FieldKind::Script | FieldKind::Complex => None,
+                    _ => assigned.get(&spec.name.to_ascii_lowercase()).copied(),
+                };
+                let catalog_required = is_required(spec.name, &doc);
+                let required = catalog_required && set_by.is_none();
+                if !(spec.common || r.show_all_fields || present || catalog_required || set_by.is_some()) {
                     continue;
                 }
                 let buf = r.designer_bufs.entry(spec.name.to_string()).or_default();
                 let field_diags: Vec<&Diagnostic> =
                     diags.iter().filter(|d| d.field.as_deref().is_some_and(|f| f.eq_ignore_ascii_case(spec.name))).collect();
-                if field_editor(ui, spec, buf, required, &field_diags, &icons, font_size, dark) {
+                let state = FieldState { required, present, set_by };
+                if field_editor(ui, spec, buf, state, &field_diags, &editor) {
                     changed.push(spec.name.to_string());
                 }
             }
@@ -223,6 +233,10 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         r.parsed = Some(crate::app::ParsedRecipe { rev: parsed_rev, doc: Ok(doc), has_comments });
     }
     app.ws_cache.icons = icons;
+    if line_numbers != app.settings.line_numbers {
+        app.settings.line_numbers = line_numbers;
+        app.save_settings();
+    }
     if ui.ctx().data_mut(|d| d.remove_temp::<bool>(egui::Id::unique(FIND_ICON))).unwrap_or(false) {
         find_icon(app);
         return;
@@ -287,20 +301,28 @@ fn diag_line(ui: &mut Ui, d: &Diagnostic) {
     });
 }
 
-#[allow(clippy::too_many_arguments)]
-fn field_editor(
-    ui: &mut Ui,
-    spec: &FieldSpec,
-    buf: &mut String,
-    required: bool,
-    diags: &[&Diagnostic],
-    icons: &[String],
+struct EditorOpts<'a> {
+    icons: &'a [String],
     font_size: f32,
     dark: bool,
-) -> bool {
+    line_numbers: bool,
+}
+
+#[derive(Clone, Copy)]
+struct FieldState<'a> {
+    required: bool,
+    present: bool,
+    /// The download script that assigns this field's variable, if any.
+    set_by: Option<&'a str>,
+}
+
+fn field_editor(ui: &mut Ui, spec: &FieldSpec, buf: &mut String, state: FieldState, diags: &[&Diagnostic], opts: &EditorOpts) -> bool {
     let mut changed = false;
     let worst = diags.iter().map(|d| d.severity).min();
     let frame_color = worst.map(theme::severity_color).unwrap_or(ui.visuals().widgets.noninteractive.bg_stroke.color);
+    // A value only a script sets has nothing to edit here. When the YAML also has
+    // one it stays editable: scripts commonly read it first (e.g. a landing-page url).
+    let script_only = state.set_by.is_some() && !state.present;
     egui::Frame::new()
         .stroke(egui::Stroke::new(1.0, frame_color))
         .corner_radius(6)
@@ -309,71 +331,83 @@ fn field_editor(
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(RichText::new(spec.name).monospace().strong());
-                if required {
+                if state.required {
                     ui.label(RichText::new("required").small().color(theme::red()));
+                }
+                if let Some(script) = state.set_by {
+                    let (text, hover) = if script_only {
+                        (format!("set by {script}"), format!("${} is assigned in {script}, so it is not set here. Edit the script to change it.", spec.name))
+                    } else {
+                        (format!("reassigned in {script}"), format!("${} is assigned in {script} at run time; this value is its starting point.", spec.name))
+                    };
+                    ui.label(RichText::new(text).small().color(theme::blue())).on_hover_text(hover);
                 }
                 ui.label(RichText::new(spec.help).small().weak());
             });
             let width = ui.available_width();
-            match spec.kind {
-                FieldKind::Text if spec.name == "iconFile" => {
-                    ui.horizontal(|ui| {
-                        changed |= ui.add(egui::TextEdit::singleline(buf).desired_width(260.0)).changed();
-                        egui::ComboBox::from_id_salt("icon-pick").selected_text("Pick from Icons\\").height(400.0).show_ui(ui, |ui| {
-                            for icon in icons {
-                                if ui.selectable_label(buf == icon, icon).clicked() {
-                                    *buf = icon.clone();
-                                    changed = true;
-                                }
-                            }
-                        });
-                        let t = buf.trim();
-                        if !t.is_empty() {
-                            if icons.iter().any(|i| i == t) {
-                                ui.colored_label(theme::green(), "\u{E73E}  found");
-                            } else {
-                                ui.colored_label(theme::red(), "\u{E711}  not in Icons\\");
-                            }
-                        }
-                        if ui.button("\u{E91B}  Find icon…").on_hover_text("Search installers, Wikidata, Chocolatey, the vendor site and the web").clicked() {
-                            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique(FIND_ICON), true));
-                        }
-                    });
-                }
-                FieldKind::Text | FieldKind::Int => {
-                    changed |= ui.add(egui::TextEdit::singleline(buf).desired_width(width)).changed();
-                }
-                FieldKind::Enum(values) => {
-                    changed |= choice(ui, spec.name, buf, values);
-                }
-                FieldKind::Bool => {
-                    changed |= choice(ui, spec.name, buf, &["true", "false"]);
-                }
-                FieldKind::List => {
-                    changed |= ui
-                        .add(egui::TextEdit::multiline(buf).desired_rows(2).desired_width(width).hint_text("one per line"))
-                        .changed();
-                }
-                FieldKind::Script | FieldKind::Complex => {
-                    let mut layouter =
-                        |ui: &Ui, text: &dyn egui::TextBuffer, wrap: f32| highlight::yaml_galley(ui, text.as_str(), font_size, dark, wrap);
-                    let rows = buf.lines().count().clamp(4, 24);
-                    changed |= ui
-                        .add(
-                            egui::TextEdit::multiline(buf)
-                                .code_editor()
-                                .desired_rows(rows)
-                                .desired_width(width)
-                                .layouter(&mut layouter),
-                        )
-                        .changed();
-                }
+            if script_only {
+                let hint = format!("Set by {} at run time", state.set_by.unwrap_or_default());
+                ui.add_enabled(false, egui::TextEdit::singleline(&mut String::new()).hint_text(hint).desired_width(width));
+            } else {
+                changed = field_input(ui, spec, buf, width, opts);
             }
             for d in diags {
                 ui.label(RichText::new(format!("{} {}", theme::severity_icon(d.severity), d.message)).color(theme::severity_color(d.severity)));
             }
         });
     ui.add_space(4.0);
+    changed
+}
+
+fn field_input(ui: &mut Ui, spec: &FieldSpec, buf: &mut String, width: f32, opts: &EditorOpts) -> bool {
+    let icons = opts.icons;
+    let mut changed = false;
+    match spec.kind {
+        FieldKind::Text if spec.name == "iconFile" => {
+            ui.horizontal(|ui| {
+                changed |= ui.add(egui::TextEdit::singleline(buf).desired_width(260.0)).changed();
+                egui::ComboBox::from_id_salt("icon-pick").selected_text("Pick from Icons\\").height(400.0).show_ui(ui, |ui| {
+                    for icon in icons {
+                        if ui.selectable_label(buf == icon, icon).clicked() {
+                            *buf = icon.clone();
+                            changed = true;
+                        }
+                    }
+                });
+                let t = buf.trim();
+                if !t.is_empty() {
+                    if icons.iter().any(|i| i == t) {
+                        ui.colored_label(theme::green(), "\u{E73E}  found");
+                    } else {
+                        ui.colored_label(theme::red(), "\u{E711}  not in Icons\\");
+                    }
+                }
+                if ui.button("\u{E91B}  Find icon…").on_hover_text("Search installers, Wikidata, Chocolatey, the vendor site and the web").clicked() {
+                    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique(FIND_ICON), true));
+                }
+            });
+        }
+        FieldKind::Text | FieldKind::Int => {
+            changed |= ui.add(egui::TextEdit::singleline(buf).desired_width(width)).changed();
+        }
+        FieldKind::Enum(values) => {
+            changed |= choice(ui, spec.name, buf, values);
+        }
+        FieldKind::Bool => {
+            changed |= choice(ui, spec.name, buf, &["true", "false"]);
+        }
+        FieldKind::List => {
+            changed |= ui.add(egui::TextEdit::multiline(buf).desired_rows(2).desired_width(width).hint_text("one per line")).changed();
+        }
+        FieldKind::Script | FieldKind::Complex => {
+            let (font_size, dark) = (opts.font_size, opts.dark);
+            let mut layouter = |ui: &Ui, text: &dyn egui::TextBuffer, wrap: f32| highlight::yaml_galley(ui, text.as_str(), font_size, dark, wrap);
+            let lines = highlight::line_count(buf);
+            let rows = buf.lines().count().clamp(4, 24);
+            let edit = egui::TextEdit::multiline(buf).code_editor().desired_rows(rows).desired_width(f32::INFINITY).layouter(&mut layouter);
+            changed |= highlight::code_edit(ui, edit, opts.line_numbers, lines, font_size).changed();
+        }
+    }
     changed
 }
 

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use eframe::egui::{self, RichText, Ui};
 use ystudio_core::agent::AgentBackend;
-use ystudio_core::harness;
+use ystudio_core::{git, harness};
 use ystudio_core::process::which;
 use ystudio_core::settings::Settings;
 use ystudio_core::workspace::WorkspaceKind;
@@ -71,6 +71,8 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         );
         ui.add_space(theme::CARD_GAP);
         settings_card(app, ui);
+        ui.add_space(theme::CARD_GAP);
+        theme::card(ui, |ui| super::update::card(app, ui));
         ui.add_space(8.0);
     });
 }
@@ -165,6 +167,9 @@ fn workspace_card(app: &mut StudioApp, ui: &mut Ui) {
             }
         }
         ui.add_space(GROUP_GAP - 6.0);
+        if app.ws.is_some() {
+            super::git_bar(app, ui);
+        }
         ui.horizontal_wrapped(|ui| {
             if ui.button("\u{E838}  Open folder…").clicked()
                 && let Some(p) = rfd::FileDialog::new().set_title("Open a Yardstick folder").pick_folder()
@@ -257,10 +262,12 @@ fn create_footer(app: &mut StudioApp, ui: &mut Ui) {
     let cloning = app.jobs.iter().any(|j| matches!(j.kind, JobKind::Clone { .. }) && j.proc.is_running());
     ui.horizontal(|ui| {
         if ui.add_enabled(!is_prod && !cloning, egui::Button::new("\u{E896}  Clone development workspace")).clicked() {
-            match harness::git_clone(app.home.clone_url.trim(), &dest) {
+            match git::clone(app.home.clone_url.trim(), &dest) {
                 Ok(spec) => {
                     app.console_open = true;
                     app.start_job(spec, JobKind::Clone { dest });
+                    // The PATH may have been refreshed to find git.
+                    app.home.tools = None;
                 }
                 Err(e) => app.error(format!("{e:#}")),
             }
@@ -320,8 +327,16 @@ fn environment_body(app: &mut StudioApp, ui: &mut Ui) {
 }
 
 fn environment_footer(app: &mut StudioApp, ui: &mut Ui) {
-    if ui.button("\u{E72C}  Re-check").clicked() {
+    if ui
+        .button("\u{E72C}  Re-check")
+        .on_hover_text("Reloads PATH from Windows, so tools installed since the Studio started (e.g. Git from Company Portal) are found.")
+        .clicked()
+    {
+        if let Err(e) = ystudio_core::process::refresh_path() {
+            app.error(format!("Could not reload PATH: {e:#}"));
+        }
         app.home.tools = None;
+        app.refresh_git_status();
     }
 }
 
@@ -351,6 +366,13 @@ fn settings_card(app: &mut StudioApp, ui: &mut Ui) {
         });
         form_row(ui, "Editor font size", None, |ui| {
             ui.add(egui::Slider::new(&mut app.settings.editor_font_size, 10.0..=22.0));
+        });
+        form_row(ui, "Editors", None, |ui| {
+            ui.checkbox(&mut app.settings.line_numbers, "Show line numbers");
+        });
+        form_row(ui, "On open and Refresh", Some("Production folders are never fetched or synced."), |ui| {
+            ui.checkbox(&mut app.settings.auto_git_fetch, "git fetch, and show how far behind the clone is");
+            ui.checkbox(&mut app.settings.auto_sync_shared, "Sync shared icons and recipe overrides (when syncSharedContent is on)");
         });
         ui.add_space(GROUP_GAP - 8.0);
         ui.horizontal(|ui| {

@@ -18,6 +18,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
 
     let font_size = app.settings.editor_font_size;
     let dark = app.settings.dark_mode;
+    let mut line_numbers = app.settings.line_numbers;
     let mut jump = None;
     let r = app.recipe.as_mut().unwrap();
 
@@ -55,18 +56,18 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         });
     });
 
+    ui.checkbox(&mut line_numbers, "Line numbers");
     let mut layouter = |ui: &Ui, text: &dyn egui::TextBuffer, wrap: f32| highlight::yaml_galley(ui, text.as_str(), font_size, dark, wrap);
     egui::ScrollArea::vertical().id_salt("yaml-editor").auto_shrink(false).show(ui, |ui| {
-        let resp = ui.add(
-            egui::TextEdit::multiline(&mut r.text)
-                .code_editor()
-                .interactive(!r.read_only)
-                .desired_width(f32::INFINITY)
-                .desired_rows(40)
-                .lock_focus(true)
-                .layouter(&mut layouter),
-        );
-        if resp.changed() {
+        let lines = highlight::line_count(&r.text);
+        let edit = egui::TextEdit::multiline(&mut r.text)
+            .code_editor()
+            .interactive(!r.read_only)
+            .desired_width(f32::INFINITY)
+            .desired_rows(40)
+            .lock_focus(true)
+            .layouter(&mut layouter);
+        if highlight::code_edit(ui, edit, line_numbers, lines, font_size).changed() {
             r.changed();
         }
     });
@@ -76,5 +77,9 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             r.section = i;
         }
         app.view = View::Designer;
+    }
+    if line_numbers != app.settings.line_numbers {
+        app.settings.line_numbers = line_numbers;
+        app.save_settings();
     }
 }

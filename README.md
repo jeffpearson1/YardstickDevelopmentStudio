@@ -20,10 +20,10 @@ there. You work in a development clone and promote finished recipes with
 
 | View | What it does |
 |------|--------------|
-| **Home** | The guided "design, test, agent, promote" path and the workspace status (production, development or unconfigured). It can clone a development workspace from GitHub, copying the icons that aren't in Git from production, and can launch `Install-Yardstick -DevelopmentOnly` for a fresh clone. It also shows the toolchain environment (pwsh, git, agent CLIs) and the settings. |
-| **Recipes** | Library of all shipped and `Recipes\Development` recipes, with filters, location and verdict badges, *New recipe* from templates, and *Copy to Development*. |
-| **Designer** | Form-based editor whose field catalogue mirrors Yardstick's schema (`Test-RecipeSchema`) and the skill's guidance. Fields are grouped into steps, script fields get a highlighted PowerShell editor, and it lints as you type. Saving keeps key order and writes scripts as literal blocks. It warns before dropping YAML comments; use the YAML Editor to keep them. |
-| **YAML Editor** | Raw YAML with syntax highlighting, kept in sync with the Designer. |
+| **Home** | The guided "design, test, agent, promote" path and the workspace status (production, development or unconfigured), with the clone's branch, how far behind it is, and *Fetch* / *Pull* / *Sync icons & overrides*. It can clone a development workspace from GitHub (creating the destination's parent folders), copying the icons that aren't in Git from production, and can launch `Install-Yardstick -DevelopmentOnly` for a fresh clone. It also shows the toolchain environment (pwsh, git, agent CLIs; *Re-check* reloads `PATH`, so a tool installed while the Studio is open is found) and the settings. |
+| **Recipes** | Library of all shipped and `Recipes\Development` recipes, with filters, location and verdict badges, *New recipe* from templates, and *Copy to Development*. *Refresh* also runs `git fetch` and the shared icon/override sync when they are enabled in Settings. |
+| **Designer** | Form-based editor whose field catalogue mirrors Yardstick's schema (`Test-RecipeSchema`) and the skill's guidance. Fields are grouped into steps, script fields get a highlighted PowerShell editor with optional line numbers, and it lints as you type. A field whose variable a download script assigns is not marked required; if the YAML leaves it blank it is shown read-only as *set by preDownloadScript* (or whichever script sets it). Saving keeps key order and writes scripts as literal blocks. It warns before dropping YAML comments; use the YAML Editor to keep them. |
+| **YAML Editor** | Raw YAML with syntax highlighting and optional line numbers, kept in sync with the Designer. |
 | **Test Bench** | Runs the harness steps: Lint, Schema, Lab (download/package) and Install test (dry run or live). Live install tests need an explicit consent dialog. "Run safe checks" chains Lint, Schema and DryRun. |
 | **Agent** | Runs the `yardstick-recipes` skill through GitHub Copilot CLI or Claude Code. Tasks are Create, Fix, Review, Update and Freeform. Output streams live, and the recipes the agent changed are picked up from its `STUDIO-RECIPES:` line. |
 | **Batch** | Open a request list (ServiceNow/JSON export, CSV/TSV, Excel `xlsx/xls/ods`, YAML, text/Markdown/email, HTML, Word `docx`) by picker, drag and drop, or `yardstick-studio.exe <file>`. A quick scan pulls out the software, version, vendor URL and ticket for each request, and flags requests that aren't software. *Extract with agent* has the agent re-read the list for better results. Each item is matched to an existing recipe (an Update) or marked New. Pick the items you want and *Run agent on N selected*: the agent runs one item at a time, and each item records its status, recipe and icon. Batches are saved under `%APPDATA%\YardstickStudio\batches` and resume where they left off. *Copy report* gives a Markdown summary. |
@@ -107,6 +107,20 @@ replaces the old one, and installing an older version over a newer one is refuse
 Settings in `%APPDATA%\YardstickStudio` are left in place on uninstall. The MSI and
 executable aren't code-signed yet, so SmartScreen may warn on first run. Sign both with
 `signtool` before distributing widely.
+
+### Updates
+
+The Studio updates itself from this repository's
+[GitHub Releases](https://github.com/jeffpearson1/YardstickDevelopmentStudio/releases).
+It checks at startup (switch this off under *Updates* on Home) or when you choose
+*Check for updates*. *Download and install* fetches the release's `*-x64.msi` and checks
+it against the SHA-256 digest GitHub publishes for the asset. It then closes the Studio,
+runs the MSI with a progress bar (Windows asks for admin rights) and reopens the Studio.
+The update waits while jobs are running or a recipe has unsaved changes. To publish an
+update, bump `version` in `Cargo.toml`, run `.\build.ps1 -Task installer`, and attach
+the MSI to a non-draft, non-pre-release GitHub release tagged `v<version>`.
+Intune-managed installs can ignore the updater: the next Intune deployment of the same or
+a newer MSI simply upgrades in place.
 
 The installer artwork in `installer\*.bmp` comes from `assets\branding`. To regenerate it,
 run `python installer\make-art.py`, which needs Pillow.

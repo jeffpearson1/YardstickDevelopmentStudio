@@ -49,6 +49,24 @@ impl Default for LintContext<'_> {
     }
 }
 
+/// The download scripts whose variable assignments feed recipe fields, in run order.
+pub const DOWNLOAD_SCRIPTS: [&str; 3] = ["preDownloadScript", "downloadScript", "postDownloadScript"];
+
+/// Variables assigned in the download scripts: lower-cased name -> the first
+/// script that assigns it. `$version = ...` and `$Script:FileName = ...` both count.
+pub fn script_assignments(doc: &RecipeDoc) -> std::collections::BTreeMap<String, &'static str> {
+    static RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"(?i)\$(?:script:|global:|local:)?([A-Za-z_]\w*)\s*=").unwrap());
+    let mut out = std::collections::BTreeMap::new();
+    for field in DOWNLOAD_SCRIPTS {
+        let text = doc.get_str(field).unwrap_or_default();
+        for c in RE.captures_iter(&text) {
+            out.entry(c[1].to_ascii_lowercase()).or_insert(field);
+        }
+    }
+    out
+}
+
 /// Lints YAML text. Parse failures become a single error.
 pub fn lint_text(text: &str, ctx: &LintContext) -> Vec<Diagnostic> {
     match RecipeDoc::parse(text) {
@@ -80,8 +98,8 @@ pub fn lint(own: &RecipeDoc, ctx: &LintContext) -> Vec<Diagnostic> {
 
     let script = |k: &str| doc.get_str(k).unwrap_or_default();
     let download_scripts = [script("preDownloadScript"), script("downloadScript"), script("postDownloadScript")].join("\n");
-    let assigned_in_scripts =
-        |var: &str| Regex::new(&format!(r"(?i)\${}\s*=", regex::escape(var))).unwrap().is_match(&download_scripts);
+    let assigned = script_assignments(doc);
+    let assigned_in_scripts = |var: &str| assigned.contains_key(&var.to_ascii_lowercase());
     let base_unresolved = own.is_set("base") && ctx.base.is_none();
 
     // Reserved runner variables
@@ -477,6 +495,19 @@ detectionType: msi
         let without = lint(&child, &ctx(&icon));
         assert!(without.iter().all(|d| d.severity != Severity::Error), "{without:#?}");
         assert!(without.iter().any(|d| d.message.contains("Base recipe not found")));
+    }
+
+    #[test]
+    fn script_assignments_name_the_first_script() {
+        let doc = RecipeDoc::parse(
+            "preDownloadScript: |\n  $Version = '1'\n  $Script:FileName = \"a.msi\"\n  if ($url -eq 'x') {}\ndownloadScript: |\n  $version = '2'\n  $publisher='X'\n",
+        )
+        .unwrap();
+        let a = script_assignments(&doc);
+        assert_eq!(a.get("version"), Some(&"preDownloadScript"));
+        assert_eq!(a.get("filename"), Some(&"preDownloadScript"));
+        assert_eq!(a.get("publisher"), Some(&"downloadScript"));
+        assert!(!a.contains_key("url"));
     }
 
     #[test]
