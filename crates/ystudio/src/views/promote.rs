@@ -6,10 +6,10 @@ use std::path::PathBuf;
 
 use eframe::egui::{self, RichText, Ui};
 use ystudio_core::harness::{self, Consent};
-use ystudio_core::results::Verdict;
+use ystudio_core::results::{RecipeResult, VALIDATION_PHASES, Verdict};
 use ystudio_core::workspace::RecipeLocation;
 
-use crate::app::{JobKind, StudioApp, job_log};
+use crate::app::{JobKind, Step, StepState, StudioApp, job_log};
 use crate::theme::{self, FluentText as _};
 
 #[derive(Default)]
@@ -47,7 +47,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     theme::page_title(ui, "Promote to production");
     ui.label(RichText::new(
         "Publish-Yardstick copies the selected recipes (and their icons) from this development workspace into a \
-         production folder. Preview with -WhatIf first. Only promote recipes the live install test validated.",
+         production folder. Preview with -WhatIf first. If validation is incomplete, review the checks before publishing anyway.",
     ).weak());
     ui.add_space(6.0);
 
@@ -117,6 +117,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             .on_disabled_hover_text("Run a successful preview of exactly this selection first.")
             .clicked()
         {
+            app.refresh_runs();
             app.promote.modal = true;
             app.promote.ack = false;
         }
@@ -125,7 +126,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     if !unvalidated.is_empty() {
         theme::banner(ui, theme::amber(), |ui| {
             ui.label(format!(
-                "Not validated by a live install test: {}. The skill only calls a recipe validated after a full live pass.",
+                "Not fully validated: {}. Publish will show the recorded checks and ask whether to publish anyway.",
                 unvalidated.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
             ));
         });
@@ -158,6 +159,7 @@ pub fn publish_modal(app: &mut StudioApp, ctx: &egui::Context) {
         return;
     }
     let ids: Vec<String> = app.promote.selected.iter().cloned().collect();
+    let incomplete = ids.iter().any(|id| !verdict_ok(app.verdicts.get(id).map(|v| v.0)));
     let target = app.promote.target.clone().unwrap_or_default();
     let mut go = false;
     let mut cancel = false;
@@ -168,12 +170,58 @@ pub fn publish_modal(app: &mut StudioApp, ctx: &egui::Context) {
         ui.label(RichText::new(target.display().to_string()).monospace().strong());
         ui.label(RichText::new(ids.join(", ")).monospace());
         ui.label("The next scheduled Yardstick run in that folder will package and upload them to Intune.");
-        ui.checkbox(&mut app.promote.ack, "I reviewed the preview and want to publish these recipes.");
+        if incomplete {
+            ui.add_space(8.0);
+            ui.label(RichText::new("Validation is incomplete").strong().color(theme::amber()));
+            ui.label("Some checks have failed, were skipped, or have not been recorded. Publishing anyway does not mark the recipes validated.");
+            egui::ScrollArea::vertical().id_salt("publish-checks").max_height(320.0).show(ui, |ui| {
+                for id in &ids {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(id).strong().monospace());
+                    let latest = app.runs.iter().find_map(|run| {
+                        run.summary.as_ref()?.results.iter().find(|r| r.id == *id).map(|result| (run, result))
+                    });
+                    if let Some((run, result)) = latest {
+                        ui.label(format!("Latest install test: {} ({})", run.timestamp, result.verdict().label()));
+                    }
+                    for line in validation_checks(latest.map(|(_, result)| result)) {
+                        ui.label(line);
+                    }
+                    if let Some(phase) = latest.and_then(|(_, result)| result.phase("Reinstall")) {
+                        ui.label(format!("Reinstall: {}", phase.status));
+                    }
+                    let session: Vec<_> = Step::ALL
+                        .iter()
+                        .filter_map(|step| {
+                            let status = match app.step_state(id, *step)? {
+                                StepState::Running => "Running",
+                                StepState::Pass => "Passed",
+                                StepState::Warn => "Warnings",
+                                StepState::Fail => "Failed",
+                            };
+                            Some(format!("{}: {status}", step.title()))
+                        })
+                        .collect();
+                    if !session.is_empty() {
+                        ui.label(RichText::new("Test Bench checks in this session").small().strong());
+                        for line in session {
+                            ui.label(line);
+                        }
+                    }
+                }
+            });
+        } else {
+            ui.checkbox(&mut app.promote.ack, "I reviewed the preview and want to publish these recipes.");
+        }
         ui.horizontal(|ui| {
-            if theme::primary(ui, app.promote.ack, RichText::new("Publish")).clicked() {
+            if incomplete && ui.button("Go back").clicked() {
+                cancel = true;
+            }
+            let label = if incomplete { "Publish anyway" } else { "Publish" };
+            if theme::primary(ui, incomplete || app.promote.ack, RichText::new(label)).clicked() {
                 go = true;
             }
-            if ui.button("Cancel").clicked() {
+            if !incomplete && ui.button("Cancel").clicked() {
                 cancel = true;
             }
         });
@@ -184,5 +232,61 @@ pub fn publish_modal(app: &mut StudioApp, ctx: &egui::Context) {
     if go {
         app.promote.modal = false;
         start_publish(app, &ids, false);
+    }
+}
+
+fn validation_checks(result: Option<&RecipeResult>) -> Vec<String> {
+    VALIDATION_PHASES
+        .iter()
+        .map(|name| {
+            let label = match *name {
+                "PostDetect" => "Post-install detection",
+                "PostUninstall" => "Post-uninstall detection",
+                _ => name,
+            };
+            match result.and_then(|r| r.phase(name)) {
+                Some(phase) => {
+                    let detail = phase.detail.as_deref().filter(|s| !s.is_empty()).map(|s| format!(" - {s}")).unwrap_or_default();
+                    format!("{label}: {}{detail}", phase.status)
+                }
+                None => format!("{label}: Not recorded"),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ystudio_core::results::Phase;
+
+    #[test]
+    fn missing_tests_are_explicit_and_do_not_qualify_as_validated() {
+        let checks = validation_checks(None);
+        assert_eq!(checks.len(), VALIDATION_PHASES.len());
+        assert!(checks.iter().all(|s| s.ends_with(": Not recorded")));
+        assert!(!verdict_ok(None));
+        assert!(!verdict_ok(Some(Verdict::Incomplete)));
+        assert!(!verdict_ok(Some(Verdict::Failed)));
+        assert!(!verdict_ok(Some(Verdict::DryRunPassed)));
+        assert!(verdict_ok(Some(Verdict::Validated)));
+        assert!(verdict_ok(Some(Verdict::ValidatedWithWarnings)));
+    }
+
+    #[test]
+    fn dialog_reports_skipped_failed_and_completed_checks_with_details() {
+        let result = RecipeResult {
+            phases: vec![
+                Phase { name: Some("PostInstallDetect".into()), status: "Pass".into(), ..Default::default() },
+                Phase { name: Some("Uninstall".into()), status: "Skip".into(), detail: Some("-SkipUninstall was specified".into()), ..Default::default() },
+                Phase { name: Some("Residue".into()), status: "Fail".into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let checks = validation_checks(Some(&result));
+        assert!(checks.contains(&"Post-install detection: Pass".into()));
+        assert!(checks.contains(&"Uninstall: Skip - -SkipUninstall was specified".into()));
+        assert!(checks.contains(&"Residue: Fail".into()));
+        assert!(checks.contains(&"Post-uninstall detection: Not recorded".into()));
     }
 }

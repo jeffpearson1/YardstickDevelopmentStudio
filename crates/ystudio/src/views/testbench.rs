@@ -31,8 +31,14 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
 
     egui::Panel::left("bench-steps").resizable(true).default_size(420.0).show(ui, |ui| {
         egui::ScrollArea::vertical().id_salt("bench-steps-scroll").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if theme::primary(ui, writable && !busy, RichText::new("\u{E768}  Run safe checks"))
+            ui.horizontal_wrapped(|ui| {
+                if theme::primary(ui, writable && !busy, RichText::new("\u{E768}  Run all checks"))
+                    .on_hover_text("Lint → schema → download → package → dry run → live test. Stops on failure and asks for consent before the live test.")
+                    .clicked()
+                {
+                    app.run_steps(&Step::ALL);
+                }
+                if ui.add_enabled(writable && !busy, egui::Button::new("Run safe checks"))
                     .on_hover_text("Lint → schema → dry run (-WhatIf). Nothing is installed.")
                     .clicked()
                 {
@@ -69,8 +75,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                             let label = if step == Step::Live { "Run live…" } else { "Run" };
                             if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
                                 if step == Step::Live {
-                                    app.bench.live_modal = true;
-                                    app.bench.live_ack = false;
+                                    app.run_steps(&[Step::Live]);
                                 } else {
                                     app.bench.queue.clear();
                                     app.bench.queue_recipe = Some(id.clone());
@@ -207,6 +212,8 @@ pub fn live_modal(app: &mut StudioApp, ctx: &egui::Context) {
     });
     if cancel {
         app.bench.live_modal = false;
+        app.bench.live_ack = false;
+        app.bench.queue.clear();
     }
     if start {
         app.bench.live_modal = false;

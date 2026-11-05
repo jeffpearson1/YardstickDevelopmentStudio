@@ -79,7 +79,13 @@ fn status_ok(s: &str) -> bool {
 
 impl RecipeResult {
     pub fn phase(&self, name: &str) -> Option<&Phase> {
-        self.phases.iter().find(|p| p.label().eq_ignore_ascii_case(name))
+        let canonical = |name: &str| match name.to_ascii_lowercase().as_str() {
+            "postdetect" | "postinstalldetect" => "postinstalldetect".to_string(),
+            "postuninstall" | "postuninstalldetect" => "postuninstalldetect".to_string(),
+            _ => name.to_ascii_lowercase(),
+        };
+        let name = canonical(name);
+        self.phases.iter().find(|p| canonical(p.label()) == name)
     }
 
     pub fn verdict(&self) -> Verdict {
@@ -290,6 +296,38 @@ mod tests {
 
         let partial = parse_result(&result("a", "Pass", &[("Schema", "Pass")])).unwrap();
         assert_eq!(partial.verdict(), Verdict::Incomplete);
+    }
+
+    #[test]
+    fn recognizes_current_harness_detection_phase_names() {
+        let phases: Vec<_> = LIVE_PASS
+            .iter()
+            .map(|&(name, status)| {
+                let name = match name {
+                    "PostDetect" => "PostInstallDetect",
+                    "PostUninstall" => "PostUninstallDetect",
+                    _ => name,
+                };
+                (name, status)
+            })
+            .collect();
+        let r = parse_result(&result("githubcopilotcli", "Pass", &phases)).unwrap();
+        assert_eq!(r.verdict(), Verdict::Validated);
+
+        let mut warned = phases.clone();
+        warned[7].1 = "Warn";
+        let r = parse_result(&result("githubcopilotcli", "Pass with warnings", &warned)).unwrap();
+        assert_eq!(r.verdict(), Verdict::ValidatedWithWarnings);
+
+        let mut skipped = phases[..5].to_vec();
+        skipped.push(("Uninstall", "Skip"));
+        let r = parse_result(&result("githubcopilotcli", "Pass", &skipped)).unwrap();
+        assert_eq!(r.verdict(), Verdict::Incomplete);
+
+        let mut failed = phases;
+        failed[4].1 = "Fail";
+        let r = parse_result(&result("githubcopilotcli", "Fail", &failed)).unwrap();
+        assert_eq!(r.verdict(), Verdict::Failed);
     }
 
     #[test]

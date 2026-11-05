@@ -304,6 +304,17 @@ impl Default for BenchState {
     }
 }
 
+impl BenchState {
+    fn take_live_consent(&mut self) -> harness::Consent {
+        if std::mem::take(&mut self.live_ack) {
+            harness::Consent::Confirmed
+        } else {
+            self.live_modal = true;
+            harness::Consent::None
+        }
+    }
+}
+
 impl StudioApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let renderer = match &cc.wgpu_render_state {
@@ -908,6 +919,15 @@ impl StudioApp {
     pub fn run_step(&mut self, step: Step) -> bool {
         let Some(r) = &self.recipe else { return false };
         let id = r.id.clone();
+        let consent = if step == Step::Live {
+            let consent = self.bench.take_live_consent();
+            if consent == harness::Consent::None {
+                return true;
+            }
+            consent
+        } else {
+            harness::Consent::None
+        };
         if step == Step::Lint {
             self.relint();
             let diags = &self.recipe.as_ref().unwrap().diagnostics;
@@ -936,7 +956,6 @@ impl StudioApp {
             Step::Live => harness::HarnessAction::InstallTest { recipes: vec![path], options: self.bench.live_options.clone() },
             Step::Lint => unreachable!(),
         };
-        let consent = if step == Step::Live { harness::Consent::Confirmed } else { harness::Consent::None };
         match harness::build(ws, &action, consent, &self.pwsh()) {
             Ok(spec) => {
                 let job = self.start_job(spec, JobKind::Harness { step, recipe_id: id.clone() });
@@ -1261,5 +1280,32 @@ impl StudioApp {
             }
         }
         self.save_settings();
+    }
+}
+
+#[cfg(test)]
+mod bench_tests {
+    use super::*;
+
+    #[test]
+    fn live_checks_pause_for_consent_and_consume_it_once() {
+        let mut bench = BenchState::default();
+        assert_eq!(bench.take_live_consent(), harness::Consent::None);
+        assert!(bench.live_modal);
+        assert!(!bench.live_ack);
+
+        bench.live_ack = true;
+        bench.live_modal = false;
+        assert_eq!(bench.take_live_consent(), harness::Consent::Confirmed);
+        assert!(!bench.live_ack);
+        assert!(!bench.live_modal);
+
+        assert_eq!(bench.take_live_consent(), harness::Consent::None);
+        assert!(bench.live_modal);
+    }
+
+    #[test]
+    fn all_checks_run_in_order_with_live_last() {
+        assert_eq!(Step::ALL, [Step::Lint, Step::Schema, Step::Download, Step::Package, Step::DryRun, Step::Live]);
     }
 }

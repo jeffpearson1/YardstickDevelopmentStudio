@@ -75,6 +75,12 @@ status bar.
 
 Only one agent process runs at a time, whether it came from the Agent view, a batch, or an extraction.
 
+Live validation requires all eight validation phases to pass (warnings are allowed).
+The result reader recognizes the harness's `PostInstallDetect` and
+`PostUninstallDetect` names as well as the older `PostDetect` and `PostUninstall`
+names. A run with `-SkipUninstall` remains incomplete even if its overall status
+is `Pass`; it has not tested uninstall, post-uninstall detection or residue.
+
 ### Batch mode (`intake.rs`)
 
 1. **Read.** The file is converted into `Record`s (title, description, ticket id, requester, and the remaining fields). The format is detected from the extension and the content: ServiceNow exports (`records`/`result` arrays, `number`/`short_description` keys), generic JSON/JSONL/YAML arrays, CSV/TSV with delimiter sniffing, spreadsheets via `calamine`, `docx` paragraphs, HTML with tags stripped, and plain text or email split into blocks. Header guessing handles columns such as "Short description", "Software" and "Product".
