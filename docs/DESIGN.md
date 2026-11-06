@@ -39,8 +39,9 @@ yardstick-studio.exe
     └─ settings.rs       %APPDATA%\YardstickStudio\settings.json
 ```
 
-The GUI only renders state owned by core types and forwards user intent to them, so every
-rule that matters for safety lives in `ystudio-core` and is tested there.
+Core command builders enforce writable-workspace and explicit-consent requirements.
+The GUI owns consent scope, sequential workflows and retry limits, with tests for those
+boundaries as well as the core rules.
 
 ### Jobs
 
@@ -58,7 +59,10 @@ dispatches on `JobKind`:
   `STUDIO-RECIPES:` line;
 - publish previews record whether the `-WhatIf` run succeeded for the current selection;
 - batch extraction jobs load the agent's `agent-items.json` into the batch;
-- agent jobs started from a batch item record that item's outcome, then start the next queued item;
+- agent jobs started from a batch item record changed recipes, then run that item's test-and-repair
+  pipeline before starting the next queued item;
+- workflow harness jobs verify fresh matching evidence, advance the stage, or send a recipe failure
+  to a repair agent; repair jobs restart the checks from lint;
 - git fetch/pull jobs refresh the ahead/behind status (a pull also rescans recipes and reloads an
   unedited open recipe); shared-sync jobs rescan icons and re-lint.
 
@@ -88,6 +92,30 @@ is `Pass`; it has not tested uninstall, post-uninstall detection or residue.
 3. **Agent extraction (optional).** The batch folder receives `digest.md` (the condensed records) and `recipes.md` (the existing recipe ids and names). The agent writes `agent-items.json`, which replaces the quick-scan items. The extract prompt allows writes only inside the batch folder.
 4. **Match.** Item names are normalised and compared with recipe ids and display names (`RecipeMeta`), to tell an *Update* or *Already packaged* item from a *New* one. The match also records whether the recipe's `iconFile` exists.
 5. **Run.** Selected items are queued. Each one becomes an `AgentTask::Create` or `AgentTask::Update` with the ticket context; if an icon was already saved, the agent is told to use it. Status, changed recipes and the log tail are stored on the item. The batch (`batch.json`) is saved after every change, and Running items are reset to Pending when a batch is loaded again.
+6. **Test and repair (`workflow.rs`).** Studio runs Lint, Schema, Download, Package,
+   DryRun and optionally Live for each authored Development recipe. A recipe failure is
+   returned to an `AgentTask::Fix`, then all checks restart. The default limit is five
+   test attempts (the first check plus at most four repairs); environmental blockers,
+   cancellation, missing recipes and missing/skipped evidence stop automatic repair.
+   The agent itself is still forbidden from running live installs.
+7. **Retest a batch.** `Test selected batch` gathers every included software item's
+   recipe ids, deduplicates them while preserving all ticket associations, and runs
+   checks sequentially without editing recipes. Failure stops that recipe, not the
+   remaining batch. Each item's `checks` records the outcome, timestamp and harness
+   evidence directory and is included in the copied report. Starting a retest invalidates
+   earlier outcomes so interrupted checks cannot appear successful.
+
+Live automation requires an explicit dialog listing the applications/recipe ids before
+starting. Consent is held only for that run or authoring queue, including bounded repair
+retries; selecting the live option is not consent. Automation never uses `-Force` or
+`-SkipUninstall` and never promotes or deploys recipes. Existing software can therefore
+block full validation without authorizing its removal. Workspace switching and concurrent
+agent/test runs are blocked while a pipeline is active.
+
+Both extraction and authoring prompts prefer authoritative vendor internet downloads.
+Shared-media links are preserved as fallback context, not used as the vendor start page.
+`manualDownload: true` is appropriate only when legitimate unattended vendor downloads are
+unavailable, with the reason and attempted sources documented by the agent.
 
 ### Icon engine (`icons.rs`)
 

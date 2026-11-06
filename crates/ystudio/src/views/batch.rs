@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use eframe::egui::{self, RichText, Ui};
 use ystudio_core::agent::{self, AgentTask, Snapshot};
 use ystudio_core::icons;
-use ystudio_core::intake::{self, Batch, BatchItem, ItemStatus, RequestKind};
+use ystudio_core::intake::{self, Batch, BatchCheck, BatchItem, ItemStatus, RequestKind};
 
 use crate::app::{JobKind, StudioApp, View, job_log};
 use crate::theme::{self, FluentText as _};
@@ -23,11 +23,12 @@ pub struct BatchState {
     pub queue: VecDeque<usize>,
     hide_other: bool,
     show_log: bool,
+    verification: Option<crate::workflow::Options>,
 }
 
 impl BatchState {
     fn busy(&self, app_jobs: &StudioApp) -> bool {
-        [self.extract_job, self.run_job].into_iter().flatten().any(|id| app_jobs.job(id).is_some_and(|j| j.proc.is_running())) || !self.queue.is_empty()
+        crate::workflow::busy(app_jobs) || !self.queue.is_empty()
     }
 }
 
@@ -61,6 +62,10 @@ fn save(app: &mut StudioApp) {
 }
 
 pub fn open_file(app: &mut StudioApp, path: &Path) {
+    if app.batch.busy(app) {
+        app.error("Finish or cancel the active batch/agent/test run before opening another request list.");
+        return;
+    }
     match intake::read_document(path) {
         Ok(doc) => {
             let n = doc.records.len();
@@ -114,6 +119,9 @@ fn icon_state(app: &StudioApp, it: &BatchItem) -> (String, egui::Color32) {
 fn task_for(app: &StudioApp, b: &Batch, idx: usize) -> Option<AgentTask> {
     let it = b.items.get(idx)?;
     let mut notes = it.agent_notes(b.record(&it.source));
+    if !it.vendor_url.is_empty() && agent::vendor_start_url(&it.vendor_url, &[]).is_empty() {
+        notes += &format!("\nRequest-supplied fallback media: {}. Research vendor downloads first.\n", it.vendor_url);
+    }
     let guess = icons::icon_file_name(&it.recipe_id());
     if app.ws_cache.icons.iter().any(|i| i.eq_ignore_ascii_case(&guess)) {
         notes += &format!("\nAn icon is already saved as Icons\\{guess}; set iconFile: {guess}.\n");
@@ -126,14 +134,30 @@ fn task_for(app: &StudioApp, b: &Batch, idx: usize) -> Option<AgentTask> {
         _ => Some(AgentTask::Create {
             app: it.app.clone(),
             id_hint: if it.suggested_id.is_empty() { ystudio_core::recipe::suggest_id(&it.app) } else { it.suggested_id.clone() },
-            vendor_url: if it.vendor_url.is_empty() { it.urls.first().cloned().unwrap_or_default() } else { it.vendor_url.clone() },
+            vendor_url: agent::vendor_start_url(&it.vendor_url, &it.urls),
             notes,
         }),
     }
 }
 
 fn any_agent_running(app: &StudioApp) -> bool {
-    app.jobs.iter().any(|j| j.proc.is_running() && matches!(j.kind, JobKind::Agent { .. } | JobKind::BatchExtract { .. }))
+    crate::workflow::busy(app)
+}
+
+pub fn start_authoring(app: &mut StudioApp, indices: Vec<usize>, options: crate::workflow::Options) {
+    let Some(b) = &mut app.batch.batch else {
+        app.error("Open a batch before starting authoring.");
+        return;
+    };
+    app.batch.queue = indices.into();
+    app.batch.verification = Some(options);
+    for &idx in &app.batch.queue {
+        b.items[idx].status = ItemStatus::Queued;
+        b.items[idx].checks.clear();
+    }
+    app.batch.show_log = true;
+    save(app);
+    start_next(app);
 }
 
 /// Starts the next queued item, if any.
@@ -152,7 +176,9 @@ pub fn start_next(app: &mut StudioApp) {
         match agent::build_command(&ws, app.settings.agent_backend, &app.settings.agent_model, &app.settings.production_paths, &task) {
             Ok(spec) => {
                 let before = Snapshot::take(&ws);
-                let job = app.start_job(spec, JobKind::Agent { before, batch_item: Some((batch_id, idx)) });
+                let verification = app.batch.verification.clone().and_then(|options| crate::workflow::task_id(&task)
+                    .map(|recipe_id| crate::workflow::Verification { recipe_id, options }));
+                let job = app.start_job(spec, JobKind::Agent { before, batch_item: Some((batch_id, idx)), verification });
                 let it = &mut app.batch.batch.as_mut().unwrap().items[idx];
                 if job.is_some() {
                     it.status = ItemStatus::Running;
@@ -175,6 +201,8 @@ pub fn start_next(app: &mut StudioApp) {
         }
     }
     reset_queued(app);
+    app.batch.verification = None;
+    save(app);
 }
 
 fn reset_queued(app: &mut StudioApp) {
@@ -187,6 +215,13 @@ fn reset_queued(app: &mut StudioApp) {
     }
 }
 
+pub fn stop_queue(app: &mut StudioApp) {
+    app.batch.queue.clear();
+    app.batch.verification = None;
+    reset_queued(app);
+    save(app);
+}
+
 fn with_batch(app: &mut StudioApp, batch_id: &str, f: impl FnOnce(&mut Batch)) {
     if let Some(b) = app.batch.batch.as_mut().filter(|b| b.id == batch_id) {
         f(b);
@@ -195,14 +230,19 @@ fn with_batch(app: &mut StudioApp, batch_id: &str, f: impl FnOnce(&mut Batch)) {
     }
     // The user switched batches meanwhile; update it on disk.
     let dir = Batch::root().join(batch_id);
-    if let Ok(mut b) = Batch::load(&dir) {
-        f(&mut b);
-        let _ = b.save();
+    match Batch::load(&dir) {
+        Ok(mut b) => {
+            f(&mut b);
+            if let Err(e) = b.save() {
+                app.error(format!("Could not save batch {batch_id}: {e:#}"));
+            }
+        }
+        Err(e) => app.error(format!("Could not load batch {batch_id}: {e:#}")),
     }
 }
 
 /// Called by the app when an agent run for a batch item ends.
-pub fn agent_finished(app: &mut StudioApp, batch_id: &str, idx: usize, ok: bool) {
+pub fn agent_finished(app: &mut StudioApp, batch_id: &str, idx: usize, ok: bool, verifying: bool) {
     let mut ids = app.agent.reported.clone();
     for c in &app.agent.changes {
         let p = c.path();
@@ -218,7 +258,7 @@ pub fn agent_finished(app: &mut StudioApp, batch_id: &str, idx: usize, ok: bool)
     let changed = app.agent.changes.len();
     with_batch(app, batch_id, |b| {
         if let Some(it) = b.items.get_mut(idx) {
-            it.status = if ok { ItemStatus::Done } else { ItemStatus::Failed };
+            it.status = if !ok { ItemStatus::Failed } else if verifying { ItemStatus::Running } else { ItemStatus::Done };
             it.recipes = ids;
             it.status_note = format!("{}; {changed} file(s) changed", if ok { "agent finished" } else { "agent exited with an error" });
         }
@@ -226,7 +266,51 @@ pub fn agent_finished(app: &mut StudioApp, batch_id: &str, idx: usize, ok: bool)
     if app.batch.run_job.is_some_and(|j| app.job(j).is_some_and(|j| !j.proc.is_running())) {
         app.batch.run_job = None;
     }
-    start_next(app);
+    if !verifying { start_next(app); }
+}
+
+pub fn check_finished(app: &mut StudioApp, batch_id: &str, idx: usize, check: BatchCheck) {
+    with_batch(app, batch_id, |b| {
+        if let Some(it) = b.items.get_mut(idx) {
+            it.checks.retain(|c| !c.recipe.eq_ignore_ascii_case(&check.recipe));
+            it.status_note = check.note.clone();
+            it.checks.push(check);
+            it.status = if it.checks.iter().all(|c| c.passed) { ItemStatus::Done } else { ItemStatus::Failed };
+        }
+    });
+}
+
+pub fn checks_started(app: &mut StudioApp, targets: &[crate::workflow::Target]) {
+    for target in targets {
+        for (batch_id, idx) in &target.items {
+            with_batch(app, batch_id, |b| {
+                if let Some(it) = b.items.get_mut(*idx) {
+                    it.checks.retain(|c| !c.recipe.eq_ignore_ascii_case(&target.id));
+                    it.checks.push(BatchCheck {
+                        recipe: target.id.clone(), passed: false, note: "Testing not completed".into(),
+                        timestamp: intake::timestamp(), summary_dir: None,
+                    });
+                    it.status = ItemStatus::Running;
+                    it.status_note = "queued for harness checks".into();
+                }
+            });
+        }
+    }
+}
+
+fn test_targets(batch: &Batch) -> Vec<crate::workflow::Target> {
+    let mut targets: Vec<crate::workflow::Target> = Vec::new();
+    for (idx, item) in batch.items.iter().enumerate().filter(|(_, i)| i.include && i.request != RequestKind::NotSoftware) {
+        let ids = if item.recipes.is_empty() { vec![item.recipe_id()] } else { item.recipes.clone() };
+        for id in ids {
+            if let Some(target) = targets.iter_mut().find(|t| t.id.eq_ignore_ascii_case(&id)) {
+                if !target.items.contains(&(batch.id.clone(), idx)) { target.items.push((batch.id.clone(), idx)); }
+            } else {
+                targets.push(crate::workflow::Target { id, items: vec![(batch.id.clone(), idx)] });
+            }
+        }
+    }
+    targets
 }
 
 /// Called by the app when an extraction agent ends.
@@ -275,7 +359,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         egui::Panel::right("batch-detail").resizable(true).default_size(380.0).show(ui, |ui| detail(app, ui));
     }
     let show_log = app.batch.show_log;
-    let log_job = app.batch.run_job.or(app.batch.extract_job);
+    let log_job = if app.workflow.busy() { app.workflow.last_job } else { app.batch.run_job.or(app.batch.extract_job) };
     if show_log && let Some(id) = log_job {
         egui::Panel::bottom("batch-log").resizable(true).default_size(220.0).show(ui, |ui| {
             if let Some(job) = app.job_mut(id) {
@@ -343,7 +427,7 @@ fn start_page(app: &mut StudioApp, ui: &mut Ui) {
         ui.label("2. A quick scan lists the software it can see and matches it against existing recipes.");
         ui.label("3. For messy tickets, “Extract with agent” has Copilot / Claude read every request and return a clean list.");
         ui.label("4. Review the list, then queue agent runs that write (or update) one recipe per item and find icons.");
-        ui.label("5. Test each recipe in the Test Bench, then copy the report back into your tickets.");
+        ui.label("5. Studio tests and repairs each recipe. Use Test selected batch to recheck the whole batch, then copy the report.");
     });
     if app.ws.is_none() {
         ui.label(RichText::new("Tip: open a Yardstick folder first so items can be matched to existing recipes.").small().weak());
@@ -353,14 +437,16 @@ fn start_page(app: &mut StudioApp, ui: &mut Ui) {
 fn items_table(app: &mut StudioApp, ui: &mut Ui) {
     let busy = app.batch.busy(app);
     let can_agent = app.writable() && app.ws_cache.has_skill;
+    let can_test = app.writable();
     let running_extract = app.batch.extract_job.and_then(|j| app.job(j)).is_some_and(|j| j.proc.is_running());
-    let running_items = app.batch.run_job.and_then(|j| app.job(j)).is_some_and(|j| j.proc.is_running()) || !app.batch.queue.is_empty();
+    let running_items = !app.workflow.running() && (app.batch.run_job.and_then(|j| app.job(j)).is_some_and(|j| j.proc.is_running()) || !app.batch.queue.is_empty());
     let queued = app.batch.queue.len();
     let backend = app.settings.agent_backend.label();
     let b = app.batch.batch.as_ref().unwrap();
     let total = b.items.len();
     let software = b.items.iter().filter(|i| i.request != RequestKind::NotSoftware).count();
     let included = b.items.iter().filter(|i| i.include && i.request != RequestKind::NotSoftware).count();
+    let pending = b.items.iter().filter(|i| i.include && i.request != RequestKind::NotSoftware && i.status != ItemStatus::Done).count();
     let file = b.source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let summary = format!("{} request(s) · {software} software item(s) · extracted by {}", b.records.len(), b.extracted_by);
     let format = b.format.clone();
@@ -370,6 +456,7 @@ fn items_table(app: &mut StudioApp, ui: &mut Ui) {
     let mut queue = false;
     let mut stop = false;
     let mut cancel = false;
+    let mut test = false;
     let st = &mut app.batch;
     theme::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -394,7 +481,7 @@ fn items_table(app: &mut StudioApp, ui: &mut Ui) {
             ui.separator();
             if running_items {
                 ui.spinner();
-                ui.label(format!("Agent working · {queued} queued"));
+                ui.label(format!("Batch working · {queued} queued"));
                 if ui.button("\u{E769}  Stop after this item").clicked() {
                     stop = true;
                 }
@@ -403,42 +490,47 @@ fn items_table(app: &mut StudioApp, ui: &mut Ui) {
                     cancel = true;
                 }
             } else {
-                let resp = theme::primary(ui, can_agent && included > 0 && !busy, RichText::new(format!("\u{E768}  Run agent on {included} selected")));
+                let resp = theme::primary(ui, can_agent && pending > 0 && !busy, RichText::new(format!("\u{E768}  Run agent on {pending} selected")));
                 if !can_agent {
                     resp.on_hover_text("Needs a writable development folder with the yardstick-recipes skill.");
                 } else if resp.clicked() {
                     queue = true;
                 }
             }
+            if ui.add_enabled(can_test && included > 0 && !busy, egui::Button::new("Test selected batch")).clicked() {
+                test = true;
+            }
             ui.separator();
             ui.checkbox(&mut st.hide_other, "Hide non-software");
-            ui.checkbox(&mut st.show_log, "Show agent log");
+            ui.checkbox(&mut st.show_log, "Show log");
         });
     });
+    ui.add_enabled_ui(!busy, |ui| crate::workflow::configure(&mut app.workflow.options, ui, true));
+    crate::workflow::progress(app, ui);
     if extract {
         start_extract(app);
     }
     if queue {
-        let b = app.batch.batch.as_mut().unwrap();
-        app.batch.queue = b
+        let b = app.batch.batch.as_ref().unwrap();
+        let indices = b
             .items
             .iter()
             .enumerate()
             .filter(|(_, i)| i.include && i.request != RequestKind::NotSoftware && i.status != ItemStatus::Done)
             .map(|(n, _)| n)
             .collect();
-        for &i in &app.batch.queue {
-            b.items[i].status = ItemStatus::Queued;
-        }
+        crate::workflow::request(app, crate::workflow::Request::BatchAuthor(indices));
+    }
+    if test {
+        let targets = test_targets(app.batch.batch.as_ref().unwrap());
         app.batch.show_log = true;
-        start_next(app);
+        crate::workflow::request(app, crate::workflow::Request::BatchTests(targets));
     }
     if stop {
-        app.batch.queue.clear();
-        reset_queued(app);
-        save(app);
+        crate::workflow::stop(app, false);
     }
     if cancel {
+        crate::workflow::stop(app, true);
         for id in [app.batch.run_job, app.batch.extract_job].into_iter().flatten() {
             if let Some(j) = app.job_mut(id) {
                 j.proc.cancel();
@@ -592,6 +684,7 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
     let mut icon = false;
     let mut matches_for = None;
     let mut close = false;
+    ui.add_enabled_ui(!busy, |ui| {
     egui::ScrollArea::vertical().id_salt("batch-detail-scroll").show(ui, |ui| {
         ui.horizontal(|ui| {
             theme::section_heading(ui, if edit.source.is_empty() { "Item" } else { &edit.source });
@@ -599,6 +692,7 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
                 if ui.small_button("\u{E711}").on_hover_text("Close").clicked() {
                     close = true;
                 }
+            });
             });
         });
         egui::Grid::new("batch-item-form").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
@@ -690,6 +784,15 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
         edit.existing_recipe = m.id;
     }
     if edit != it {
+        if edit.app != it.app || edit.version != it.version || edit.existing_recipe != it.existing_recipe
+            || edit.suggested_id != it.suggested_id || edit.vendor_url != it.vendor_url
+            || edit.notes != it.notes || edit.publisher != it.publisher
+        {
+            edit.recipes.clear();
+            edit.checks.clear();
+            edit.status = ItemStatus::Pending;
+            edit.status_note.clear();
+        }
         app.batch.batch.as_mut().unwrap().items[n] = edit;
         save(app);
     }
@@ -697,11 +800,30 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
         app.batch.selected = None;
     }
     if run {
-        app.batch.queue = VecDeque::from([n]);
-        app.batch.show_log = true;
-        start_next(app);
+        crate::workflow::request(app, crate::workflow::Request::BatchAuthor(vec![n]));
     }
     if icon {
         find_icon(app, n);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_testing_deduplicates_recipes_and_preserves_ticket_associations() {
+        let mut batch = Batch::new(intake::Document { path: PathBuf::from("requests.txt"), format: "text".into(), records: Vec::new() }, &[]);
+        batch.items = vec![
+            BatchItem { app: "One".into(), include: true, recipes: vec!["shared".into(), "other".into()], ..Default::default() },
+            BatchItem { app: "Two".into(), include: true, recipes: vec!["SHARED".into()], ..Default::default() },
+            BatchItem { app: "Excluded".into(), include: false, recipes: vec!["excluded".into()], ..Default::default() },
+            BatchItem { app: "Meeting".into(), include: true, request: RequestKind::NotSoftware, ..Default::default() },
+        ];
+        let targets = test_targets(&batch);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].id, "shared");
+        assert_eq!(targets[0].items, vec![(batch.id.clone(), 0), (batch.id.clone(), 1)]);
+        assert_eq!(targets[1].id, "other");
     }
 }

@@ -458,6 +458,18 @@ pub struct BatchItem {
     /// Recipe ids the agent reported for this item.
     pub recipes: Vec<String>,
     pub status_note: String,
+    /// Studio-owned harness evidence, retained when the batch is reopened.
+    pub checks: Vec<BatchCheck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchCheck {
+    pub recipe: String,
+    pub passed: bool,
+    pub note: String,
+    pub timestamp: String,
+    pub summary_dir: Option<PathBuf>,
 }
 
 impl BatchItem {
@@ -484,7 +496,7 @@ impl BatchItem {
             n += &format!("Version the requester mentioned: {}\n", self.version);
         }
         if !self.urls.is_empty() {
-            n += &format!("Links from the request (may be a vendor page, a direct download, or a shared folder with the installer):\n{}\n", self.urls.iter().map(|u| format!("- {u}")).collect::<Vec<_>>().join("\n"));
+            n += &format!("Links from the request (research vendor internet downloads first; shared folders/software dropbox are fallback media only):\n{}\n", self.urls.iter().map(|u| format!("- {u}")).collect::<Vec<_>>().join("\n"));
         }
         if !self.notes.is_empty() {
             n += &format!("Notes: {}\n", self.notes);
@@ -1029,15 +1041,17 @@ impl Batch {
     pub fn report(&self) -> String {
         let mut s = String::from("| Ticket | Software | Version | Outcome | Recipe | Notes |\n|---|---|---|---|---|---|\n");
         for it in &self.items {
-            let outcome = match it.status {
+            let outcome = if !it.checks.is_empty() {
+                it.checks.iter().map(|c| format!("{}: {}", c.recipe, c.note)).collect::<Vec<_>>().join("; ")
+            } else { match it.status {
                 ItemStatus::Done => "recipe ready for live test".to_string(),
                 ItemStatus::Failed => "agent failed".to_string(),
                 ItemStatus::Skipped => "skipped".to_string(),
                 _ => it.request.label().to_string(),
-            };
+            }};
             let recipe = if it.recipes.is_empty() { it.existing_recipe.clone() } else { it.recipes.join(", ") };
             let cell = |s: &str| s.replace('|', "/").replace('\n', " ");
-            s += &format!("| {} | {} | {} | {} | {} | {} |\n", cell(&it.source), cell(&it.app), cell(&it.version), outcome, cell(&recipe), cell(&it.notes));
+            s += &format!("| {} | {} | {} | {} | {} | {} |\n", cell(&it.source), cell(&it.app), cell(&it.version), cell(&outcome), cell(&recipe), cell(&it.notes));
         }
         s
     }
@@ -1253,6 +1267,25 @@ mod tests {
         assert_eq!(back.items, b.items);
         assert!(b.report().contains("| T1 | Zoom |"));
         assert_eq!(timestamp().len(), 19);
+    }
+
+    #[test]
+    fn harness_evidence_survives_reopen_and_overrides_agent_claims_in_report() {
+        let mut b = Batch::new(Document {
+            path: PathBuf::from("batch.txt"), format: "text".into(),
+            records: vec![Record { reference: "T1".into(), title: "Package Zoom".into(), ..Default::default() }],
+        }, &[]);
+        b.items[0].status = ItemStatus::Done;
+        b.items[0].checks.push(BatchCheck {
+            recipe: "zoom".into(), passed: false, note: "Live check failed | missing detection".into(),
+            timestamp: timestamp(), summary_dir: Some(PathBuf::from(r"C:\test\evidence")),
+        });
+        let back: Batch = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+        assert_eq!(back.items[0].checks, b.items[0].checks);
+        assert!(back.report().contains("zoom: Live check failed / missing detection"));
+        assert!(!back.report().contains("recipe ready for live test"));
+        let old: BatchItem = serde_json::from_str(r#"{"app":"Zoom","status":"done"}"#).unwrap();
+        assert!(old.checks.is_empty());
     }
 
     #[test]

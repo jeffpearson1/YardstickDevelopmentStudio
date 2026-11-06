@@ -21,7 +21,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
 
     let writable = app.writable();
     let id = app.recipe.as_ref().unwrap().id.clone();
-    let busy = app.bench.last_job.and_then(|j| app.job(j)).is_some_and(|j| j.proc.is_running());
+    let busy = crate::workflow::busy(app) || !app.batch.queue.is_empty();
 
     if matches!(app.ws.as_ref().map(|w| &w.kind), Some(WorkspaceKind::Unconfigured)) {
         theme::banner(ui, theme::amber(), |ui| {

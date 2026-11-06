@@ -100,7 +100,9 @@ pub enum StepState {
 pub enum JobKind {
     Harness { step: Step, recipe_id: String },
     /// `batch_item` is (batch id, item index) when a batch queued the run.
-    Agent { before: Snapshot, batch_item: Option<(String, usize)> },
+    Agent { before: Snapshot, batch_item: Option<(String, usize)>, verification: Option<crate::workflow::Verification> },
+    WorkflowHarness { step: Step, recipe_id: String },
+    WorkflowRepair { before: Snapshot },
     /// An agent reading a request list into batch items.
     BatchExtract { batch_id: String, backend: String },
     Clone { dest: PathBuf },
@@ -120,7 +122,7 @@ pub struct Job {
 
 impl Job {
     pub fn is_agent(&self) -> bool {
-        matches!(self.kind, JobKind::Agent { .. })
+        matches!(self.kind, JobKind::Agent { .. } | JobKind::WorkflowRepair { .. })
     }
 }
 
@@ -276,6 +278,7 @@ pub struct StudioApp {
     pub docs: views::docs::DocsState,
     pub promote: views::promote::PromoteState,
     pub update: views::update::UpdateState,
+    pub workflow: crate::workflow::State,
 }
 
 pub struct BenchState {
@@ -316,6 +319,29 @@ impl BenchState {
 }
 
 impl StudioApp {
+    #[cfg(test)]
+    pub(crate) fn isolated_for_tests(ws: Workspace) -> Self {
+        let settings = Settings::default();
+        let mut app = Self {
+            home: views::home::HomeState::new(&settings), settings,
+            ws: Some(ws), ws_error: None, view: View::Batch, recipes: Vec::new(),
+            ws_cache: WsCache::default(), recipe: None, jobs: Vec::new(), next_job: 1,
+            console_job: None, console_open: false, waker: Arc::new(|| {}),
+            status: Status::default(), pending: None, md_cache: CommonMarkCache::default(),
+            verdicts: BTreeMap::new(), runs: Vec::new(), perf: Perf::default(), git_status: None,
+            library: Default::default(), bench: Default::default(), agent: Default::default(),
+            batch: Default::default(), icons: Default::default(), runs_ui: Default::default(),
+            docs: Default::default(), promote: Default::default(), update: Default::default(), workflow: Default::default(),
+        };
+        app.refresh_recipes();
+        app
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poll_for_tests(&mut self) {
+        self.poll_jobs();
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let renderer = match &cc.wgpu_render_state {
             Some(rs) => {
@@ -362,6 +388,7 @@ impl StudioApp {
             docs: Default::default(),
             promote: Default::default(),
             update: Default::default(),
+            workflow: Default::default(),
         };
         theme::install_fonts(egui_ctx);
         app.apply_theme(egui_ctx);
@@ -444,6 +471,10 @@ impl StudioApp {
     // ---- workspace -------------------------------------------------------
 
     pub fn open_workspace(&mut self, path: &Path) {
+        if crate::workflow::busy(self) || !self.batch.queue.is_empty() {
+            self.error("Finish or cancel the active agent/test pipeline before switching workspaces.");
+            return;
+        }
         match Workspace::open(path, &self.settings.production_paths, &self.settings.trusted_dev_paths) {
             Ok(ws) => {
                 self.settings.remember_workspace(path.to_path_buf());
@@ -670,12 +701,22 @@ impl StudioApp {
 
     /// Re-runs the in-process linter if the text changed.
     pub fn relint(&mut self) {
-        let Some(ws) = &self.ws else { return };
-        let Some(r) = &mut self.recipe else { return };
+        let Some(r) = &self.recipe else { return };
         if r.lint_rev == r.rev {
             return;
         }
-        let doc = RecipeDoc::parse(&r.text).ok();
+        let diags = match self.lint_diagnostics(&r.text, &r.id) {
+            Ok(diags) => diags,
+            Err(e) => { self.error(e); return; }
+        };
+        let r = self.recipe.as_mut().unwrap();
+        r.diagnostics = diags;
+        r.lint_rev = r.rev;
+    }
+
+    pub fn lint_diagnostics(&self, text: &str, id: &str) -> Result<Vec<Diagnostic>, String> {
+        let ws = self.ws.as_ref().ok_or_else(|| "Open a workspace before linting a recipe.".to_string())?;
+        let doc = RecipeDoc::parse(text).ok();
         let base = doc
             .as_ref()
             .and_then(|d| d.get_str("base"))
@@ -687,11 +728,10 @@ impl StudioApp {
             })
             .and_then(|p| RecipeDoc::load(&p).ok());
         let icon_exists = |name: &str| ws.icon_exists(name);
-        let ctx = LintContext { file_id: Some(&r.id), icon_exists: Some(&icon_exists), base: base.as_ref(), shared_recipe: true };
-        let mut diags = lint::lint_text(&r.text, &ctx);
+        let ctx = LintContext { file_id: Some(id), icon_exists: Some(&icon_exists), base: base.as_ref(), shared_recipe: true };
+        let mut diags = lint::lint_text(text, &ctx);
         diags.sort_by_key(|d| d.severity);
-        r.diagnostics = diags;
-        r.lint_rev = r.rev;
+        Ok(diags)
     }
 
     // ---- jobs ------------------------------------------------------------
@@ -742,16 +782,23 @@ impl StudioApp {
         for id in finished {
             self.on_job_finished(id);
         }
+        crate::workflow::poll(self);
     }
 
     fn on_job_finished(&mut self, id: u64) {
         let Some(idx) = self.jobs.iter().position(|j| j.id == id) else { return };
         self.jobs[idx].handled = true;
         let ok = self.jobs[idx].proc.succeeded();
+        let cancelled = self.jobs[idx].proc.cancelled;
         let started = self.jobs[idx].started_sys;
         let text = self.jobs[idx].proc.text();
         let label = self.jobs[idx].proc.spec.label.clone();
         let kind = self.jobs[idx].kind.clone();
+        if cancelled && matches!(kind, JobKind::WorkflowHarness { .. } | JobKind::WorkflowRepair { .. }) {
+            crate::workflow::stop(self, true);
+        } else if cancelled && matches!(kind, JobKind::Agent { batch_item: Some(_), .. }) {
+            views::batch::stop_queue(self);
+        }
         match kind {
             JobKind::Harness { step, recipe_id } => {
                 let mut state = if ok { StepState::Pass } else { StepState::Fail };
@@ -782,7 +829,13 @@ impl StudioApp {
             JobKind::BatchExtract { batch_id, backend } => {
                 views::batch::extract_finished(self, &batch_id, ok, &backend);
             }
-            JobKind::Agent { before, batch_item } => {
+            JobKind::WorkflowHarness { step, recipe_id } => {
+                crate::workflow::harness_finished(self, step, &recipe_id, ok, started, text);
+            }
+            JobKind::WorkflowRepair { before } => {
+                crate::workflow::repair_finished(self, before, ok, &text);
+            }
+            JobKind::Agent { before, batch_item, verification } => {
                 if let Some(ws) = &self.ws {
                     let after = Snapshot::take(ws);
                     let mut changes = before.diff(&after);
@@ -805,8 +858,25 @@ impl StudioApp {
                 } else {
                     self.error(format!("Agent exited with an error ({n} file(s) changed)."));
                 }
-                if let Some((batch_id, idx)) = batch_item {
-                    views::batch::agent_finished(self, &batch_id, idx, ok);
+                let blocked = ystudio_core::agent::blocked_reason(&text).is_some();
+                if let Some((batch_id, idx)) = &batch_item {
+                    views::batch::agent_finished(self, batch_id, *idx, ok && !blocked, verification.is_some());
+                }
+                if let Some(verification) = verification {
+                    let resume_batch = batch_item.is_some();
+                    let items = batch_item.into_iter().collect();
+                    let target = crate::workflow::Target { id: verification.recipe_id.clone(), items };
+                    if ok && !blocked {
+                        crate::workflow::start(self, vec![target], verification.options, true, resume_batch);
+                    } else {
+                        if let Some((batch_id, idx)) = target.items.first() {
+                            views::batch::check_finished(self, batch_id, *idx, ystudio_core::intake::BatchCheck {
+                                recipe: target.id, passed: false, note: "Authoring agent failed or reported an environmental blocker.".into(),
+                                timestamp: ystudio_core::intake::timestamp(), summary_dir: None,
+                            });
+                            views::batch::start_next(self);
+                        }
+                    }
                 }
             }
             JobKind::Clone { dest } => {
@@ -897,6 +967,10 @@ impl StudioApp {
 
     /// Queues steps for the open recipe and starts the first one.
     pub fn run_steps(&mut self, steps: &[Step]) {
+        if crate::workflow::busy(self) || !self.batch.queue.is_empty() {
+            self.error("Finish the active agent/test pipeline before starting another test.");
+            return;
+        }
         let Some(r) = &self.recipe else { return };
         self.bench.queue = steps.iter().copied().collect();
         self.bench.queue_recipe = Some(r.id.clone());
@@ -1005,7 +1079,7 @@ impl StudioApp {
         for (view, icon, name) in View::NAV {
             let busy = match view {
                 View::Agent => self.jobs.iter().any(|j| j.is_agent() && j.proc.is_running()),
-                View::Batch => self.jobs.iter().any(|j| matches!(j.kind, JobKind::BatchExtract { .. }) && j.proc.is_running()) || !self.batch.queue.is_empty(),
+                View::Batch => self.workflow.busy() || self.jobs.iter().any(|j| matches!(j.kind, JobKind::BatchExtract { .. }) && j.proc.is_running()) || !self.batch.queue.is_empty(),
                 View::Icons => self.icons.searching(),
                 View::TestBench => self.bench.last_job.and_then(|id| self.job(id)).is_some_and(|j| j.proc.is_running()),
                 _ => false,
@@ -1267,6 +1341,7 @@ impl StudioApp {
         self.pending_modal(&ctx);
         views::testbench::live_modal(self, &ctx);
         views::promote::publish_modal(self, &ctx);
+        crate::workflow::modal(self, &ctx);
         self.perf.record(self.view, frame_start.elapsed().as_secs_f32() * 1000.0);
         if self.perf.continuous {
             ctx.request_repaint();

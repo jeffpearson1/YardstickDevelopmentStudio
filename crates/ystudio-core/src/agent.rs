@@ -98,6 +98,16 @@ pub fn guardrails(ws: &Workspace, production_paths: &[PathBuf]) -> String {
          4. Never execute a downloaded installer to see what it does; analyse it statically.\n\
          5. Never put scopeTags or other tenant-specific values in a recipe.\n\
          6. You cannot ask the user questions. Make reasonable, clearly stated assumptions.\n\n\
+         7. Prefer an authoritative internet download: the vendor's website/CDN/API or its official release repository. \
+            Follow redirects and use the existing Yardstick download helpers. A software dropbox, shared-drive link, \
+            or `manualDownload: true` is a LAST RESORT, not the default, even when a request contains a shared link. \
+            Use manual media only when no legitimate unattended vendor download is available (for example licensed \
+            or authenticated media), and document the sources tried and the precise reason. Never invent a URL or \
+            bypass authentication/licensing.\n\
+         8. When automatic testing is enabled, Studio runs the full test-and-repair pipeline after you finish. Run safe checks to inform your work, \
+            but do not run live tests yourself or claim validation. On a repair task, fix the supplied failure, \
+            then return so Studio can re-run the harness. If the cause is environmental, do not edit the recipe: \
+            finish with `STUDIO-BLOCKED: <reason>` as well as the recipe report.\n\n\
          Finish with the skill's final report (recipe path, resolved version, vendor sources, schema and -WhatIf \
          results, warnings, harness summary directory), then a line `STUDIO-RECIPES: <comma-separated ids you created or changed>`.\n",
         root = ws.root.display(),
@@ -114,7 +124,10 @@ pub fn task_prompt(task: &AgentTask) -> String {
                 p += &format!("Use the recipe id `{}` (file `Recipes\\Development\\{}.yaml`).\n", id_hint.trim(), id_hint.trim());
             }
             if !vendor_url.trim().is_empty() {
-                p += &format!("Vendor page to start from: {}\n", vendor_url.trim());
+                let label = if vendor_start_url(vendor_url, &[]).is_empty() {
+                    "Request-supplied fallback media (research the vendor first)"
+                } else { "Vendor page to start from" };
+                p += &format!("{label}: {}\n", vendor_url.trim());
             }
             if !notes.trim().is_empty() {
                 p += &format!("Notes from the user:\n{}\n", notes.trim());
@@ -161,6 +174,27 @@ pub fn task_prompt(task: &AgentTask) -> String {
 
 pub fn full_prompt(ws: &Workspace, production_paths: &[PathBuf], task: &AgentTask) -> String {
     format!("{}\n---\n\n{}", guardrails(ws, production_paths), task_prompt(task))
+}
+
+/// Avoid treating a request's shared-media link as its vendor research source.
+pub fn vendor_start_url(vendor: &str, urls: &[String]) -> String {
+    std::iter::once(vendor).chain(urls.iter().map(String::as_str))
+        .find(|url| {
+            let url = url.trim().to_ascii_lowercase();
+            let Some(authority) = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) else { return false };
+            let host = authority.split(['/', '?', '#']).next().unwrap_or_default()
+                .rsplit('@').next().unwrap_or_default().split(':').next().unwrap_or_default();
+            !host.is_empty() && !["dropbox.com", "dropboxusercontent.com", "sharepoint.com", "onedrive.com", "1drv.ms", "box.com"]
+                .iter().any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+        })
+        .unwrap_or_default().trim().to_string()
+}
+
+pub fn blocked_reason(output: &str) -> Option<String> {
+    output.lines().rev().find_map(|line| {
+        line.trim().trim_start_matches(['*', '`']).strip_prefix("STUDIO-BLOCKED:")
+            .map(|reason| reason.trim().trim_end_matches(['*', '`']).to_string())
+    })
 }
 
 /// Builds the agent CLI invocation. Refuses production workspaces.
@@ -226,7 +260,8 @@ pub fn extract_prompt(batch_dir: &Path) -> String {
          page, but do not download installers. Mark software that matches a recipe in `recipes.md` as `existing` \
          (or `update` if the requester needs a newer version or the request says the deployed one is outdated) and \
          set `existingRecipe` to that id. Keep links the requester gave in `urls`; mention shared-drive links \
-         (Dropbox, OneDrive, Box) in `notes` because the installer may need a manual download. Put licensing, \
+         (Dropbox, OneDrive, Box) in `notes` as fallback media only. Find the authoritative vendor product/download \
+         page for `vendorUrl` whenever possible; do not assume a shared link requires manualDownload. Put licensing, \
          architecture, prerequisites and anything a packager should know in `notes`.\n\n\
          Write the result as JSON to `{out}` in exactly this shape (the comments explain the fields; do not write \
          comments in the file):\n```\n{schema}\n```\n\
@@ -377,6 +412,20 @@ mod tests {
         assert!(p.contains("Never run `Yardstick.ps1`"));
         assert!(p.contains(r"Recipes\Development\obsidian.yaml"));
         assert!(p.contains("STUDIO-RECIPES"));
+        assert!(p.contains("LAST RESORT") && p.contains("authoritative internet download"));
+        assert!(p.contains("do not run live tests yourself"));
+        assert!(p.contains("STUDIO-BLOCKED"));
+    }
+
+    #[test]
+    fn shared_media_does_not_become_the_vendor_start_page() {
+        assert_eq!(vendor_start_url("https://team.sharepoint.com/software", &[
+            "https://www.dropbox.com/s/installer".into(), "https://vendor.example/download".into()
+        ]), "https://vendor.example/download");
+        assert!(vendor_start_url(r"\\server\softwaredropbox", &[]).is_empty());
+        assert_eq!(vendor_start_url("https://xbox.com/download", &[]), "https://xbox.com/download");
+        assert_eq!(vendor_start_url("https://vendor.example/?ref=dropbox.com", &[]), "https://vendor.example/?ref=dropbox.com");
+        assert_eq!(blocked_reason("**STUDIO-BLOCKED: MSI 1618**"), Some("MSI 1618".into()));
     }
 
     #[test]

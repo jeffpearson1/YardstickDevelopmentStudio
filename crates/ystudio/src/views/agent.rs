@@ -28,7 +28,6 @@ impl TaskKind {
     ];
 }
 
-#[derive(Default)]
 pub struct AgentState {
     pub kind: TaskKind,
     pub app_name: String,
@@ -44,6 +43,18 @@ pub struct AgentState {
     pub reported: Vec<String>,
     /// Whether each of [`AgentBackend::ALL`] is installed; probed once (PATH scan).
     backends_found: Option<[bool; AgentBackend::ALL.len()]>,
+    pub auto_test: bool,
+}
+
+impl Default for AgentState {
+    fn default() -> Self {
+        Self {
+            kind: TaskKind::default(), app_name: String::new(), id_hint: String::new(),
+            vendor_url: String::new(), notes: String::new(), target_id: String::new(),
+            evidence: String::new(), freeform: String::new(), show_prompt: false,
+            job: None, changes: Vec::new(), reported: Vec::new(), backends_found: None, auto_test: true,
+        }
+    }
 }
 
 impl AgentState {
@@ -51,6 +62,31 @@ impl AgentState {
         self.kind = TaskKind::Fix;
         self.target_id = id.to_string();
         self.evidence = evidence;
+    }
+
+    pub fn start(app: &mut StudioApp, mut task: AgentTask, options: Option<crate::workflow::Options>) {
+        let verification = options.and_then(|options| crate::workflow::task_id(&task)
+            .map(|recipe_id| crate::workflow::Verification { recipe_id, options }));
+        if let AgentTask::Create { id_hint, .. } = &mut task
+            && let Some(verification) = &verification
+        {
+            *id_hint = verification.recipe_id.clone();
+        }
+        let Some(ws) = &app.ws else {
+            app.error("Open a development workspace before starting the agent.");
+            return;
+        };
+        match agent::build_command(ws, app.settings.agent_backend, &app.settings.agent_model, &app.settings.production_paths, &task) {
+            Ok(spec) => {
+                let before = Snapshot::take(ws);
+                app.agent.changes.clear();
+                app.agent.reported.clear();
+                app.workflow.message.clear();
+                app.agent.job = app.start_job(spec, JobKind::Agent { before, batch_item: None, verification });
+                app.save_settings();
+            }
+            Err(e) => app.error(format!("{e:#}")),
+        }
     }
 
     fn task(&self) -> Result<AgentTask, &'static str> {
@@ -96,7 +132,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         });
     }
     // Two agents writing at once would muddle each other's change lists.
-    let running = app.jobs.iter().any(|j| j.proc.is_running() && matches!(j.kind, JobKind::Agent { .. } | JobKind::BatchExtract { .. }));
+    let running = crate::workflow::busy(app) || !app.batch.queue.is_empty();
     let open_id = app.recipe.as_ref().map(|r| r.id.clone());
     let ids: Vec<String> = app.recipes.iter().map(|r| r.id.clone()).collect();
 
@@ -177,13 +213,20 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             });
             ui.collapsing("Guardrails", |ui| {
                 ui.label(RichText::new(
-                    "The agent may only write inside this workspace, may run schema validation and -WhatIf dry runs, \
-                     and is denied Yardstick.ps1, Publish-Yardstick.ps1 and git push. Live install tests and promotion \
-                     stay with you in the Test Bench and Promote views.",
+                    "The agent prefers vendor internet downloads; software dropbox is a last resort. It may only write \
+                     inside this workspace and run safe checks. Studio owns live tests, requires consent, and sends \
+                     recipe failures back for bounded repairs. Production, publishing and git push remain denied.",
                 ).small());
             });
             let st = &mut app.agent;
             let task = st.task();
+            let can_verify = task.as_ref().ok().and_then(crate::workflow::task_id).is_some();
+            if can_verify {
+                ui.add_enabled(!running, egui::Checkbox::new(&mut st.auto_test, "Test and repair automatically"));
+                if st.auto_test {
+                    ui.add_enabled_ui(!running, |ui| crate::workflow::configure(&mut app.workflow.options, ui, true));
+                }
+            }
             ui.checkbox(&mut st.show_prompt, "Show the full prompt");
             if st.show_prompt
                 && let Ok(t) = &task
@@ -198,20 +241,16 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             let can_run = task.is_ok() && app.writable() && !running;
             if theme::primary(ui, can_run, RichText::new("\u{E99A}  Start agent")).clicked() {
                 let task = task.unwrap();
-                match agent::build_command(&ws, app.settings.agent_backend, &app.settings.agent_model, &app.settings.production_paths, &task) {
-                    Ok(spec) => {
-                        let before = Snapshot::take(&ws);
-                        app.agent.changes.clear();
-                        app.agent.reported.clear();
-                        app.agent.job = app.start_job(spec, JobKind::Agent { before, batch_item: None });
-                        app.save_settings();
-                    }
-                    Err(e) => app.error(format!("{e:#}")),
+                if can_verify && app.agent.auto_test {
+                    crate::workflow::request(app, crate::workflow::Request::Agent(task));
+                } else {
+                    AgentState::start(app, task, None);
                 }
             }
         });
     });
 
+    crate::workflow::progress(app, ui);
     // Output, changes and next steps.
     if !app.agent.changes.is_empty() || !app.agent.reported.is_empty() {
         let mut open = None;
@@ -247,7 +286,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                     }
                 });
             }
-            ui.label(RichText::new("The agent's claims are not a verdict - run the Test Bench (and the live test) yourself.").small().weak());
+            ui.label(RichText::new("Only Studio's recorded harness evidence establishes validation; the agent's claims do not.").small().weak());
         });
         if let Some(id) = open
             && app.open_recipe_by_id(&id)

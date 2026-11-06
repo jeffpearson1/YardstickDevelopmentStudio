@@ -5,6 +5,7 @@ mod highlight;
 mod soft;
 mod theme;
 mod views;
+mod workflow;
 
 use eframe::{egui, wgpu};
 
