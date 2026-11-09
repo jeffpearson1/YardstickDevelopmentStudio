@@ -44,6 +44,23 @@ fn status_badge(ui: &mut Ui, s: ItemStatus) {
     theme::badge(ui, t, c);
 }
 
+/// "done" covers both "the agent wrote a recipe" and "checks passed"; say which,
+/// and whether the recipe is complete (the contents that passed a live test).
+fn item_status_badge(app: &StudioApp, ui: &mut Ui, it: &BatchItem) {
+    if it.status != ItemStatus::Done {
+        return status_badge(ui, it.status);
+    }
+    let ids: Vec<String> = if it.recipes.is_empty() { vec![it.recipe_id()] } else { it.recipes.clone() };
+    let (text, color, hover) = if ids.iter().all(|id| app.completion(id).is_complete()) {
+        ("complete · not published", theme::green(), "Passed a live install test and unchanged since. Ready to publish.")
+    } else if !it.checks.is_empty() && it.checks.iter().all(|c| c.passed) {
+        ("checks passed", theme::blue(), "The checks that ran passed, but no live install test of the current recipe has.")
+    } else {
+        ("recipe written", theme::blue(), "The agent finished. Run the checks to validate it.")
+    };
+    theme::badge(ui, text, color).on_hover_text(hover);
+}
+
 fn request_color(r: RequestKind) -> egui::Color32 {
     match r {
         RequestKind::New => theme::accent(),
@@ -624,7 +641,7 @@ fn items_table(app: &mut StudioApp, ui: &mut Ui) {
                 ui.label(&it.version);
                 ui.label(RichText::new(it.request.label()).color(request_color(it.request)));
                 ui.horizontal(|ui| {
-                    status_badge(ui, it.status);
+                    item_status_badge(app, ui, it);
                     if !it.status_note.is_empty() {
                         // Long blocker notes stay readable on hover without widening the table.
                         let short: String = it.status_note.chars().take(90).collect();

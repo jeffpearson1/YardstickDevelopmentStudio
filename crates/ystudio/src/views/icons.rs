@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::SystemTime;
 
 use eframe::egui::{self, Color32, RichText, TextureHandle, Ui};
 use ystudio_core::icons::{self, Candidate, IconQuery, Process, RgbaImage, SearchEvent};
@@ -50,8 +51,17 @@ pub struct IconsState {
     preview: Option<Preview>,
     backdrop: Backdrop,
     last_saved: Option<String>,
+    current: Option<CurrentIcon>,
     /// Start a search on the next frame (set by other views' hooks).
     pub auto_search: bool,
+}
+
+/// The icon file the recipe uses today, shown beside the candidates.
+struct CurrentIcon {
+    path: PathBuf,
+    stamp: Option<SystemTime>,
+    /// `None` when the file is missing or cannot be decoded.
+    texture: Option<(TextureHandle, (u32, u32))>,
 }
 
 struct Preview {
@@ -430,14 +440,63 @@ fn candidate_grid(app: &mut StudioApp, ui: &mut Ui) {
     }
 }
 
+/// The recipe's `iconFile`, or the file name being saved when no recipe is chosen.
+fn current_icon_path(app: &StudioApp) -> Option<PathBuf> {
+    let ws = app.ws.as_ref()?;
+    let from_recipe = app.icons.recipe_id.as_ref()
+        .and_then(|id| app.recipes.iter().find(|r| &r.id == id))
+        .map(|r| r.meta.icon_file.trim().to_string())
+        .filter(|f| !f.is_empty());
+    let file = from_recipe.unwrap_or_else(|| app.icons.file_name.trim().to_string());
+    (!file.is_empty() && !file.contains(['\\', '/', ':'])).then(|| ws.layout.icons.join(file))
+}
+
+fn current_icon(app: &mut StudioApp, ui: &mut Ui) {
+    let Some(path) = current_icon_path(app) else { return };
+    let stamp = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    let st = &mut app.icons;
+    if st.current.as_ref().is_none_or(|c| c.path != path || c.stamp != stamp) {
+        let loaded = stamp.and_then(|_| std::fs::read(&path).ok()).and_then(|b| icons::decode(&b).ok())
+            .map(|d| (texture(ui.ctx(), "icon-current", &d.image), (d.image.width(), d.image.height())));
+        st.current = Some(CurrentIcon { path: path.clone(), stamp, texture: loaded });
+    }
+    let c = st.current.as_ref().unwrap();
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    theme::section_heading(ui, "Current icon");
+    match &c.texture {
+        Some((tex, size)) => {
+            ui.horizontal(|ui| {
+                for side in [96.0, 32.0] {
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+                    backdrop(ui, r, st.backdrop);
+                    let s = fit(*size, side - 4.0);
+                    egui::Image::new((tex.id(), s)).paint_at(ui, egui::Rect::from_center_size(r.center(), s));
+                }
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(&name).monospace());
+                    ui.label(RichText::new(format!("{}×{}", size.0, size.1)).small().weak());
+                });
+            });
+        }
+        None if c.stamp.is_some() => {
+            ui.colored_label(theme::amber(), format!("Icons\\{name} exists but could not be read."));
+        }
+        None => {
+            ui.label(RichText::new(format!("None yet - Icons\\{name} does not exist.")).weak());
+        }
+    }
+    ui.add_space(6.0);
+}
+
 fn preview_panel(app: &mut StudioApp, ui: &mut Ui) {
     let ctx = ui.ctx().clone();
-    let Some(c) = app.icons.selected().cloned() else {
-        ui.add_space(20.0);
-        ui.label(RichText::new("Select a candidate to preview and save it.").weak());
-        return;
-    };
     egui::ScrollArea::vertical().id_salt("icons-preview-scroll").show(ui, |ui| {
+        current_icon(app, ui);
+        let Some(c) = app.icons.selected().cloned() else {
+            ui.add_space(14.0);
+            ui.label(RichText::new("Select a candidate to preview and save it.").weak());
+            return;
+        };
         theme::section_heading(ui, "Preview");
         ui.label(RichText::new(&c.label).semibold());
         ui.label(RichText::new(&c.origin).small().weak());

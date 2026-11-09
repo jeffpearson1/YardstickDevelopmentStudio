@@ -14,7 +14,7 @@ use std::time::SystemTime;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::process::{ProcessSpec, which};
+use crate::process::{ProcessSpec, find_program, launcher};
 use crate::workspace::Workspace;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -41,8 +41,28 @@ impl AgentBackend {
         }
     }
 
+    /// Where the CLI's installers put it, in case PATH does not have it yet.
+    fn install_dirs(self) -> Vec<PathBuf> {
+        let local = dirs::data_local_dir().unwrap_or_default();
+        let npm = dirs::data_dir().unwrap_or_default().join("npm");
+        let winget = local.join(r"Microsoft\WinGet\Links");
+        match self {
+            AgentBackend::CopilotCli => vec![local.join("GitHubCopilotCLI"), winget, npm],
+            AgentBackend::ClaudeCode => vec![dirs::home_dir().unwrap_or_default().join(r".local\bin"), winget, npm],
+        }
+    }
+
     pub fn locate(self) -> Option<PathBuf> {
-        which(self.executable())
+        find_program(self.executable(), &self.install_dirs())
+    }
+
+    /// A process for this CLI, ready for arguments.
+    fn spec(self, label: impl Into<String>, cwd: &Path) -> Result<ProcessSpec> {
+        let exe = self.locate().ok_or_else(|| {
+            anyhow::anyhow!("{} (`{}`) was not found on PATH or in its usual install folders.", self.label(), self.executable())
+        })?;
+        let (program, prefix) = launcher(&exe)?;
+        Ok(ProcessSpec::new(label, program, cwd).args(prefix).env("NO_COLOR", "1"))
     }
 }
 
@@ -209,12 +229,9 @@ pub fn build_command(
     if !ws.has_skill() {
         bail!("This Yardstick folder has no .claude\\skills\\yardstick-recipes\\SKILL.md; update it from GitHub first.");
     }
-    let exe = backend.locate().ok_or_else(|| {
-        anyhow::anyhow!("{} (`{}`) was not found on PATH.", backend.label(), backend.executable())
-    })?;
     let prompt = full_prompt(ws, production_paths, task);
     let root = ws.root.to_string_lossy().into_owned();
-    let mut spec = ProcessSpec::new(task.title(), exe, &ws.root).env("NO_COLOR", "1");
+    let mut spec = backend.spec(task.title(), &ws.root)?;
     match backend {
         AgentBackend::CopilotCli => {
             spec = spec.args(["-p", &prompt, "--no-color", "--no-ask-user", "--stream", "on", "--add-dir", &root]);
@@ -274,12 +291,9 @@ pub fn extract_prompt(batch_dir: &Path) -> String {
 
 /// Agent invocation for batch extraction: confined to the batch folder, no shell.
 pub fn build_extract_command(backend: AgentBackend, model: &str, batch_dir: &Path) -> Result<ProcessSpec> {
-    let exe = backend.locate().ok_or_else(|| {
-        anyhow::anyhow!("{} (`{}`) was not found on PATH.", backend.label(), backend.executable())
-    })?;
     let prompt = extract_prompt(batch_dir);
     let dir = batch_dir.to_string_lossy().into_owned();
-    let mut spec = ProcessSpec::new("Extract software from request list", exe, batch_dir).env("NO_COLOR", "1");
+    let mut spec = backend.spec("Extract software from request list", batch_dir)?;
     match backend {
         AgentBackend::CopilotCli => {
             spec = spec.args(["-p", &prompt, "--no-color", "--no-ask-user", "--stream", "on", "--add-dir", &dir]);

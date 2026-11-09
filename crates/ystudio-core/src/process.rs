@@ -372,19 +372,69 @@ pub fn fmt_duration(d: Duration) -> String {
     }
 }
 
-/// Finds an executable on PATH (respecting PATHEXT-style extensions).
+/// Extensions Windows can launch, in the order a bare name is tried.
+#[cfg(windows)]
+const EXE_EXTS: [&str; 4] = ["exe", "com", "cmd", "bat"];
+
+/// Finds an executable on PATH. On Windows a bare name only matches files with
+/// an executable extension: an extensionless POSIX shim beside the `.exe` (VS
+/// Code puts one named `copilot` on PATH) cannot be launched.
 pub fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    let exts = ["", ".exe", ".cmd", ".bat"];
-    for dir in std::env::split_paths(&path) {
-        for ext in exts {
-            let candidate = dir.join(format!("{name}{ext}"));
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
+    std::env::split_paths(&path).find_map(|dir| find_in(&dir, name))
+}
+
+fn find_in(dir: &Path, name: &str) -> Option<PathBuf> {
+    exe_names(name).into_iter().map(|n| dir.join(n)).find(|c| c.is_file())
+}
+
+#[cfg(windows)]
+fn exe_names(name: &str) -> Vec<String> {
+    let has_ext = Path::new(name).extension().is_some_and(|e| EXE_EXTS.iter().any(|x| e.eq_ignore_ascii_case(x)));
+    if has_ext { vec![name.to_string()] } else { EXE_EXTS.iter().map(|e| format!("{name}.{e}")).collect() }
+}
+
+#[cfg(not(windows))]
+fn exe_names(name: &str) -> Vec<String> {
+    vec![name.to_string()]
+}
+
+/// [`which`], then the folders installers use without (yet) being on this
+/// process's PATH, then PATH re-read from the registry - so a tool installed
+/// while the Studio is open is found without a restart.
+pub fn find_program(name: &str, known_dirs: &[PathBuf]) -> Option<PathBuf> {
+    which(name)
+        .or_else(|| known_dirs.iter().find_map(|d| find_in(d, name)))
+        .or_else(|| refresh_path().ok().and_then(|()| which(name)))
+}
+
+/// How to launch `exe` with arguments that may span lines. Batch files cannot
+/// take a multi-line argument, so an npm shim (`copilot.cmd`) runs its Node
+/// script directly instead.
+pub fn launcher(exe: &Path) -> Result<(PathBuf, Vec<String>)> {
+    let is_batch = exe.extension().is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+    if !is_batch {
+        return Ok((exe.to_path_buf(), Vec::new()));
     }
-    None
+    let shim = std::fs::read_to_string(exe).with_context(|| format!("reading {}", exe.display()))?;
+    let dir = exe.parent().unwrap_or(Path::new("."));
+    let script = npm_shim_script(&shim).map(|rel| dir.join(rel)).filter(|s| s.is_file());
+    let node = Some(dir.join("node.exe")).filter(|n| n.is_file()).or_else(|| which("node"));
+    match (script, node) {
+        (Some(script), Some(node)) => Ok((node, vec![script.to_string_lossy().into_owned()])),
+        _ => anyhow::bail!(
+            "{} is a batch file, which cannot be given the Studio's multi-line prompt. Install the standalone \
+             executable instead (for example with winget), or make sure Node.js is on PATH.",
+            exe.display()
+        ),
+    }
+}
+
+/// The script an npm `cmd-shim` runs, relative to the shim's folder.
+fn npm_shim_script(shim: &str) -> Option<String> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r#"(?i)"%~?dp0%?\\(node_modules\\[^"]+)"\s+%\*"#).unwrap());
+    re.captures(shim).map(|c| c[1].to_string())
 }
 
 /// Re-reads the machine and user PATH from the registry into this process, so
@@ -392,17 +442,47 @@ pub fn which(name: &str) -> Option<PathBuf> {
 /// found without a restart. Entries only this process had are kept at the end.
 #[cfg(windows)]
 pub fn refresh_path() -> Result<()> {
-    let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-    let ps = PathBuf::from(system_root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
-    let script = "foreach ($t in 'Machine', 'User') { [Environment]::ExpandEnvironmentVariables([string][Environment]::GetEnvironmentVariable('Path', $t)) }";
-    let spec = ProcessSpec::new("refresh PATH", ps, &std::env::temp_dir()).args(["-NoProfile", "-NonInteractive", "-Command", script]);
-    let fresh = run_capture(&spec)?;
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    let machine = registry_string(HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment", "Path");
+    let user = registry_string(HKEY_CURRENT_USER, "Environment", "Path");
+    if machine.is_none() && user.is_none() {
+        anyhow::bail!("PATH could not be read from the registry");
+    }
+    let fresh = [machine, user].into_iter().flatten().collect::<Vec<_>>().join(";");
     let current = std::env::var("PATH").unwrap_or_default();
-    let merged = merge_path(&fresh.lines().collect::<Vec<_>>().join(";"), &current);
+    let merged = merge_path(&fresh, &current);
     // SAFETY: Windows environment access is serialised by the OS and std; the
     // Studio's other threads only read process output and never PATH.
     unsafe { std::env::set_var("PATH", merged) };
     Ok(())
+}
+
+/// A `REG_SZ` or `REG_EXPAND_SZ` value, with environment strings expanded.
+#[cfg(windows)]
+fn registry_string(root: windows_sys::Win32::System::Registry::HKEY, key: &str, value: &str) -> Option<String> {
+    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
+    use windows_sys::Win32::System::Registry::{RRF_RT_REG_SZ, RegGetValueW};
+    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let (key, value) = (wide(key), wide(value));
+    let mut buf = vec![0u16; 4096];
+    loop {
+        let mut bytes = (buf.len() * 2) as u32;
+        // SAFETY: the strings are NUL-terminated and `bytes` is the buffer's size in bytes.
+        let rc = unsafe {
+            RegGetValueW(root, key.as_ptr(), value.as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), buf.as_mut_ptr().cast(), &mut bytes)
+        };
+        match rc {
+            ERROR_SUCCESS => {
+                // Expansion happens in place and `bytes` can be the unexpanded
+                // size, so the string ends at the first NUL.
+                let len = (bytes as usize / 2).min(buf.len());
+                let end = buf[..len].iter().position(|&c| c == 0).unwrap_or(len);
+                return Some(String::from_utf16_lossy(&buf[..end]));
+            }
+            ERROR_MORE_DATA => buf.resize(bytes as usize / 2 + 1, 0),
+            _ => return None,
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -487,6 +567,53 @@ mod tests {
     fn merges_path_fresh_first_without_duplicates() {
         let merged = merge_path(r"C:\Windows;C:\Program Files\Git\cmd\;;", r"C:\windows\;C:\Users\me\bin;C:\Program Files\Git\cmd");
         assert_eq!(merged, r"C:\Windows;C:\Program Files\Git\cmd\;C:\Users\me\bin");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extensionless_shims_are_not_programs() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("copilot"), "#!/usr/bin/env sh\n").unwrap();
+        assert_eq!(find_in(d.path(), "copilot"), None);
+        std::fs::write(d.path().join("copilot.cmd"), "").unwrap();
+        std::fs::write(d.path().join("copilot.exe"), "").unwrap();
+        assert_eq!(find_in(d.path(), "copilot"), Some(d.path().join("copilot.exe")));
+        assert_eq!(find_in(d.path(), "copilot.cmd"), Some(d.path().join("copilot.cmd")));
+        assert_eq!(find_program("copilot", &[d.path().to_path_buf()]), which("copilot").or(Some(d.path().join("copilot.exe"))));
+    }
+
+    #[test]
+    fn npm_shims_run_their_node_script() {
+        let shim = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\n\
+            IF EXIST \"%dp0%\\node.exe\" (\r\n  SET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\n  SET \"_prog=node\"\r\n)\r\n\r\n\
+            endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\node_modules\\@github\\copilot\\npm-loader.js\" %*\r\n";
+        assert_eq!(npm_shim_script(shim).as_deref(), Some(r"node_modules\@github\copilot\npm-loader.js"));
+        assert_eq!(npm_shim_script("@echo off\r\nfoo.exe %*\r\n"), None);
+
+        let d = tempfile::tempdir().unwrap();
+        let cmd = d.path().join("copilot.cmd");
+        std::fs::write(&cmd, shim).unwrap();
+        std::fs::create_dir_all(d.path().join(r"node_modules\@github\copilot")).unwrap();
+        std::fs::write(d.path().join(r"node_modules\@github\copilot\npm-loader.js"), "").unwrap();
+        std::fs::write(d.path().join("node.exe"), "").unwrap();
+        let (program, prefix) = launcher(&cmd).unwrap();
+        assert_eq!(program, d.path().join("node.exe"));
+        assert_eq!(prefix, vec![d.path().join(r"node_modules\@github\copilot\npm-loader.js").to_string_lossy().into_owned()]);
+
+        let other = d.path().join("other.cmd");
+        std::fs::write(&other, "@echo off\r\nfoo.exe %*\r\n").unwrap();
+        assert!(launcher(&other).unwrap_err().to_string().contains("batch file"));
+        assert_eq!(launcher(Path::new(r"C:\x\copilot.exe")).unwrap(), (PathBuf::from(r"C:\x\copilot.exe"), Vec::new()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reads_path_from_the_registry() {
+        use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+        let path = registry_string(HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment", "Path").unwrap();
+        // Machine PATH is REG_EXPAND_SZ with %SystemRoot%; it comes back expanded.
+        assert!(!path.contains("%SystemRoot%") && path.to_lowercase().contains(r"\system32"), "{path}");
+        refresh_path().unwrap();
     }
 
     #[test]

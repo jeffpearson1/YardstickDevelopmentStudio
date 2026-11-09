@@ -5,17 +5,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::process::{ProcessSpec, refresh_path, run_capture, which};
+use crate::process::{ProcessSpec, find_program, run_capture};
 use crate::workspace::Workspace;
 
-/// Finds git on PATH, re-reading PATH from the registry once if it is missing
+/// Finds git on PATH, re-reading PATH from the registry if it is missing
 /// (git may have been installed since the Studio started).
 pub fn git_exe() -> Result<PathBuf> {
-    if let Some(g) = which("git") {
-        return Ok(g);
-    }
-    let _ = refresh_path();
-    which("git").ok_or_else(|| anyhow!("git was not found on PATH. Install Git (e.g. from Company Portal), then try again."))
+    find_program("git", &[]).ok_or_else(|| anyhow!("git was not found on PATH. Install Git (e.g. from Company Portal), then try again."))
 }
 
 pub fn is_repo(root: &Path) -> bool {
@@ -111,7 +107,7 @@ mod tests {
     fn clone_creates_missing_parents() {
         let d = tempfile::tempdir().unwrap();
         let dest = d.path().join(r"a\b\YardstickDev");
-        if which("git").is_none() {
+        if crate::process::which("git").is_none() {
             return;
         }
         let s = clone("https://example.invalid/repo", &dest).unwrap();

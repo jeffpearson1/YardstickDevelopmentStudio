@@ -8,6 +8,7 @@ pub mod icons;
 pub mod promote;
 pub mod recipes;
 pub mod runs;
+pub mod settings;
 pub mod testbench;
 pub mod update;
 
@@ -52,6 +53,31 @@ pub fn need_recipe(app: &mut StudioApp, ui: &mut Ui) -> bool {
         }
     });
     false
+}
+
+/// Shows how far a recipe has got: complete (the tested contents, not yet
+/// published), changed since it was validated, or its latest test verdict.
+/// Returns false when there is nothing to show.
+pub fn recipe_status_badge(app: &StudioApp, ui: &mut Ui, id: &str) -> bool {
+    use ystudio_core::validation::Completion;
+    let development = app.recipes.iter().find(|r| r.id.eq_ignore_ascii_case(id))
+        .is_some_and(|r| r.location == ystudio_core::workspace::RecipeLocation::Development);
+    match app.completion(id) {
+        Completion::Complete(r) => {
+            let text = if development { "Complete · not published" } else { "Validated" };
+            let warn = if r.warnings { " with warnings" } else { "" };
+            theme::badge(ui, text, theme::green()).on_hover_text(format!("Passed its live install test{warn} on {}, and is unchanged since.", r.tested));
+        }
+        Completion::Changed(r) => {
+            theme::badge(ui, "Changed since validation", theme::amber())
+                .on_hover_text(format!("Passed its live install test on {}, but has been edited since. Run the live test again.", r.tested));
+        }
+        Completion::NotValidated => {
+            let Some((v, ts)) = app.verdicts.get(id) else { return false };
+            theme::badge(ui, v.label(), theme::verdict_color(*v)).on_hover_text(format!("Install test {ts}"));
+        }
+    }
+    true
 }
 
 /// Banner explaining why actions are disabled in a production folder.

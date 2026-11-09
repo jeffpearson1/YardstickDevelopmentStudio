@@ -16,6 +16,7 @@ pub mod recipe;
 pub mod results;
 pub mod settings;
 pub mod update;
+pub mod validation;
 pub mod workspace;
 
 pub use workspace::{Workspace, WorkspaceKind};

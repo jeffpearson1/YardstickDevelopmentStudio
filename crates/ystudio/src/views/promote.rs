@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use eframe::egui::{self, RichText, Ui};
 use ystudio_core::harness::{self, Consent};
-use ystudio_core::results::{RecipeResult, VALIDATION_PHASES, Verdict};
+use ystudio_core::results::{RecipeResult, VALIDATION_PHASES};
 use ystudio_core::workspace::RecipeLocation;
 
 use crate::app::{JobKind, Step, StepState, StudioApp, job_log};
@@ -22,10 +22,6 @@ pub struct PromoteState {
     job: Option<u64>,
     /// `is_yardstick_root` result for the last target looked at.
     target_checked: Option<(PathBuf, bool)>,
-}
-
-fn verdict_ok(v: Option<Verdict>) -> bool {
-    matches!(v, Some(Verdict::Validated | Verdict::ValidatedWithWarnings))
 }
 
 impl PromoteState {
@@ -91,13 +87,8 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                             app.promote.selected.remove(id);
                         }
                     }
-                    match app.verdicts.get(id) {
-                        Some((v, ts)) => {
-                            theme::badge(ui, v.label(), theme::verdict_color(*v)).on_hover_text(format!("Install test {ts}"));
-                        }
-                        None => {
-                            theme::badge(ui, "never tested", theme::grey());
-                        }
+                    if !super::recipe_status_badge(app, ui, id) {
+                        theme::badge(ui, "never tested", theme::grey());
                     }
                 });
             }
@@ -122,11 +113,11 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             app.promote.ack = false;
         }
     });
-    let unvalidated: Vec<&String> = ids.iter().filter(|id| !verdict_ok(app.verdicts.get(*id).map(|v| v.0))).collect();
+    let unvalidated: Vec<&String> = ids.iter().filter(|id| !app.completion(id).is_complete()).collect();
     if !unvalidated.is_empty() {
         theme::banner(ui, theme::amber(), |ui| {
             ui.label(format!(
-                "Not fully validated: {}. Publish will show the recorded checks and ask whether to publish anyway.",
+                "Not complete (no passing live test of the current contents): {}. Publish will show the recorded checks and ask whether to publish anyway.",
                 unvalidated.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
             ));
         });
@@ -159,7 +150,7 @@ pub fn publish_modal(app: &mut StudioApp, ctx: &egui::Context) {
         return;
     }
     let ids: Vec<String> = app.promote.selected.iter().cloned().collect();
-    let incomplete = ids.iter().any(|id| !verdict_ok(app.verdicts.get(id).map(|v| v.0)));
+    let incomplete = ids.iter().any(|id| !app.completion(id).is_complete());
     let target = app.promote.target.clone().unwrap_or_default();
     let mut go = false;
     let mut cancel = false;
@@ -265,12 +256,6 @@ mod tests {
         let checks = validation_checks(None);
         assert_eq!(checks.len(), VALIDATION_PHASES.len());
         assert!(checks.iter().all(|s| s.ends_with(": Not recorded")));
-        assert!(!verdict_ok(None));
-        assert!(!verdict_ok(Some(Verdict::Incomplete)));
-        assert!(!verdict_ok(Some(Verdict::Failed)));
-        assert!(!verdict_ok(Some(Verdict::DryRunPassed)));
-        assert!(verdict_ok(Some(Verdict::Validated)));
-        assert!(verdict_ok(Some(Verdict::ValidatedWithWarnings)));
     }
 
     #[test]

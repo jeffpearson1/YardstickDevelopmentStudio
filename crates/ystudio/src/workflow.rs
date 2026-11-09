@@ -483,8 +483,11 @@ pub fn harness_finished(app: &mut StudioApp, step: Step, id: &str, ok: bool, sta
     } else { StepState::Fail });
     if let Some(run) = run {
         app.workflow.run.as_mut().unwrap().summary_dir = Some(run.dir.clone());
-        app.bench.last_run = Some(run);
         app.refresh_runs();
+        if passed && step == Step::Live {
+            app.record_validation(id, started, &run);
+        }
+        app.bench.last_run = Some(run);
     }
     if app.workflow.run.as_ref().is_some_and(|r| r.cancelled) {
         finish(app, false, "Cancelled; live-test cleanup may need manual review.".into());
@@ -795,6 +798,13 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         assert_eq!(saved.items[1].status, ystudio_core::intake::ItemStatus::Failed);
         assert_eq!(saved.items[2].status, ystudio_core::intake::ItemStatus::Done);
         assert!(saved.items[2].checks[0].passed);
+        // The passing live run is recorded against the recipe's contents.
+        assert!(app.completion("app").is_complete());
+        assert!(!app.completion("broken").is_complete());
+        let recipe = dir.path().join(r"Recipes\Development\app.yaml");
+        std::fs::write(&recipe, std::fs::read_to_string(&recipe).unwrap() + "notes: edited\n").unwrap();
+        app.refresh_recipes();
+        assert!(matches!(app.completion("app"), ystudio_core::validation::Completion::Changed(_)));
         assert!(saved.items[2].checks[0].summary_dir.as_ref().unwrap().is_dir());
         assert!(saved.report().contains("app: Validated"));
         assert!(saved.items[2].checks[0].note.contains("live test elevated"), "{}", saved.items[2].checks[0].note);
@@ -1021,5 +1031,35 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         app.workflow.message = "app: waiting for UAC approval to run the system-context live test".into();
         render(&mut app, "elevation-waiting", 1400, 900);
         app.workflow.run = None;
+    }
+
+    #[test]
+    fn settings_update_banner_current_icon_and_completion_render() {
+        let (dir, mut app) = fake_app();
+        let icon = image::RgbaImage::from_fn(64, 64, |x, y| image::Rgba([40, 120 + (x * 2) as u8, 200 - (y * 2) as u8, 255]));
+        icon.save(dir.path().join(r"Icons\app.png")).unwrap();
+        let ws = app.ws.clone().unwrap();
+        let mut ledger = ystudio_core::validation::Ledger::load(&ws.layout.harness_artifacts);
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        assert!(ledger.record("app", &ws.development_recipe_path("app"), later, results::Verdict::Validated, "2026-11-09 10:00:00", None).unwrap());
+        ledger.save().unwrap();
+        app.refresh_runs();
+        assert!(app.completion("app").is_complete());
+
+        app.update.status = crate::views::update::Status::Available(ystudio_core::update::Release {
+            version: "9.9.9".into(), notes: "Big release".into(), html_url: String::new(),
+            asset_name: "x.msi".into(), asset_url: String::new(), size: 1, sha256: None,
+        });
+        app.view = crate::app::View::Recipes;
+        render(&mut app, "recipes-complete-update-banner", 1400, 900);
+        app.view = crate::app::View::Settings;
+        render(&mut app, "settings", 1400, 1100);
+        render(&mut app, "settings-narrow", 900, 600);
+        crate::views::icons::prepare_for_recipe(&mut app, "app");
+        app.icons.auto_search = false;
+        app.view = crate::app::View::Icons;
+        render(&mut app, "icons-current", 1400, 900);
+        std::fs::remove_file(dir.path().join(r"Icons\app.png")).unwrap();
+        render(&mut app, "icons-current-missing", 1400, 900);
     }
 }

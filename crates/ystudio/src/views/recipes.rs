@@ -108,9 +108,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                 for g in &r.groups {
                     theme::badge(ui, g, theme::blue());
                 }
-                if let Some((v, ts)) = app.verdicts.get(&r.id) {
-                    theme::badge(ui, v.label(), theme::verdict_color(*v)).on_hover_text(format!("Install test {ts}"));
-                }
+                super::recipe_status_badge(app, ui, &r.id);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if r.location != RecipeLocation::Development
                         && ui.add_enabled(writable, egui::Button::new("\u{E8C8}  Copy to Development").small()).on_hover_text(

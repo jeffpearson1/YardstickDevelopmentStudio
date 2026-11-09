@@ -15,6 +15,7 @@ use ystudio_core::process::{ProcessSpec, RunningProcess, Stream, Waker, fmt_dura
 use ystudio_core::recipe::RecipeDoc;
 use ystudio_core::results::{self, InstallRun, Verdict};
 use ystudio_core::settings::Settings;
+use ystudio_core::validation::{Completion, Ledger};
 use ystudio_core::workspace::{RecipeEntry, RecipeLocation, Workspace, WorkspaceKind};
 
 use crate::theme::{self, FluentText as _};
@@ -33,10 +34,11 @@ pub enum View {
     Runs,
     Docs,
     Promote,
+    Settings,
 }
 
 impl View {
-    pub const NAV: [(View, &'static str, &'static str); 11] = [
+    pub const NAV: [(View, &'static str, &'static str); 12] = [
         (View::Home, theme::icon::HOME, "Home"),
         (View::Recipes, theme::icon::LIBRARY, "Recipes"),
         (View::Designer, theme::icon::EDIT, "Designer"),
@@ -48,6 +50,7 @@ impl View {
         (View::Runs, theme::icon::CHART, "Runs"),
         (View::Docs, theme::icon::BOOK, "Docs"),
         (View::Promote, theme::icon::UPLOAD, "Promote"),
+        (View::Settings, theme::icon::SETTINGS, "Settings"),
     ];
 }
 
@@ -264,6 +267,10 @@ pub struct StudioApp {
     pub md_cache: CommonMarkCache,
     /// Latest known verdict per recipe id, from the newest install-test runs.
     pub verdicts: BTreeMap<String, (Verdict, String)>,
+    /// Recipe contents that passed a live install test.
+    pub ledger: Ledger,
+    /// [`Completion`] of every recipe in the ledger, by lower-case id.
+    completion: BTreeMap<String, Completion>,
     pub runs: Vec<InstallRun>,
     pub perf: Perf,
     /// Branch and ahead/behind of the open workspace; `None` if it is not a git clone.
@@ -278,6 +285,7 @@ pub struct StudioApp {
     pub docs: views::docs::DocsState,
     pub promote: views::promote::PromoteState,
     pub update: views::update::UpdateState,
+    pub settings_ui: views::settings::SettingsState,
     pub workflow: crate::workflow::State,
     pub elevation: crate::elevation::State,
 }
@@ -324,12 +332,13 @@ impl StudioApp {
     pub(crate) fn isolated_for_tests(ws: Workspace) -> Self {
         let settings = Settings::default();
         let mut app = Self {
-            home: views::home::HomeState::new(&settings), settings,
+            home: views::home::HomeState::new(&settings), settings_ui: views::settings::SettingsState::new(&settings), settings,
             ws: Some(ws), ws_error: None, view: View::Batch, recipes: Vec::new(),
             ws_cache: WsCache::default(), recipe: None, jobs: Vec::new(), next_job: 1,
             console_job: None, console_open: false, waker: Arc::new(|| {}),
             status: Status::default(), pending: None, md_cache: CommonMarkCache::default(),
-            verdicts: BTreeMap::new(), runs: Vec::new(), perf: Perf::default(), git_status: None,
+            verdicts: BTreeMap::new(), ledger: Ledger::default(), completion: BTreeMap::new(),
+            runs: Vec::new(), perf: Perf::default(), git_status: None,
             library: Default::default(), bench: Default::default(), agent: Default::default(),
             batch: Default::default(), icons: Default::default(), runs_ui: Default::default(),
             docs: Default::default(), promote: Default::default(), update: Default::default(), workflow: Default::default(),
@@ -362,6 +371,7 @@ impl StudioApp {
         let waker: Waker = Arc::new(move || ctx.request_repaint());
         let mut app = Self {
             home: views::home::HomeState::new(&settings),
+            settings_ui: views::settings::SettingsState::new(&settings),
             settings,
             ws: None,
             ws_error: None,
@@ -378,6 +388,8 @@ impl StudioApp {
             pending: None,
             md_cache: CommonMarkCache::default(),
             verdicts: BTreeMap::new(),
+            ledger: Ledger::default(),
+            completion: BTreeMap::new(),
             runs: Vec::new(),
             perf: Perf::new(),
             git_status: None,
@@ -529,6 +541,37 @@ impl StudioApp {
             has_skill: ws.has_skill(),
             documents: ws.documents(),
         };
+        self.refresh_completion();
+    }
+
+    /// Re-hashes the recipes in the validation ledger.
+    fn refresh_completion(&mut self) {
+        let ledger = &self.ledger;
+        self.completion = ledger
+            .ids()
+            .filter_map(|id| self.recipes.iter().find(|r| r.id.eq_ignore_ascii_case(id)).map(|r| (id.to_string(), ledger.completion(id, &r.path))))
+            .collect();
+    }
+
+    /// Whether `id` is exactly what passed a live install test, or changed since.
+    pub fn completion(&self, id: &str) -> &Completion {
+        static NOT_VALIDATED: Completion = Completion::NotValidated;
+        self.completion.get(&id.to_lowercase()).unwrap_or(&NOT_VALIDATED)
+    }
+
+    /// Records a live install test that validated `id`, if the recipe has not
+    /// changed since the run started.
+    pub fn record_validation(&mut self, id: &str, started: SystemTime, run: &InstallRun) {
+        let Some(path) = self.ws.as_ref().and_then(|w| w.find_recipe(id)) else { return };
+        let Some(result) = run.summary.as_ref().and_then(|s| s.results.iter().find(|r| r.id == id)) else { return };
+        let saved = self
+            .ledger
+            .record(id, &path, started, result.verdict(), &run.timestamp, Some(run.dir.clone()))
+            .and_then(|recorded| if recorded { self.ledger.save() } else { Ok(()) });
+        if let Err(e) = saved {
+            self.error(format!("Could not record that {id} passed: {e:#}"));
+        }
+        self.refresh_completion();
     }
 
     /// Reads the branch and ahead/behind counts (local only, no network).
@@ -609,12 +652,14 @@ impl StudioApp {
     pub fn refresh_runs(&mut self) {
         let Some(ws) = &self.ws else { return };
         self.runs = results::list_install_runs(&ws.layout.harness_artifacts);
+        self.ledger = Ledger::load(&ws.layout.harness_artifacts);
         self.verdicts.clear();
         for run in &self.runs {
             for r in run.summary.iter().flat_map(|s| &s.results) {
                 self.verdicts.entry(r.id.clone()).or_insert((r.verdict(), run.timestamp.clone()));
             }
         }
+        self.refresh_completion();
     }
 
     // ---- recipes ---------------------------------------------------------
@@ -821,8 +866,13 @@ impl StudioApp {
                             }
                         };
                     }
-                    self.bench.last_run = run;
                     self.refresh_runs();
+                    if step == Step::Live
+                        && let Some(run) = &run
+                    {
+                        self.record_validation(&recipe_id, started, run);
+                    }
+                    self.bench.last_run = run;
                 }
                 self.bench.steps.insert((recipe_id.clone(), step), state);
                 if state == StepState::Fail {
@@ -1089,11 +1139,12 @@ impl StudioApp {
                 View::Batch => self.workflow.busy() || self.jobs.iter().any(|j| matches!(j.kind, JobKind::BatchExtract { .. }) && j.proc.is_running()) || !self.batch.queue.is_empty(),
                 View::Icons => self.icons.searching(),
                 View::TestBench => self.bench.last_job.and_then(|id| self.job(id)).is_some_and(|j| j.proc.is_running()),
+                View::Settings => self.update.badge_version(&self.settings.skipped_update).is_some(),
                 _ => false,
             };
             let mut resp = theme::nav_item(ui, icon, name, self.view == view, busy);
             if busy {
-                resp = resp.on_hover_text("Running");
+                resp = resp.on_hover_text(if view == View::Settings { "An update is available" } else { "Running" });
             }
             if resp.clicked() {
                 self.view = view;
@@ -1123,9 +1174,7 @@ impl StudioApp {
                 if errors == 0 && warnings == 0 {
                     theme::badge(ui, "lint clean", theme::green());
                 }
-                if let Some((v, _)) = self.verdicts.get(&r.id) {
-                    theme::badge(ui, v.label(), theme::verdict_color(*v));
-                }
+                views::recipe_status_badge(self, ui, &r.id);
             });
         });
     }
@@ -1332,18 +1381,22 @@ impl StudioApp {
             let top_left = if self.console_open { egui::CornerRadius { nw: 8, ..Default::default() } } else { egui::CornerRadius { nw: 8, sw: 8, ..Default::default() } };
             egui::Frame::new().fill(p.layer).stroke(egui::Stroke::new(1.0, p.card_stroke)).corner_radius(top_left).inner_margin(egui::Margin { left: 24, right: 24, top: 20, bottom: 12 })
         };
-        egui::CentralPanel::default().frame(content).show(ui, |ui| match self.view {
-            View::Home => views::home::show(self, ui),
-            View::Recipes => views::recipes::show(self, ui),
-            View::Designer => views::designer::show(self, ui),
-            View::Editor => views::editor::show(self, ui),
-            View::TestBench => views::testbench::show(self, ui),
-            View::Agent => views::agent::show(self, ui),
-            View::Batch => views::batch::show(self, ui),
-            View::Icons => views::icons::show(self, ui),
-            View::Runs => views::runs::show(self, ui),
-            View::Docs => views::docs::show(self, ui),
-            View::Promote => views::promote::show(self, ui),
+        egui::CentralPanel::default().frame(content).show(ui, |ui| {
+            views::update::banner(self, ui);
+            match self.view {
+                View::Home => views::home::show(self, ui),
+                View::Recipes => views::recipes::show(self, ui),
+                View::Designer => views::designer::show(self, ui),
+                View::Editor => views::editor::show(self, ui),
+                View::TestBench => views::testbench::show(self, ui),
+                View::Agent => views::agent::show(self, ui),
+                View::Batch => views::batch::show(self, ui),
+                View::Icons => views::icons::show(self, ui),
+                View::Runs => views::runs::show(self, ui),
+                View::Docs => views::docs::show(self, ui),
+                View::Promote => views::promote::show(self, ui),
+                View::Settings => views::settings::show(self, ui),
+            }
         });
 
         self.pending_modal(&ctx);

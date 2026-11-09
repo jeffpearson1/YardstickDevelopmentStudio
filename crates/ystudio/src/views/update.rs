@@ -1,5 +1,5 @@
-//! Self-update: background check and download, the Home "Updates" card and the
-//! status-bar badge. The work itself lives in `ystudio_core::update`.
+//! Self-update: background check and download, the Updates card in Settings,
+//! the banner above every page and the status-bar badge. The work itself lives in `ystudio_core::update`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,11 +35,13 @@ pub struct UpdateState {
     rx: Option<Receiver<Msg>>,
     /// A startup check: stay quiet about errors and skipped versions.
     quiet: bool,
+    /// The version whose banner was dismissed this session.
+    dismissed: Option<String>,
 }
 
 impl Default for UpdateState {
     fn default() -> Self {
-        Self { status: Status::Idle, rx: None, quiet: false }
+        Self { status: Status::Idle, rx: None, quiet: false, dismissed: None }
     }
 }
 
@@ -64,7 +66,7 @@ pub fn start_check(app: &mut StudioApp, quiet: bool) {
         let _ = tx.send(Msg::Checked(update::check(CURRENT_VERSION)));
         waker();
     });
-    app.update = UpdateState { status: Status::Checking, rx: Some(rx), quiet };
+    app.update = UpdateState { status: Status::Checking, rx: Some(rx), quiet, dismissed: app.update.dismissed.take() };
 }
 
 fn start_download(app: &mut StudioApp, release: Release) {
@@ -89,7 +91,7 @@ fn start_download(app: &mut StudioApp, release: Release) {
         let _ = tx.send(Msg::Downloaded(r, result));
         waker();
     });
-    app.update = UpdateState { status: Status::Downloading { release, progress }, rx: Some(rx), quiet: false };
+    app.update = UpdateState { status: Status::Downloading { release, progress }, rx: Some(rx), quiet: false, dismissed: app.update.dismissed.take() };
 }
 
 /// Drains finished checks and downloads. Called every frame.
@@ -100,7 +102,7 @@ pub fn poll(app: &mut StudioApp) {
     match msg {
         Msg::Checked(Ok(Some(r))) => {
             if !(quiet && r.version == app.settings.skipped_update) {
-                app.notify(format!("Yardstick Development Studio {} is available - see Updates on Home.", r.version));
+                app.notify(format!("Yardstick Development Studio {} is available - see Settings > Updates.", r.version));
             }
             app.update.status = Status::Available(r);
         }
@@ -175,14 +177,42 @@ pub fn badge(app: &mut StudioApp, ui: &mut Ui) {
     ui.separator();
     if ui
         .add(egui::Button::new(RichText::new(format!("\u{E896}  Update {v}")).color(theme::accent())).frame(false))
-        .on_hover_text("A newer Yardstick Development Studio is available. Open Updates on Home.")
+        .on_hover_text("A newer Yardstick Development Studio is available. Open Updates in Settings.")
         .clicked()
     {
-        app.view = View::Home;
+        app.view = View::Settings;
     }
 }
 
-/// The Updates card body on Home.
+/// Shown above every page while a newer release waits, until the user opens
+/// Updates or dismisses it for this session.
+pub fn banner(app: &mut StudioApp, ui: &mut Ui) {
+    if app.view == View::Settings {
+        return;
+    }
+    let Some(v) = app.update.badge_version(&app.settings.skipped_update).map(str::to_string) else { return };
+    if app.update.dismissed.as_deref() == Some(v.as_str()) {
+        return;
+    }
+    let what = if matches!(app.update.status, Status::Ready { .. }) { "is downloaded and ready to install" } else { "is available" };
+    let (mut open, mut later) = (false, false);
+    theme::banner(ui, theme::accent(), |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("Yardstick Development Studio {v} {what}.")).semibold());
+            open = theme::primary(ui, true, "View update").clicked();
+            later = ui.button("Later").clicked();
+        });
+    });
+    ui.add_space(8.0);
+    if open {
+        app.view = View::Settings;
+    }
+    if later {
+        app.update.dismissed = Some(v);
+    }
+}
+
+/// The Updates card body in Settings.
 pub fn card(app: &mut StudioApp, ui: &mut Ui) {
     theme::section_heading(ui, "Updates");
     ui.horizontal(|ui| {
