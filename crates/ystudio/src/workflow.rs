@@ -43,17 +43,50 @@ pub enum Request {
     Agent(AgentTask),
     BatchAuthor(Vec<usize>),
     BatchTests(Vec<Target>),
+    /// Existing recipes no check has confirmed: test them, and hand failures to the agent.
+    BatchRepair(Vec<Target>),
 }
 
 #[derive(Default)]
 pub struct State {
     pub options: Options,
     pub request: Option<Request>,
+    /// Where the requested recipes' live tests would run, read once per request.
+    contexts: Contexts,
     ack: bool,
     run: Option<Run>,
     pub last_job: Option<u64>,
     pub message: String,
     advance_pending: bool,
+}
+
+/// Recipe counts by where their live test runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Contexts {
+    system: usize,
+    user: usize,
+    /// Not authored yet; system-context is the default.
+    unknown: usize,
+}
+
+impl Contexts {
+    fn elevated(self) -> bool {
+        self.system + self.unknown > 0
+    }
+
+    fn summary(self) -> String {
+        let mut parts = Vec::new();
+        if self.system > 0 {
+            parts.push(format!("{} system-context (one elevated session)", self.system));
+        }
+        if self.user > 0 {
+            parts.push(format!("{} user-scope (unelevated)", self.user));
+        }
+        if self.unknown > 0 {
+            parts.push(format!("{} not authored yet (assumed system-context)", self.unknown));
+        }
+        parts.join(" · ")
+    }
 }
 
 struct Run {
@@ -69,6 +102,10 @@ struct Run {
     cancelled: bool,
     summary_dir: Option<PathBuf>,
     warned: bool,
+    /// Whether the current recipe's live test ran elevated.
+    elevated: Option<bool>,
+    /// The live step is waiting for the UAC prompt to be answered.
+    waiting_elevation: bool,
 }
 
 impl Run {
@@ -116,7 +153,34 @@ pub fn request(app: &mut StudioApp, request: Request) {
         return;
     }
     app.workflow.ack = false;
+    app.workflow.contexts = contexts(app, &request);
     app.workflow.request = Some(request);
+}
+
+fn contexts(app: &StudioApp, request: &Request) -> Contexts {
+    match request {
+        Request::Agent(_) => Contexts { unknown: 1, ..Contexts::default() },
+        Request::BatchAuthor(indices) => Contexts { unknown: indices.len(), ..Contexts::default() },
+        Request::BatchTests(targets) | Request::BatchRepair(targets) => {
+            let mut c = Contexts::default();
+            for path in targets.iter().map(|t| recipe_path(app, &t.id, false)) {
+                match path.filter(|p| p.is_file()) {
+                    Some(p) if harness::runs_elevated(&p) => c.system += 1,
+                    Some(_) => c.user += 1,
+                    None => c.unknown += 1,
+                }
+            }
+            c
+        }
+    }
+}
+
+/// Authoring and repairs always target the Development copy; testing may use a shipped recipe.
+fn recipe_path(app: &StudioApp, id: &str, repair: bool) -> Option<PathBuf> {
+    let path = app.ws.as_ref()?.development_recipe_path(id);
+    Some(if path.is_file() || repair { path } else {
+        app.recipes.iter().find(|r| r.id == id).map(|r| r.path.clone()).unwrap_or(path)
+    })
 }
 
 pub fn task_id(task: &AgentTask) -> Option<String> {
@@ -131,21 +195,29 @@ pub fn task_id(task: &AgentTask) -> Option<String> {
 
 pub fn modal(app: &mut StudioApp, ctx: &egui::Context) {
     let Some(request) = &app.workflow.request else { return };
-    let (labels, repairs) = match request {
-        Request::Agent(task) => (vec![task.title()], true),
-        Request::BatchAuthor(indices) => (
+    let shipped_only = |id: &str| app.ws.as_ref().is_some_and(|ws| !ws.development_recipe_path(id).is_file());
+    let (heading, labels, repairs) = match request {
+        Request::Agent(task) => ("Create, test and repair recipes", vec![task.title()], true),
+        Request::BatchAuthor(indices) => ("Create, test and repair recipes",
             indices.iter().filter_map(|&i| app.batch.batch.as_ref()?.items.get(i))
                 .map(|it| format!("{} ({})", it.app, it.recipe_id())).collect(), true),
-        Request::BatchTests(targets) => (targets.iter().map(|t| t.id.clone()).collect(), false),
+        Request::BatchTests(targets) => ("Test selected batch recipes", targets.iter().map(|t| t.id.clone()).collect(), false),
+        Request::BatchRepair(targets) => ("Repair batch recipes with agent", targets.iter().map(|t| if shipped_only(&t.id) {
+            format!("{} (shipped recipe; copied into Recipes\\Development first)", t.id)
+        } else { t.id.clone() }).collect(), true),
     };
+    let repairing_tested = matches!(request, Request::BatchRepair(_));
     let mut go = false;
     let mut cancel = false;
     egui::Modal::new(egui::Id::unique("workflow-consent")).show(ctx, |ui| {
         ui.set_max_width(580.0);
-        ui.heading(if repairs { "Create, test and repair recipes" } else { "Test selected batch recipes" });
+        ui.heading(heading);
         egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
             for label in &labels { ui.label(label); }
         });
+        if repairing_tested {
+            ui.label("These recipes have no passing check yet. Each is tested first; a recipe that passes is left unchanged.");
+        }
         ui.label("Studio runs lint, schema, download, package and dry-run checks sequentially.");
         if repairs {
             ui.label(format!("Up to {} test attempts per recipe. Recipe failures go back to the agent; environmental blockers stop repair.", app.workflow.options.attempts));
@@ -154,11 +226,24 @@ pub fn modal(app: &mut StudioApp, ctx: &egui::Context) {
         }
         if app.workflow.options.live {
             let warning = if repairs {
-                "Live checks INSTALL and UNINSTALL real software on THIS machine, including repeated runs after repairs. System installs may show UAC prompts."
+                "Live checks INSTALL and UNINSTALL real software on THIS machine, including repeated runs after repairs."
             } else {
-                "Live checks INSTALL and UNINSTALL real software on THIS machine. System installs may show UAC prompts."
+                "Live checks INSTALL and UNINSTALL real software on THIS machine."
             };
             ui.label(RichText::new(warning).color(theme::red()));
+            let contexts = app.workflow.contexts;
+            if contexts.elevated() {
+                ui.label(format!(
+                    "{}  One UAC prompt for Yardstick Development Studio appears when you start. A hidden elevated worker then runs the system-context live tests and closes when this run ends.",
+                    crate::elevation::SHIELD
+                ));
+                if repairs {
+                    ui.label("Recipes the repair agent edits are tested again in that session without another prompt.");
+                }
+            } else {
+                ui.label("Every listed recipe is user-scope, so live tests run unelevated with no UAC prompt.");
+            }
+            ui.label(RichText::new(contexts.summary()).weak());
             ui.label("No -Force or SkipUninstall: already-installed software may block full validation. Promotion and Intune deployment are never automatic.");
             ui.checkbox(&mut app.workflow.ack, "I consent to live install/uninstall tests for all applications listed above.");
         }
@@ -175,12 +260,45 @@ pub fn modal(app: &mut StudioApp, ctx: &egui::Context) {
         app.workflow.ack = false;
         let mut options = app.workflow.options.clone();
         options.consent = if options.live { Consent::Confirmed } else { Consent::None };
+        // Before any UAC prompt, so a failed copy asks for nothing.
+        if let Request::BatchRepair(targets) = &request
+            && let Err(e) = copy_shipped_to_development(app, targets)
+        {
+            app.error(format!("Could not prepare the repairs: {e:#}"));
+            return;
+        }
+        if options.live && app.workflow.contexts.elevated() {
+            crate::elevation::begin(app);
+        }
         match request {
             Request::Agent(task) => crate::views::agent::AgentState::start(app, task, Some(options)),
             Request::BatchAuthor(indices) => crate::views::batch::start_authoring(app, indices, options),
             Request::BatchTests(targets) => start(app, targets, options, false, false),
+            Request::BatchRepair(targets) => start(app, targets, options, true, false),
         }
     }
+}
+
+/// Repairs edit only Development copies, so a recipe that exists only as a
+/// shipped recipe is copied there first under the same id (overriding the
+/// shipped one while it is worked on). The shipped file is never changed.
+fn copy_shipped_to_development(app: &mut StudioApp, targets: &[Target]) -> anyhow::Result<()> {
+    let Some(ws) = app.ws.clone() else { anyhow::bail!("No workspace is open.") };
+    let mut copied = false;
+    for target in targets {
+        if ws.development_recipe_path(&target.id).is_file() {
+            continue;
+        }
+        let Some(src) = app.recipes.iter().find(|r| r.id.eq_ignore_ascii_case(&target.id)).map(|r| (r.path.clone(), r.id.clone())) else {
+            anyhow::bail!("Recipe {} was not found.", target.id);
+        };
+        ws.copy_to_development(&src.0, &src.1, &target.id)?;
+        copied = true;
+    }
+    if copied {
+        app.refresh_recipes();
+    }
+    Ok(())
 }
 
 pub fn start(app: &mut StudioApp, targets: Vec<Target>, options: Options, repair: bool, resume_batch: bool) {
@@ -200,14 +318,18 @@ pub fn start(app: &mut StudioApp, targets: Vec<Target>, options: Options, repair
     };
     app.workflow.run = Some(Run {
         root, queue, current, options, repair, resume_batch, attempt: 1, step: 0,
-        stopped: false, cancelled: false, summary_dir: None, warned: false,
+        stopped: false, cancelled: false, summary_dir: None, warned: false, elevated: None, waiting_elevation: false,
     });
     app.workflow.advance_pending = false;
     advance(app);
 }
 
 pub fn poll(app: &mut StudioApp) {
-    if std::mem::take(&mut app.workflow.advance_pending) {
+    let answered = app.workflow.run.as_ref().is_some_and(|r| r.waiting_elevation) && !crate::elevation::waiting(app);
+    if std::mem::take(&mut app.workflow.advance_pending) || answered {
+        if let Some(run) = &mut app.workflow.run {
+            run.waiting_elevation = false;
+        }
         advance(app);
     }
 }
@@ -234,12 +356,8 @@ fn advance(app: &mut StudioApp) {
         let id = run.current.id.clone();
         let attempt = run.attempt;
         app.workflow.message = format!("{}: {} (attempt {attempt}/{})", id, step.title(), run.options.attempts);
-        let Some(ws) = &app.ws else { return };
-        let path = ws.development_recipe_path(&id);
-        // Authoring and repairs always target the Development copy; testing may use a shipped recipe.
-        let path = if path.is_file() { path } else if !run.repair {
-            app.recipes.iter().find(|r| r.id == id).map(|r| r.path.clone()).unwrap_or(path)
-        } else { path };
+        let consent = if step == Step::Live { run.options.consent } else { Consent::None };
+        let Some(path) = recipe_path(app, &id, run.repair) else { return };
         if !ystudio_core::recipe::is_valid_id(&id) || !path.is_file() {
             finish(app, false, format!("Recipe {id} is missing; create its Development copy first."));
             return;
@@ -258,39 +376,71 @@ fn advance(app: &mut StudioApp) {
             let state = if failed { StepState::Fail } else if lint::count(&diagnostics, Severity::Warning) > 0 { StepState::Warn } else { StepState::Pass };
             app.bench.steps.insert((id, step), state);
             if failed {
-                fail(app, format!("{diagnostics:?}"), false);
+                let errors: Vec<&str> = diagnostics.iter().filter(|d| d.severity == Severity::Error).map(|d| d.message.as_str()).collect();
+                let summary = format!("Studio lint: {}", errors.join("; "));
+                fail(app, format!("{diagnostics:?}"), summary, false);
                 return;
             }
             app.workflow.run.as_mut().unwrap().step += 1;
             continue;
+        }
+        if step == Step::Live && harness::runs_elevated(&path) {
+            let proc = match crate::elevation::install_test(app, &path) {
+                crate::elevation::Live::Started(proc) => proc,
+                crate::elevation::Live::Waiting => {
+                    app.workflow.message = format!("{id}: waiting for UAC approval to run the system-context live test");
+                    app.workflow.run.as_mut().unwrap().waiting_elevation = true;
+                    return;
+                }
+                crate::elevation::Live::Blocked(reason) => {
+                    finish(app, false, format!("Blocked: {reason} The system-context live test did not run."));
+                    return;
+                }
+            };
+            app.workflow.run.as_mut().unwrap().elevated = Some(true);
+            let job = app.add_job(*proc, JobKind::WorkflowHarness { step, recipe_id: id.clone() });
+            track(app, id, step, Some(job), " · elevated session");
+            return;
         }
         let action = match step {
             Step::Schema => HarnessAction::Schema { recipe: path },
             Step::Download => HarnessAction::Lab { recipe: path, stage: LabStage::Download },
             Step::Package => HarnessAction::Lab { recipe: path, stage: LabStage::Package },
             Step::DryRun => HarnessAction::InstallTest { recipes: vec![path], options: InstallTestOptions::dry_run() },
-            Step::Live => HarnessAction::InstallTest { recipes: vec![path], options: InstallTestOptions::live() },
+            // User scope: the harness must never raise a UAC prompt of its own.
+            Step::Live => HarnessAction::InstallTest { recipes: vec![path], options: InstallTestOptions { no_elevate: true, ..InstallTestOptions::live() } },
             Step::Lint => unreachable!(),
         };
-        let consent = if step == Step::Live { run.options.consent } else { Consent::None };
+        let Some(ws) = &app.ws else { return };
         let spec = match harness::build(ws, &action, consent, &app.pwsh()) {
             Ok(spec) => spec,
             Err(e) => { finish(app, false, format!("Could not build harness command: {e:#}")); return; }
         };
         let job = app.start_job(spec, JobKind::WorkflowHarness { step, recipe_id: id.clone() });
-        app.workflow.last_job = job;
-        app.bench.last_job = job;
-        app.agent.job = job;
-        if app.workflow.run.as_ref().is_some_and(|r| !r.current.items.is_empty()) {
-            app.batch.run_job = job;
-        }
-        app.console_open = true;
-        if job.is_some() {
-            app.bench.steps.insert((id, step), StepState::Running);
-        } else {
-            finish(app, false, "Could not start the harness; check the console.".into());
-        }
+        let context = if step == Step::Live {
+            app.workflow.run.as_mut().unwrap().elevated = Some(false);
+            " · unelevated (user scope)"
+        } else { "" };
+        track(app, id, step, job, context);
         return;
+    }
+}
+
+/// Points the logs at a started harness job and marks the step running.
+fn track(app: &mut StudioApp, id: String, step: Step, job: Option<u64>, context: &str) {
+    app.workflow.last_job = job;
+    app.bench.last_job = job;
+    app.agent.job = job;
+    let items = app.workflow.run.as_ref().map(|r| r.current.items.clone()).unwrap_or_default();
+    if !items.is_empty() {
+        app.batch.run_job = job;
+    }
+    app.console_open = true;
+    if job.is_some() {
+        crate::views::batch::checks_progress(app, &items, &format!("{}{context}", step.title()));
+        app.bench.steps.insert((id, step), StepState::Running);
+    } else {
+        finish(app, false, "Could not start the harness; check the console.".into());
     }
 }
 
@@ -308,7 +458,7 @@ fn environmental(text: &str) -> bool {
     ["msi 1618", "exit code 1618", "exitcode: 1618", "another installation is already in progress",
         "access is denied", "requires elevation", "elevation was cancelled", "user canceled", "user cancelled",
         "intunewin32app module is not", "no licensed installer", "no installer found in",
-        "already installed", "already detected"].iter().any(|s| text.contains(s))
+        "already installed", "already detected", "elevated worker ended", "refused by the elevated worker"].iter().any(|s| text.contains(s))
 }
 
 pub fn harness_finished(app: &mut StudioApp, step: Step, id: &str, ok: bool, started: SystemTime, text: String) {
@@ -322,6 +472,12 @@ pub fn harness_finished(app: &mut StudioApp, step: Step, id: &str, ok: bool, sta
     let warning = result.is_some_and(|r| r.verdict() == Verdict::ValidatedWithWarnings);
     let details = result.map(|r| format!("\nHarness evidence: {r:#?}")).unwrap_or_default();
     let evidence = format!("{} for {id}\n{text}{details}", step.title());
+    let why = match result {
+        Some(r) => r.problems(),
+        None if matches!(step, Step::DryRun | Step::Live) && ok => "no matching harness evidence".into(),
+        None => last_error(&text),
+    };
+    let summary = format!("{}: {why}", step.title());
     app.bench.steps.insert((id.into(), step), if passed {
         if warning { StepState::Warn } else { StepState::Pass }
     } else { StepState::Fail });
@@ -339,15 +495,25 @@ pub fn harness_finished(app: &mut StudioApp, step: Step, id: &str, ok: bool, sta
     } else {
         // Missing/skipped evidence is not a recipe defect and must not trigger edits.
         let blocker = environmental(&evidence) || (ok && !passed);
-        fail(app, evidence, blocker);
+        fail(app, evidence, summary, blocker);
     }
 }
 
-fn fail(app: &mut StudioApp, evidence: String, blocker: bool) {
+/// The most telling output line: the last one mentioning an error, else the last one.
+fn last_error(text: &str) -> String {
+    let lines = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("> ") && !l.starts_with("Exited with code"));
+    let lines: Vec<&str> = lines.collect();
+    let line = lines.iter().rev().find(|l| l.to_ascii_lowercase().contains("error")).or(lines.last());
+    line.map_or_else(|| "no output".into(), |l| l.to_string())
+}
+
+/// `evidence` is the full record for the repair agent; `summary` is one line
+/// for status messages and batch notes.
+fn fail(app: &mut StudioApp, evidence: String, summary: String, blocker: bool) {
     let Some(run) = &mut app.workflow.run else { return };
     if !run.can_repair(blocker) {
         let prefix = if blocker { "Blocked (environment or incomplete harness evidence)" } else { "Checks failed" };
-        finish(app, false, format!("{prefix}: {}", tail(&evidence, 1600)));
+        finish(app, false, format!("{prefix}: {summary}"));
         return;
     }
     run.attempt += 1;
@@ -375,8 +541,10 @@ fn fail(app: &mut StudioApp, evidence: String, blocker: bool) {
     if job.is_none() { finish(app, false, "Could not start the repair agent.".into()); }
 }
 
-fn tail(text: &str, limit: usize) -> String {
-    text.chars().rev().take(limit).collect::<String>().chars().rev().collect()
+/// `text` on one line, cut to `limit` characters.
+fn brief(text: &str, limit: usize) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() <= limit { line } else { format!("{}…", line.chars().take(limit).collect::<String>()) }
 }
 
 pub fn repair_finished(app: &mut StudioApp, before: Snapshot, ok: bool, text: &str) {
@@ -393,7 +561,8 @@ pub fn repair_finished(app: &mut StudioApp, before: Snapshot, ok: bool, text: &s
     if app.workflow.run.as_ref().is_some_and(|r| r.cancelled) {
         finish(app, false, "Cancelled.".into());
     } else if !ok || agent::blocked_reason(text).is_some() {
-        finish(app, false, format!("Repair agent stopped: {}", tail(text, 1600)));
+        let why = agent::blocked_reason(text).unwrap_or_else(|| "it exited with an error; see the console".into());
+        finish(app, false, format!("Repair agent stopped: {why}"));
     } else {
         advance(app);
     }
@@ -401,10 +570,17 @@ pub fn repair_finished(app: &mut StudioApp, before: Snapshot, ok: bool, text: &s
 
 fn finish(app: &mut StudioApp, passed: bool, note: String) {
     let Some(mut run) = app.workflow.run.take() else { return };
+    // Notes appear in the progress line, batch rows and the copied report.
+    let note = brief(&note, 400);
     app.workflow.message = format!("{}: {note}", run.current.id);
+    let context = match run.elevated {
+        Some(true) => ", live test elevated",
+        Some(false) => ", live test unelevated",
+        None => "",
+    };
     let check = BatchCheck {
-        recipe: run.current.id.clone(), passed, note: format!("{note} ({} test attempt(s))", run.attempt),
-        timestamp: ystudio_core::intake::timestamp(), summary_dir: run.summary_dir.clone(),
+        recipe: run.current.id.clone(), passed, note: format!("{note} ({} test attempt(s){context})", run.attempt),
+        timestamp: ystudio_core::intake::timestamp(), summary_dir: run.summary_dir.clone(), live: passed && run.options.live,
     };
     for (batch_id, idx) in &run.current.items {
         crate::views::batch::check_finished(app, batch_id, *idx, check.clone());
@@ -416,6 +592,7 @@ fn finish(app: &mut StudioApp, passed: bool, note: String) {
         run.step = 0;
         run.summary_dir = None;
         run.warned = false;
+        run.elevated = None;
         app.workflow.run = Some(run);
         app.workflow.advance_pending = true;
         (app.waker)();
@@ -426,7 +603,7 @@ fn finish(app: &mut StudioApp, passed: bool, note: String) {
             for (batch_id, idx) in target.items {
                 crate::views::batch::check_finished(app, &batch_id, idx, BatchCheck {
                     recipe: target.id.clone(), passed: false, note: "Not tested: run stopped or cancelled".into(),
-                    timestamp: ystudio_core::intake::timestamp(), summary_dir: None,
+                    timestamp: ystudio_core::intake::timestamp(), summary_dir: None, live: false,
                 });
             }
         }
@@ -437,6 +614,8 @@ pub fn stop(app: &mut StudioApp, cancel: bool) {
     if let Some(run) = &mut app.workflow.run {
         run.stopped = true;
         run.cancelled |= cancel;
+        // Nothing is running that could finish; let advance() see the cancellation.
+        app.workflow.advance_pending |= cancel && run.waiting_elevation;
     }
     if cancel && let Some(id) = app.workflow.last_job && let Some(job) = app.job_mut(id) {
         job.proc.cancel();
@@ -445,19 +624,26 @@ pub fn stop(app: &mut StudioApp, cancel: bool) {
 }
 
 pub fn progress(app: &mut StudioApp, ui: &mut Ui) {
+    crate::elevation::strip(app, ui);
+    // One line: a long blocker reason must not push the page over the logs.
+    let message = |ui: &mut Ui, text: &str| {
+        ui.add(egui::Label::new(text).truncate()).on_hover_text(text);
+    };
     if app.workflow.run.is_none() {
-        if !app.workflow.message.is_empty() { ui.label(&app.workflow.message); }
+        if !app.workflow.message.is_empty() {
+            ui.horizontal(|ui| message(ui, &app.workflow.message));
+        }
         return;
     }
-    ui.horizontal_wrapped(|ui| {
+    ui.horizontal(|ui| {
         ui.spinner();
-        ui.label(&app.workflow.message);
         if ui.button("Stop after this recipe").clicked() {
             stop(app, false);
         }
         if ui.button("Cancel now").clicked() {
             stop(app, true);
         }
+        message(ui, &app.workflow.message);
     });
 }
 
@@ -497,7 +683,7 @@ mod tests {
         let mut run = Run {
             root: PathBuf::new(), queue: VecDeque::new(), current: Target { id: "test".into(), items: Vec::new() },
             options: Options::default(), repair: true, resume_batch: false, attempt: 1, step: 0,
-            stopped: false, cancelled: false, summary_dir: None, warned: false,
+            stopped: false, cancelled: false, summary_dir: None, warned: false, elevated: None, waiting_elevation: false,
         };
         for expected in 1..=5 {
             assert_eq!(run.attempt, expected);
@@ -530,7 +716,10 @@ mod tests {
         std::fs::write(root.join(r"Icons\app.png"), [0]).unwrap();
         std::fs::write(root.join(r"Recipes\Development\app.yaml"), "id: app\nurl: https://example.com/app.msi\nversion: '1.0'\ninstallScript: msiexec /i <filename> /qn\nuninstallScript: msiexec /x <productcode> /qn\niconFile: app.png\ndisplayName: App\npublisher: Test\ndescription: Fake harness app\ndetectionType: msi\n").unwrap();
         let text = std::fs::read_to_string(root.join(r"Recipes\Development\app.yaml")).unwrap().replace("id: app", "id: broken");
-        std::fs::write(root.join(r"Recipes\Development\broken.yaml"), text).unwrap();
+        std::fs::write(root.join(r"Recipes\Development\broken.yaml"), &text).unwrap();
+        let user = text.replace("id: broken", "id: user").replace("displayName: App", "displayName: App\ninstallExperience: user");
+        std::fs::write(root.join(r"Recipes\Development\user.yaml"), user).unwrap();
+        std::fs::write(root.join(r"Recipes\Development\present.yaml"), text.replace("id: broken", "id: present")).unwrap();
         let ws = ystudio_core::workspace::Workspace::open(root, &[], &[]).unwrap();
         std::fs::create_dir_all(&ws.layout.harness).unwrap();
         let trace = harness::ps_quote(&root.join("trace.txt").to_string_lossy());
@@ -540,18 +729,21 @@ mod tests {
             format!("param([string]$RecipePath, [string]$Stage)\nAdd-Content -LiteralPath {trace} -Value $Stage\n")).unwrap();
         let artifacts = harness::ps_quote(&ws.layout.harness_artifacts.to_string_lossy());
         std::fs::write(ws.layout.harness.join("Invoke-RecipeInstallTest.ps1"), format!(r#"
-param([string[]]$RecipePath, [switch]$WhatIf, [switch]$NoElevate, [switch]$DiscardInstaller,
+param([string[]]$RecipePath, [switch]$WhatIf, [switch]$NoElevate, [switch]$DiscardInstaller, [switch]$ElevatedChild,
 [int]$InstallTimeoutMinutes, [int]$DetectionSettleSeconds, [int]$ResidueSettleSeconds)
-$label = if ($WhatIf) {{ 'DryRun' }} else {{ 'Live' }}
+$label = if ($WhatIf) {{ 'DryRun' }} elseif ($ElevatedChild) {{ 'Live elevated' }} elseif ($NoElevate) {{ 'Live user' }} else {{ 'Live prompting' }}
 Add-Content -LiteralPath {trace} -Value $label
 $names = if ($WhatIf) {{ @('Schema','Download','PreDetect') }} else {{
     @('Schema','Download','PreDetect','Install','PostInstallDetect','Uninstall','PostUninstallDetect','Residue')
 }}
 $phases = @($names | ForEach-Object {{ @{{ Name = $_; Status = 'Pass' }} }})
 if ($WhatIf) {{ $phases += @{{ Name = 'Install'; Status = 'Skip' }} }}
+$id = [IO.Path]::GetFileNameWithoutExtension($RecipePath[0])
+$overall = 'Pass'
+if ($id -eq 'present') {{ $phases[2] = @{{ Name = 'PreDetect'; Status = 'Blocked'; Detail = 'App is already installed' }}; $overall = 'Blocked' }}
 $dir = Join-Path (Join-Path {artifacts} '_install-tests') ([DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss-fffffff'))
 New-Item -ItemType Directory -Path $dir -Force | Out-Null
-@{{ Results = @(@{{ Id = 'app'; Overall = 'Pass'; Phases = $phases }}) }} |
+@{{ Results = @(@{{ Id = $id; Overall = $overall; Phases = $phases }}) }} |
     ConvertTo-Json -Depth 8 | Set-Content (Join-Path $dir 'summary.json')
 "#)).unwrap();
         (dir, StudioApp::isolated_for_tests(ws))
@@ -587,6 +779,7 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         let batch_dir = batch.dir();
         app.batch.batch = Some(batch);
         let options = Options { consent: Consent::Confirmed, ..Options::default() };
+        connect_in_process(&mut app);
         start(&mut app, vec![
             Target { id: "missing".into(), items: vec![(batch_id.clone(), 0)] },
             Target { id: "broken".into(), items: vec![(batch_id.clone(), 1)] },
@@ -594,7 +787,7 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         ], options, false, false);
         drain(&mut app);
         let trace = std::fs::read_to_string(dir.path().join("trace.txt")).unwrap();
-        assert_eq!(trace.lines().collect::<Vec<_>>(), ["Schema", "Schema", "Download", "Package", "DryRun", "Live"]);
+        assert_eq!(trace.lines().collect::<Vec<_>>(), ["Schema", "Schema", "Download", "Package", "DryRun", "Live elevated"]);
         assert!(Step::ALL.iter().all(|step| app.step_state("app", *step) == Some(StepState::Pass)));
         assert!(app.workflow.message.contains("Validated"));
         let saved = ystudio_core::intake::Batch::load(&batch_dir).unwrap();
@@ -604,6 +797,123 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         assert!(saved.items[2].checks[0].passed);
         assert!(saved.items[2].checks[0].summary_dir.as_ref().unwrap().is_dir());
         assert!(saved.report().contains("app: Validated"));
+        assert!(saved.items[2].checks[0].note.contains("live test elevated"), "{}", saved.items[2].checks[0].note);
+        assert!(matches!(app.elevation, crate::elevation::State::Off), "the session ends with the run");
+    }
+
+    fn connect_in_process(app: &mut StudioApp) {
+        let session = ystudio_core::elevation::Session::in_process(None).unwrap();
+        app.elevation = crate::elevation::State::Ready { session, since: std::time::Instant::now(), tests: 0 };
+    }
+
+    fn trace(dir: &tempfile::TempDir) -> Vec<String> {
+        std::fs::read_to_string(dir.path().join("trace.txt")).unwrap().lines().map(str::to_string).collect()
+    }
+
+    fn wait_for_uac_step(app: &mut StudioApp) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+        while !app.workflow.message.contains("waiting for UAC") && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            app.poll_for_tests();
+        }
+        assert!(app.workflow.message.contains("waiting for UAC"), "{}", app.workflow.message);
+    }
+
+    #[test]
+    fn blocked_evidence_is_summarised_in_one_line_and_never_repaired() {
+        let (_dir, mut app) = fake_app();
+        start(&mut app, vec![Target { id: "present".into(), items: Vec::new() }], Options { live: false, ..Options::default() }, true, false);
+        drain(&mut app);
+        let message = &app.workflow.message;
+        assert_eq!(
+            message,
+            "present: Blocked (environment or incomplete harness evidence): Install test (dry run): overall Blocked: PreDetect Blocked (App is already installed)"
+        );
+        assert!(!app.jobs.iter().any(|j| matches!(j.kind, JobKind::WorkflowRepair { .. })));
+    }
+
+    #[test]
+    fn repair_copies_shipped_recipes_to_development_and_leaves_passing_ones_alone() {
+        let (dir, mut app) = fake_app();
+        let original = std::fs::read_to_string(dir.path().join(r"Recipes\Development\app.yaml")).unwrap().replace("id: app", "id: shipped");
+        let shipped = dir.path().join(r"Recipes\shipped.yaml");
+        std::fs::write(&shipped, &original).unwrap();
+        app.refresh_recipes();
+        let targets = vec![Target { id: "shipped".into(), items: Vec::new() }];
+        copy_shipped_to_development(&mut app, &targets).unwrap();
+        let copy = app.ws.as_ref().unwrap().development_recipe_path("shipped");
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), original);
+        // Already copied: nothing to do, and the copy is not overwritten.
+        copy_shipped_to_development(&mut app, &targets).unwrap();
+
+        connect_in_process(&mut app);
+        start(&mut app, targets, Options { consent: Consent::Confirmed, ..Options::default() }, true, false);
+        drain(&mut app);
+        assert!(app.workflow.message.starts_with("shipped: Validated"), "{}", app.workflow.message);
+        assert!(!app.jobs.iter().any(|j| matches!(j.kind, JobKind::WorkflowRepair { .. })));
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&shipped).unwrap(), original);
+    }
+
+    #[test]
+    fn user_scope_live_tests_run_unelevated_without_asking_for_elevation() {
+        let (dir, mut app) = fake_app();
+        let options = Options { consent: Consent::Confirmed, ..Options::default() };
+        start(&mut app, vec![Target { id: "user".into(), items: Vec::new() }], options, false, false);
+        drain(&mut app);
+        assert_eq!(trace(&dir).last().map(String::as_str), Some("Live user"));
+        assert_eq!(app.step_state("user", Step::Live), Some(StepState::Pass));
+        assert!(matches!(app.elevation, crate::elevation::State::Off));
+    }
+
+    #[test]
+    fn unavailable_elevation_blocks_system_recipes_without_repair_and_continues() {
+        let (dir, mut app) = fake_app();
+        app.elevation = crate::elevation::State::Unavailable("The UAC prompt was declined.".into());
+        let options = Options { consent: Consent::Confirmed, ..Options::default() };
+        start(&mut app, vec![
+            Target { id: "app".into(), items: Vec::new() },
+            Target { id: "user".into(), items: Vec::new() },
+        ], options, true, false);
+        drain(&mut app);
+        let trace = trace(&dir);
+        assert!(!trace.iter().any(|l| l == "Live elevated" || l == "Live prompting"), "{trace:?}");
+        assert_eq!(trace.last().map(String::as_str), Some("Live user"));
+        assert!(!app.jobs.iter().any(|j| matches!(j.kind, JobKind::WorkflowRepair { .. })));
+        assert_eq!(app.step_state("app", Step::Live), None);
+        assert_eq!(app.step_state("user", Step::Live), Some(StepState::Pass));
+    }
+
+    #[test]
+    fn live_step_waits_for_the_uac_answer_then_runs_elevated() {
+        let (dir, mut app) = fake_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.elevation = crate::elevation::State::Waiting { rx, since: std::time::Instant::now() };
+        let options = Options { consent: Consent::Confirmed, ..Options::default() };
+        start(&mut app, vec![Target { id: "app".into(), items: Vec::new() }], options, false, false);
+        wait_for_uac_step(&mut app);
+        assert_eq!(trace(&dir).last().map(String::as_str), Some("DryRun"));
+        tx.send(ystudio_core::elevation::Session::in_process(None)).unwrap();
+        drain(&mut app);
+        assert_eq!(trace(&dir).last().map(String::as_str), Some("Live elevated"));
+        assert!(app.workflow.message.contains("Validated"), "{}", app.workflow.message);
+    }
+
+    #[test]
+    fn cancelling_while_waiting_for_uac_stops_the_run() {
+        let (_dir, mut app) = fake_app();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.elevation = crate::elevation::State::Waiting { rx, since: std::time::Instant::now() };
+        let options = Options { consent: Consent::Confirmed, ..Options::default() };
+        start(&mut app, vec![Target { id: "app".into(), items: Vec::new() }], options, false, false);
+        wait_for_uac_step(&mut app);
+        stop(&mut app, true);
+        app.poll_for_tests();
+        assert!(app.workflow.run.is_none());
+        assert!(app.workflow.message.contains("Cancelled"), "{}", app.workflow.message);
+        // The next frame notices nothing needs the session any more.
+        app.poll_for_tests();
+        assert!(matches!(app.elevation, crate::elevation::State::Off));
     }
 
     #[test]
@@ -678,6 +988,9 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         }];
         app.batch.batch = Some(batch);
         render(&mut app, "batch-wide", 1400, 900);
+        request(&mut app, Request::BatchRepair(vec![Target { id: "app".into(), items: Vec::new() }]));
+        render(&mut app, "batch-repair-consent", 1400, 900);
+        app.workflow.request = None;
         let targets = vec![Target { id: "app".into(), items: Vec::new() }];
         request(&mut app, Request::BatchTests(targets));
         render(&mut app, "batch-consent-narrow", 900, 600);
@@ -690,5 +1003,23 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         app.view = crate::app::View::Batch;
         app.settings.dark_mode = false;
         render(&mut app, "batch-light", 1400, 900);
+        // The elevated session's states, kept alive by a pending consent request.
+        app.settings.dark_mode = true;
+        app.workflow.request = Some(Request::BatchTests(vec![Target { id: "app".into(), items: Vec::new() }]));
+        connect_in_process(&mut app);
+        render(&mut app, "elevation-ready", 1400, 900);
+        app.elevation = crate::elevation::State::Unavailable("The UAC prompt was declined.".into());
+        render(&mut app, "elevation-unavailable-narrow", 900, 600);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.elevation = crate::elevation::State::Waiting { rx, since: std::time::Instant::now() };
+        app.workflow.request = None;
+        app.workflow.run = Some(Run {
+            root: app.ws.as_ref().unwrap().root.clone(), queue: VecDeque::new(), current: Target { id: "app".into(), items: Vec::new() },
+            options: Options::default(), repair: false, resume_batch: false, attempt: 1, step: 5,
+            stopped: false, cancelled: false, summary_dir: None, warned: false, elevated: None, waiting_elevation: true,
+        });
+        app.workflow.message = "app: waiting for UAC approval to run the system-context live test".into();
+        render(&mut app, "elevation-waiting", 1400, 900);
+        app.workflow.run = None;
     }
 }

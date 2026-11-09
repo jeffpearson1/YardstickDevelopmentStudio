@@ -256,23 +256,10 @@ fn duplicate_window(app: &mut StudioApp, ctx: &egui::Context) {
     });
     if go {
         let id = app.library.duplicate_id.trim().to_string();
-        let dest = ws.development_recipe_path(&id);
-        let result = (|| -> anyhow::Result<()> {
-            ws.ensure_writable("copy recipes")?;
-            anyhow::ensure!(!dest.exists(), "{} already exists.", dest.display());
-            let mut text = ystudio_core::read_text(&src)?;
-            if id != src_id {
-                // Keep `id` equal to the file name.
-                let re = regex::Regex::new(&format!(r"(?m)^id:\s*['\x22]?{}['\x22]?\s*$", regex::escape(&src_id)))?;
-                text = re.replace(&text, format!("id: {id}").as_str()).into_owned();
-            }
-            std::fs::create_dir_all(dest.parent().unwrap())?;
-            std::fs::write(&dest, text)?;
-            Ok(())
-        })();
+        let result = ws.copy_to_development(&src, &src_id, &id);
         app.library.duplicate_of = None;
         match result {
-            Ok(()) => {
+            Ok(dest) => {
                 app.refresh_recipes();
                 app.request_open_recipe(dest);
                 app.view = View::Designer;

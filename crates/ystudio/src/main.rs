@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod elevation;
 mod highlight;
 mod soft;
 mod theme;
@@ -10,6 +11,11 @@ mod workflow;
 use eframe::{egui, wgpu};
 
 fn main() -> anyhow::Result<()> {
+    // The hidden elevated worker for live install tests; see ystudio_core::elevation.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some(ystudio_core::elevation::WORKER_ARG) {
+        return ystudio_core::elevation::serve_from_args(&args[1..]);
+    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Yardstick Development Studio")
         .with_inner_size([1400.0, 900.0])

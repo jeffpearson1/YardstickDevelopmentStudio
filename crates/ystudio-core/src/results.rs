@@ -103,6 +103,26 @@ impl RecipeResult {
         }
         Verdict::Incomplete
     }
+
+    /// One line for status messages: the overall result and the phases that
+    /// did not pass, with their details. Skipped phases are listed only when
+    /// nothing worse is.
+    pub fn problems(&self) -> String {
+        let status = |p: &&Phase| p.status.to_ascii_lowercase();
+        let mut bad: Vec<&Phase> = self.phases.iter().filter(|p| !matches!(status(p).as_str(), "pass" | "whatif" | "skip")).collect();
+        if bad.is_empty() {
+            bad = self.phases.iter().filter(|p| status(p) == "skip").collect();
+        }
+        let parts: Vec<String> = bad
+            .iter()
+            .map(|p| match p.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+                Some(detail) => format!("{} {} ({detail})", p.label(), p.status),
+                None => format!("{} {}", p.label(), p.status),
+            })
+            .collect();
+        let overall = if self.overall.is_empty() { "unknown" } else { self.overall.as_str() };
+        if parts.is_empty() { format!("overall {overall}") } else { format!("overall {overall}: {}", parts.join("; ")) }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -296,6 +316,22 @@ mod tests {
 
         let partial = parse_result(&result("a", "Pass", &[("Schema", "Pass")])).unwrap();
         assert_eq!(partial.verdict(), Verdict::Incomplete);
+    }
+
+    #[test]
+    fn problems_name_the_phases_that_did_not_pass() {
+        let phase = |name: &str, status: &str, detail: &str| Phase {
+            name: Some(name.into()), status: status.into(), detail: Some(detail.into()), ..Default::default()
+        };
+        let blocked = RecipeResult {
+            overall: "Blocked".into(),
+            phases: vec![phase("Schema", "Pass", ""), phase("PreDetect", "Blocked", "App is already installed"), phase("Install", "Skip", "WhatIf")],
+            ..Default::default()
+        };
+        assert_eq!(blocked.problems(), "overall Blocked: PreDetect Blocked (App is already installed)");
+        let skipped = RecipeResult { overall: "Pass".into(), phases: vec![phase("Install", "Skip", "")], ..Default::default() };
+        assert_eq!(skipped.problems(), "overall Pass: Install Skip");
+        assert_eq!(RecipeResult::default().problems(), "overall unknown");
     }
 
     #[test]

@@ -470,6 +470,18 @@ pub struct BatchCheck {
     pub note: String,
     pub timestamp: String,
     pub summary_dir: Option<PathBuf>,
+    /// The run included a live install test (absent in batches saved before 0.5).
+    #[serde(default)]
+    pub live: bool,
+}
+
+impl BatchCheck {
+    /// Whether this check proves the recipe works: it passed and, when `live`
+    /// checks are wanted, it included one. Older saves lack the `live` flag, so
+    /// a passed live run is also recognised by the workflow's "Validated" note.
+    pub fn confirms(&self, live: bool) -> bool {
+        self.passed && (!live || self.live || self.note.starts_with("Validated"))
+    }
 }
 
 impl BatchItem {
@@ -1278,7 +1290,7 @@ mod tests {
         b.items[0].status = ItemStatus::Done;
         b.items[0].checks.push(BatchCheck {
             recipe: "zoom".into(), passed: false, note: "Live check failed | missing detection".into(),
-            timestamp: timestamp(), summary_dir: Some(PathBuf::from(r"C:\test\evidence")),
+            timestamp: timestamp(), summary_dir: Some(PathBuf::from(r"C:\test\evidence")), live: true,
         });
         let back: Batch = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
         assert_eq!(back.items[0].checks, b.items[0].checks);
@@ -1286,6 +1298,20 @@ mod tests {
         assert!(!back.report().contains("recipe ready for live test"));
         let old: BatchItem = serde_json::from_str(r#"{"app":"Zoom","status":"done"}"#).unwrap();
         assert!(old.checks.is_empty());
+    }
+
+    #[test]
+    fn only_passing_checks_confirm_and_live_needs_a_live_run() {
+        let check = |passed, live, note: &str| BatchCheck {
+            recipe: "zoom".into(), passed, note: note.into(), timestamp: timestamp(), summary_dir: None, live,
+        };
+        assert!(!check(false, true, "Checks failed").confirms(false));
+        let safe = check(true, false, "Safe checks passed; live test still required");
+        assert!(safe.confirms(false) && !safe.confirms(true));
+        assert!(check(true, true, "Validated").confirms(true));
+        // Saved before the live flag existed.
+        let old: BatchCheck = serde_json::from_str(r#"{"recipe":"zoom","passed":true,"note":"Validated with warnings; review harness evidence","timestamp":"t","summaryDir":null}"#).unwrap();
+        assert!(!old.live && old.confirms(true));
     }
 
     #[test]

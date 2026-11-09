@@ -51,7 +51,9 @@ Git writes progress to stderr, so its specs set `stderr_is_progress` and the con
 those lines dimmed instead of red.
 The UI calls `poll()` each frame. `poll()` returns *whether anything changed*; use
 `is_running()` to find out whether the process is still alive. Cancelling kills the whole
-process tree with `taskkill /T /F`. When a job finishes, `StudioApp::on_job_finished`
+process tree with `taskkill /T /F`. A live test running in the elevated worker is a remote
+`RunningProcess`: its lines and exit arrive over the worker's pipe, and cancelling it asks
+the worker to kill the tree (see *One UAC prompt per run* below). When a job finishes, `StudioApp::on_job_finished`
 dispatches on `JobKind`:
 
 - harness jobs reload results and verdicts;
@@ -104,6 +106,20 @@ is `Pass`; it has not tested uninstall, post-uninstall detection or residue.
    remaining batch. Each item's `checks` records the outcome, timestamp and harness
    evidence directory and is included in the copied report. Starting a retest invalidates
    earlier outcomes so interrupted checks cannot appear successful.
+8. **Repair with agent.** Picks the included items whose recipe exists but has no check
+   confirming it for that item. With live checks on, only a passed live test confirms
+   (`BatchCheck::live`, or a "Validated" note in batches saved before the flag); with
+   them off, passed safe checks do. Items without a recipe are left to *Run agent*.
+   Recipes that exist only as shipped recipes are first copied into
+   `Recipes\Development` under the same id (`Workspace::copy_to_development`); the
+   shipped file is never edited. The selection then runs the same test-and-repair
+   pipeline as authoring: each recipe is tested first, so one that now passes is not
+   touched, and failures go to `AgentTask::Fix` within the attempt limit.
+
+Status messages and batch notes carry a one-line summary of a failure
+(`RecipeResult::problems`, the lint errors, or the last error line of the output),
+capped at 400 characters. The full output and harness evidence still go to the repair
+agent.
 
 Live automation requires an explicit dialog listing the applications/recipe ids before
 starting. Consent is held only for that run or authoring queue, including bounded repair
@@ -111,6 +127,45 @@ retries; selecting the live option is not consent. Automation never uses `-Force
 `-SkipUninstall` and never promotes or deploys recipes. Existing software can therefore
 block full validation without authorizing its removal. Workspace switching and concurrent
 agent/test runs are blocked while a pipeline is active.
+
+**One UAC prompt per run (`elevation.rs`).** The consent dialog counts the listed recipes
+by context: system-context (the default), user-scope (`installExperience: user`), and not
+yet authored (assumed system-context). If any of them may need elevation, *Start* asks for
+it once, right away, while the user is at the machine. `Session::launch` runs this same
+executable through `ShellExecuteEx` "runas" as `yardstick-studio --elevated-worker <pipe>
+<studio pid>`, hidden, so the UAC prompt names Yardstick Development Studio. Safe checks
+continue while the prompt is open; a live step that reaches it first waits for the answer.
+Each live test is then routed by `harness::runs_elevated`:
+
+- system-context recipes run in the worker, which calls the harness with `-ElevatedChild`.
+  The harness is already elevated there, so it does not relaunch itself, and it skips the
+  shared-content sync that the unelevated steps already ran;
+- user-scope recipes run unelevated as before, with `-NoElevate`, so the harness can never
+  raise its own prompt.
+
+The worker's output streams into the normal job console through a remote `RunningProcess`
+(`RunningProcess::remote`, fed by a `Feed`). Cancelling a remote job sends the worker a
+cancel request, because an unelevated Studio cannot kill an elevated process tree. The
+session ends when nothing that could need it is running (no workflow run, request, or
+queued batch item), when the user chooses *End elevated session*, or when the Studio exits.
+If UAC is declined, or the worker dies, system-context recipes finish as *Blocked* with no
+repair attempt, user-scope recipes continue, and *Retry elevation* asks again. A status-bar
+badge and a line above the run's progress show the session state; batch items show which
+step is running and, once done, whether the live test ran elevated.
+
+The worker accepts exactly two requests over its pipe: run an install test for one recipe
+file, or cancel one. It reopens the workspace with the Studio's production and trusted
+folder lists, accepts only `pwsh.exe`/`powershell.exe`, refuses `-Force`, and rebuilds the
+command itself through `harness::build`, so the core's production and path refusals still
+apply. It never runs a command line it is sent. Two one-way pipes are used because
+synchronous reads and writes on a single handle serialise. Both pipes allow one instance
+(`FILE_FLAG_FIRST_PIPE_INSTANCE`) and local clients only. The Studio checks the client's
+PID against the process it launched. The worker checks the server's PID against its
+`<studio pid>` argument, checks that this process is the same executable, and connects with
+identification-level QoS so the Studio cannot impersonate the elevated token. Closing the
+Studio's end stops the worker and kills any test it is running. Known trade-off: for the
+length of the run, recipes the repair agent edits are installed elevated without another
+UAC review. The consent dialog says so.
 
 Both extraction and authoring prompts prefer authoritative vendor internet downloads.
 Shared-media links are preserved as fallback context, not used as the vendor start page.
@@ -159,6 +214,9 @@ Enforcement:
 - **Consent.** Live install tests, `-Force` and real publishes need `Consent::Confirmed`,
   which is only produced by a modal with an acknowledgement checkbox. Dry runs and
   `-WhatIf` need no consent.
+- **Elevation.** Automatic runs elevate once, through a Studio-owned worker that runs only
+  install tests it rebuilds itself and talks only to the Studio that launched it. It never
+  outlives the run or the Studio.
 - **Two-step promote.** *Publish…* stays disabled until a successful `-WhatIf` preview of
   exactly the current selection. Recipes without a validated live install test get a
   warning.

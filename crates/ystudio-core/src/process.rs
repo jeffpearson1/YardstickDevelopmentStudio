@@ -112,16 +112,45 @@ impl ProcessSpec {
 
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
+/// Delivers output for a [`RunningProcess`] that runs where this process can
+/// neither spawn nor kill it directly (the elevated worker).
+#[derive(Clone)]
+pub struct Feed {
+    tx: Sender<Event>,
+    waker: Option<Waker>,
+}
+
+impl Feed {
+    pub fn line(&self, stream: Stream, text: String) {
+        let _ = self.tx.send(Event::Line(LogLine { stream, text }));
+        self.wake();
+    }
+
+    pub fn exited(&self, code: Option<i32>) {
+        let _ = self.tx.send(Event::Exited(code));
+        self.wake();
+    }
+
+    fn wake(&self) {
+        if let Some(w) = &self.waker {
+            w();
+        }
+    }
+}
+
 /// A running (or finished) captured process.
 pub struct RunningProcess {
     pub spec: ProcessSpec,
     pub started: Instant,
+    /// 0 for a remote process.
     pub pid: u32,
     rx: Receiver<Event>,
     pub lines: Vec<LogLine>,
     pub exit: Option<Option<i32>>,
     pub finished_at: Option<Instant>,
     pub cancelled: bool,
+    /// Asks whoever runs a remote process to stop it.
+    canceller: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl RunningProcess {
@@ -147,7 +176,19 @@ impl RunningProcess {
         });
 
         let echo = LogLine { stream: Stream::Studio, text: format!("> {}", spec.display()) };
-        Ok(Self { spec, started: Instant::now(), pid, rx, lines: vec![echo], exit: None, finished_at: None, cancelled: false })
+        Ok(Self { spec, started: Instant::now(), pid, rx, lines: vec![echo], exit: None, finished_at: None, cancelled: false, canceller: None })
+    }
+
+    /// A process that runs elsewhere; its output and exit arrive through the
+    /// returned [`Feed`], and [`Self::cancel`] calls `cancel` instead of taskkill.
+    pub fn remote(spec: ProcessSpec, note: &str, waker: Option<Waker>, cancel: Box<dyn FnMut() + Send>) -> (Self, Feed) {
+        let (tx, rx) = channel();
+        let echo = LogLine { stream: Stream::Studio, text: format!("> ({note}) {}", spec.display()) };
+        let proc = Self {
+            spec, started: Instant::now(), pid: 0, rx, lines: vec![echo], exit: None, finished_at: None, cancelled: false,
+            canceller: Some(cancel),
+        };
+        (proc, Feed { tx, waker })
     }
 
     /// Drains pending output. Returns true if anything changed.
@@ -190,6 +231,10 @@ impl RunningProcess {
             return;
         }
         self.cancelled = true;
+        if let Some(cancel) = &mut self.canceller {
+            cancel();
+            return;
+        }
         let mut kill = Command::new("taskkill");
         kill.args(["/PID", &self.pid.to_string(), "/T", "/F"]).stdout(Stdio::null()).stderr(Stdio::null());
         #[cfg(windows)]
@@ -419,6 +464,23 @@ mod tests {
         }
         assert!(!p.is_running());
         assert!(p.cancelled);
+    }
+
+    #[test]
+    fn remote_process_reports_through_its_feed_and_cancels_through_the_callback() {
+        let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = asked.clone();
+        let spec = ProcessSpec::new("remote", "pwsh", &std::env::temp_dir());
+        let (mut p, feed) = RunningProcess::remote(spec, "elevated", None, Box::new(move || flag.store(true, std::sync::atomic::Ordering::SeqCst)));
+        assert!(p.lines[0].text.starts_with("> (elevated) pwsh"));
+        feed.line(Stream::Stdout, "hello".into());
+        p.cancel();
+        assert!(asked.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(p.is_running());
+        feed.exited(None);
+        p.poll();
+        assert!(!p.is_running() && p.cancelled && !p.succeeded());
+        assert!(p.lines.iter().any(|l| l.text == "hello"));
     }
 
     #[test]

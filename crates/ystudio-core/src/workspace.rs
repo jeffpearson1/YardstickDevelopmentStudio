@@ -215,6 +215,26 @@ impl Workspace {
         self.layout.development_recipes.join(format!("{id}.yaml"))
     }
 
+    /// Copies a recipe into `Recipes\Development` as `id`, keeping comments and
+    /// formatting. With the same id the copy overrides the shipped recipe while
+    /// it is worked on; the source is never changed.
+    pub fn copy_to_development(&self, src: &Path, src_id: &str, id: &str) -> Result<PathBuf> {
+        self.ensure_writable("copy recipes")?;
+        let dest = self.development_recipe_path(id);
+        if dest.exists() {
+            bail!("{} already exists.", dest.display());
+        }
+        let mut text = read_text(src)?;
+        if id != src_id {
+            // Keep `id` equal to the file name.
+            let re = Regex::new(&format!(r"(?m)^id:\s*['\x22]?{}['\x22]?\s*$", regex::escape(src_id)))?;
+            text = re.replace(&text, format!("id: {id}").as_str()).into_owned();
+        }
+        std::fs::create_dir_all(&self.layout.development_recipes)?;
+        std::fs::write(&dest, text).with_context(|| format!("writing {}", dest.display()))?;
+        Ok(dest)
+    }
+
     pub fn icon_exists(&self, icon_file: &str) -> bool {
         !icon_file.trim().is_empty() && self.layout.icons.join(icon_file.trim()).is_file()
     }
@@ -502,6 +522,22 @@ mod tests {
         assert_eq!(brave.meta.display_name, "Brave");
         assert_eq!(brave.meta.icon_file, "7zip.png");
         assert_eq!(brave.meta.url, "https://7-zip.org");
+    }
+
+    #[test]
+    fn copies_to_development_keeping_text_and_never_overwriting() {
+        let d = fake_workspace(Some("developmentOnly: true\n"));
+        let src = d.path().join(r"Recipes\7zip.yaml");
+        std::fs::write(&src, "id: 7zip # shipped\ndisplayName: 7-Zip\n").unwrap();
+        let ws = Workspace::open(d.path(), &[], &[]).unwrap();
+        let same = ws.copy_to_development(&src, "7zip", "7zip").unwrap();
+        assert_eq!(std::fs::read_to_string(&same).unwrap(), "id: 7zip # shipped\ndisplayName: 7-Zip\n");
+        assert!(ws.copy_to_development(&src, "7zip", "7zip").is_err());
+        std::fs::write(&src, "id: 7zip\ndisplayName: 7-Zip\n").unwrap();
+        let renamed = ws.copy_to_development(&src, "7zip", "7zipbeta").unwrap();
+        assert!(std::fs::read_to_string(renamed).unwrap().starts_with("id: 7zipbeta\n"));
+        let prod = Workspace::open(d.path(), &[d.path().to_path_buf()], &[]).unwrap();
+        assert!(prod.copy_to_development(&src, "7zip", "other").is_err());
     }
 
     #[test]
