@@ -1115,4 +1115,52 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         app.workflow.request = None;
         render(&mut app, "requests-new-recipe", 1400, 900);
     }
+
+    #[test]
+    fn publish_pushes_a_branch_and_offers_the_compare_page() {
+        let Ok(git_exe) = ystudio_core::git::git_exe() else { return };
+        let (dir, mut app) = fake_app();
+        let root = dir.path().to_path_buf();
+        let origin = tempfile::tempdir().unwrap();
+        let g = |cwd: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new(&git_exe).args(args).current_dir(cwd).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        g(origin.path(), &["init", "--bare", "-b", "main"]);
+        std::fs::write(root.join(".gitignore"), "/Recipes/Development/*\n/Icons/*\n/Artifacts/\n").unwrap();
+        g(&root, &["init", "-b", "main"]);
+        g(&root, &["config", "user.name", "Studio Test"]);
+        g(&root, &["config", "user.email", "studio@example.com"]);
+        g(&root, &["add", "-A"]);
+        g(&root, &["commit", "-m", "base"]);
+        g(&root, &["remote", "add", "origin", &origin.path().to_string_lossy()]);
+        g(&root, &["push", "-u", "origin", "main"]);
+        g(&root, &["remote", "set-head", "origin", "main"]);
+
+        app.view = crate::app::View::Promote;
+        render(&mut app, "publish-local-remote", 1400, 900);
+        // The bare remote has no GitHub address; point the view at one.
+        app.promote.repo = Some((root.clone(), Ok(ystudio_core::promote::Repo {
+            remote_url: origin.path().to_string_lossy().into_owned(), web_url: "https://github.com/o/r".into(), base: "main".into(),
+        }), None));
+        app.promote.selected.insert("app".into());
+        render(&mut app, "publish", 1400, 900);
+        app.promote.modal = true;
+        render(&mut app, "publish-confirm", 1400, 900);
+        app.promote.modal = false;
+
+        crate::views::promote::start(&mut app, &["app".to_string()]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while app.promote.running() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            app.poll_for_tests();
+            crate::views::promote::poll(&mut app);
+        }
+        assert_eq!(app.promote.prompts.len(), 1, "{:?}", app.jobs.last().map(|j| j.proc.text()));
+        assert_eq!(app.promote.prompts[0].1.url(), "https://github.com/o/r/compare/main...studio/app?expand=1");
+        assert!(app.promote.selected.is_empty());
+        let shipped = std::process::Command::new(&git_exe).args(["show", "studio/app:Recipes/app.yaml"]).current_dir(origin.path()).output().unwrap();
+        assert!(String::from_utf8_lossy(&shipped.stdout).contains("id: app"));
+        render(&mut app, "publish-browser-prompt", 1400, 900);
+    }
 }

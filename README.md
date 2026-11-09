@@ -10,27 +10,35 @@
 A desktop IDE, written in Rust with [egui](https://github.com/emilk/egui), for building
 [Yardstick](https://github.com/jeffpearson1/Yardstick) recipes. It walks you through
 **designing** a recipe, **testing** it with the recipe harness, **creating or fixing it
-agentically** with the repo's `yardstick-recipes` skill, and **promoting** it to production.
+agentically** with the repo's `yardstick-recipes` skill, and **publishing** it as a pull
+request.
 
 The Studio never writes to a production Yardstick folder and never runs the harness
-there. You work in a development clone and promote finished recipes with
-`Publish-Yardstick.ps1`.
+there. You work in a development clone and publish finished recipes as pull requests;
+production pulls them once they are merged.
 
 ## Feature tour
 
 | View | What it does |
 |------|--------------|
-| **Home** | The guided "design, test, agent, promote" path and the workspace status (production, development or unconfigured), with the clone's branch, how far behind it is, and *Fetch* / *Pull* / *Sync icons & overrides*. It can clone a development workspace from GitHub (creating the destination's parent folders), copying the icons that aren't in Git from production, and can launch `Install-Yardstick -DevelopmentOnly` for a fresh clone. It also shows the toolchain environment (pwsh, git, agent CLIs; *Re-check* reloads `PATH`, so a tool installed while the Studio is open is found) and the settings. |
-| **Recipes** | Library of all shipped and `Recipes\Development` recipes, with filters, location and verdict badges, *New recipe* from templates, and *Copy to Development*. *Refresh* also runs `git fetch` and the shared icon/override sync when they are enabled in Settings. |
-| **Designer** | Form-based editor whose field catalogue mirrors Yardstick's schema (`Test-RecipeSchema`) and the skill's guidance. Fields are grouped into steps, script fields get a highlighted PowerShell editor with optional line numbers, and it lints as you type. A field whose variable a download script assigns is not marked required; if the YAML leaves it blank it is shown read-only as *set by preDownloadScript* (or whichever script sets it). Saving keeps key order and writes scripts as literal blocks. It warns before dropping YAML comments; use the YAML Editor to keep them. |
-| **YAML Editor** | Raw YAML with syntax highlighting and optional line numbers, kept in sync with the Designer. |
-| **Test Bench** | Runs the harness steps: Lint, Schema, Lab (download/package) and Install test (dry run or live). **Run all checks** runs all six steps in order, stops on failure, and pauses for explicit consent before the live install test. **Run safe checks** chains Lint, Schema and DryRun without installing anything. |
-| **Agent** | Runs the `yardstick-recipes` skill through GitHub Copilot CLI or Claude Code. Create, Fix and Update can **Test and repair automatically**: Studio runs every harness stage and returns recipe failures to the agent, up to five test attempts by default. Live install/uninstall checks require explicit run consent; turn them off for safe-only checks. Vendor internet downloads take priority; the software dropbox is fallback media only. Review remains read-only; Freeform does not automatically run live checks. |
-| **Batch** | Open a request list (ServiceNow/JSON export, CSV/TSV, Excel `xlsx/xls/ods`, YAML, text/Markdown/email, HTML, Word `docx`) by picker, drag and drop, or `yardstick-studio.exe <file>`. A quick scan pulls out the software, version, vendor URL and ticket for each request, and flags requests that aren't software. *Extract with agent* has the agent re-read the list for better results. *Run agent on N selected* creates/updates, tests and repairs each recipe before moving to the next item. **Test selected batch** rechecks all included software recipes without editing them; duplicate recipes run once and failures do not stop the remaining recipes. One batch-wide consent dialog covers the listed applications' live install/uninstall tests, including repair retries. System-context live tests share **one UAC prompt per run**: a hidden elevated worker runs them and closes when the run ends, its output streams into the console, and the status bar shows the session (user-scope recipes run unelevated). **Repair with agent** tests the included recipes that no check has confirmed working yet (only a passed live test counts when live checks are on) and hands failures to the agent, re-testing after each fix; shipped-only recipes are copied into `Recipes\Development` first. Batches and harness outcomes are saved under `%APPDATA%\YardstickStudio\batches`; *Copy report* includes recorded check results. |
-| **Icons** | The icon finder, which replaces Yardstick's `Get-YardstickIcon.ps1`. It searches installer resources (EXE/MSI), Wikidata/Commons, Chocolatey, the vendor site (manifest, touch icon, favicon) and image search in parallel, scores each result for relevance and merges duplicates. Results appear as they arrive. Preview the icon on checker/dark/light backgrounds, clean it up (background removal, trim, square, margin), save it to `Icons\` and set `iconFile` in the recipe. Also opens from the Designer (*Find icon…*), from a Batch item, or with `--icons "<app>"`. |
-| **Runs** | Browses `Artifacts\RecipeHarness\_install-tests`, parsing `summary.json` into verdicts and phase tables. |
-| **Docs** | The skill and its reference docs, rendered as Markdown. |
-| **Promote** | Select Development recipes and run a `Publish-Yardstick -WhatIf` preview. *Publish…* unlocks after a successful preview of exactly that selection. If validation is incomplete, a dialog lists the recorded checks, including skipped, failed and missing phases, with **Go back** and **Publish anyway** options. Fully validated recipes use the standard confirmation dialog. |
+| **Home** | A launcher: **Continue** a request (the open one, or earlier ones with items still to do), **Import requests** from a file or pasted text, **New recipe**, **Edit a recipe** (search by id or name) and **Update several recipes**. Below it, the workspace status (production, development or unconfigured) with the clone's branch, how far behind it is, and *Fetch* / *Pull* / *Sync icons & overrides*, and a form that clones a development workspace from GitHub. |
+| **Recipes** | Library of all shipped and `Recipes\Development` recipes, with filters, location and status badges, *New recipe*, *Copy to Development*, *Missing icons*, and *Update several…*, which picks recipes to re-test, repair or update together as one request. Opening a recipe shows its header (status, Save/Revert) and five tabs that all work on it: **Design**, **YAML**, **Test**, **Icon** and **Agent**. |
+| **Recipes → Design** | Form-based editor whose field catalogue mirrors Yardstick's schema (`Test-RecipeSchema`) and the skill's guidance. Fields are grouped into steps, script fields get a highlighted PowerShell editor with optional line numbers, and it lints as you type. A field whose variable a download script assigns is not marked required; if the YAML leaves it blank it is shown read-only as *set by preDownloadScript* (or whichever script sets it). Saving keeps key order and writes scripts as literal blocks. It warns before dropping YAML comments; use the YAML tab to keep them. |
+| **Recipes → YAML** | Raw YAML with syntax highlighting and optional line numbers, kept in sync with Design. |
+| **Recipes → Test** | Runs the harness steps: Lint, Schema, Lab (download/package) and Install test (dry run or live). **Run all checks** runs all six steps in order, stops on failure, and pauses for explicit consent before the live install test. **Run safe checks** chains Lint, Schema and DryRun without installing anything. |
+| **Recipes → Icon** | The icon finder, which replaces Yardstick's `Get-YardstickIcon.ps1`, filled in for the open recipe. It shows the recipe's current icon, and searches the web by itself only when there is no usable one. It searches installer resources (EXE/MSI), Wikidata/Commons, Chocolatey, the vendor site (manifest, touch icon, favicon) and image search in parallel, scores each result for relevance and merges duplicates. Preview on checker/dark/light backgrounds, clean it up (background removal, trim, square, margin), save it to `Icons\` and set `iconFile`. Also opens for a request item, from the library's *Missing icons*, or with `--icons "<app>"`. |
+| **Recipes → Agent** | Runs the `yardstick-recipes` skill on the open recipe through GitHub Copilot CLI or Claude Code: Fix, Review, Update or Freeform. Fix and Update can **Test and repair automatically**: Studio runs every harness stage and returns recipe failures to the agent, up to five test attempts by default. Live install/uninstall checks require explicit run consent. Review is read-only. |
+| **Requests** | New recipes, imported request lists and recipe updates go through one pipeline: the agent writes (or updates) each recipe, then Studio tests and repairs it. *New recipe…* with the agent makes a one-item request. Import a request list (ServiceNow/JSON export, CSV/TSV, Excel `xlsx/xls/ods`, YAML, text/Markdown/email, HTML, Word `docx`) by picker, *Paste text…*, drag and drop, or `yardstick-studio.exe <file>`; a quick scan pulls out the software, version, vendor URL and ticket for each request and flags requests that aren't software, and *Extract with agent* re-reads messy lists. *Run agent on N selected* creates or updates, tests and repairs each recipe in turn. **Test selected** rechecks the included recipes without editing them. **Repair with agent** tests the recipes no check has confirmed working yet and hands failures to the agent. One consent dialog covers a run's live install/uninstall tests, and system-context live tests share **one UAC prompt per run** through a hidden elevated worker (user-scope recipes run unelevated). Items show *recipe written*, *checks passed* or *complete · not published*. Requests are saved under `%APPDATA%\YardstickStudio\batches`; *Copy report* includes recorded check results. |
+| **Runs** | Browses `Artifacts\RecipeHarness\_install-tests`, parsing `summary.json` into verdicts and phase tables. It opens on the open recipe's newest run. |
+| **Publish** | Each selected development recipe becomes a pull request: the Studio cuts a `studio/<id>` branch from the upstream default branch in a temporary worktree (your checkout is untouched), commits the recipe to its shipped path with its test evidence, pushes it, and opens the pull request with `gh` when it is installed, or offers GitHub's compare page. It asks before opening anything in the browser. The recipe's icon is copied to the shared icon folder (`SharedIcons`), not into git. Production pulls merged changes itself. Recipes without a passing live test of their current contents get a dialog listing the recorded checks before you can *Open anyway*. |
+| **Settings** | Updates, production and trusted development folders, the agent CLI and model (models are read from the CLI), PowerShell, the tool check (pwsh, git, gh, agent CLIs; *Re-check* reloads `PATH`), and appearance. Changes save as you make them. |
+| **Help** | The skill and its reference docs, rendered as Markdown. |
+
+A recipe is **complete** when a live install test passed with exactly its current contents:
+the Studio records the recipe's hash in `Artifacts\RecipeHarness\_studio\validated.json`
+when a live test passes, and shows *Complete · not published* until the recipe changes
+(then *Changed since validation*). When a newer Studio is released, a banner above every
+page offers it until you open it or choose *Later*.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the architecture and the safety model.
 
@@ -44,7 +52,10 @@ See [docs/DESIGN.md](docs/DESIGN.md) for the architecture and the safety model.
     `build.ps1` finds it automatically and sets `-C dlltool=`.
 - A GPU with DirectX 12 or Vulkan, or the WARP software rasteriser. Rendering uses
   `wgpu`, so it works on VMs and RDP sessions that lack OpenGL 2.
-- For the Agent view, at least one of `copilot` (GitHub Copilot CLI) or `claude` (Claude Code) on `PATH`.
+- For the agent, GitHub Copilot CLI (`copilot`) or Claude Code (`claude`). The Studio also
+  looks in their usual install folders and re-reads `PATH`, so one installed while it is
+  open is found.
+- Optional: the GitHub CLI (`gh`), to open pull requests directly from Publish.
 
 ## Build and run
 
@@ -146,6 +157,8 @@ from about 1.8 fps to about 100 fps.
    `Install-Yardstick -DevelopmentOnly` from the banner. Settings are stored in
    `%APPDATA%\YardstickStudio\settings.json`, which also holds the production paths and
    trusted development paths.
-3. Pick a recipe in **Recipes**, *Copy to Development*, then edit it in **Designer**.
-4. In **Test Bench**, run *safe checks*, then run a live install test if you want one.
-5. **Promote**: preview, then publish.
+3. From **Home**, start a **New recipe** (the agent writes, tests and repairs it), import
+   requests, or open a recipe and *Copy to Development* to edit it on its **Design** tab.
+4. On the recipe's **Test** tab, run *safe checks*, then a live install test. A passing
+   live test marks it *Complete · not published*.
+5. **Publish** it: the Studio opens a pull request.

@@ -106,7 +106,8 @@ pub enum JobKind {
     /// An agent reading a request list into batch items.
     BatchExtract { batch_id: String, backend: String },
     Clone { dest: PathBuf },
-    Publish { what_if: bool },
+    /// Branches pushed and pull requests opened for promoted recipes.
+    PullRequests,
     GitFetch,
     GitPull,
     SyncShared,
@@ -841,7 +842,6 @@ impl StudioApp {
         let cancelled = self.jobs[idx].proc.cancelled;
         let started = self.jobs[idx].started_sys;
         let text = self.jobs[idx].proc.text();
-        let label = self.jobs[idx].proc.spec.label.clone();
         let kind = self.jobs[idx].kind.clone();
         if cancelled && matches!(kind, JobKind::WorkflowHarness { .. } | JobKind::WorkflowRepair { .. }) {
             crate::workflow::stop(self, true);
@@ -951,16 +951,8 @@ impl StudioApp {
                     self.error("git clone failed - see the console.");
                 }
             }
-            JobKind::Publish { what_if } => {
-                if what_if {
-                    self.promote.preview_finished(id, ok);
-                }
-                if ok {
-                    self.notify(if what_if { "Publish preview finished - review the console." } else { "Published to production." });
-                } else {
-                    self.error(format!("{label} failed - see the console."));
-                }
-            }
+            // Outcomes arrive through the Publish view, which offers to open them.
+            JobKind::PullRequests => {}
             JobKind::GitFetch => {
                 self.refresh_git_status();
                 match (&self.git_status, ok) {
@@ -1415,7 +1407,7 @@ impl StudioApp {
         views::recipes::windows(self, &ctx);
         views::batch::paste_window(self, &ctx);
         views::testbench::live_modal(self, &ctx);
-        views::promote::publish_modal(self, &ctx);
+        views::promote::modals(self, &ctx);
         crate::workflow::modal(self, &ctx);
         self.perf.record(self.view, frame_start.elapsed().as_secs_f32() * 1000.0);
         if self.perf.continuous {

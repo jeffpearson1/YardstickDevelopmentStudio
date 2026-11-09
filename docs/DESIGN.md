@@ -22,17 +22,20 @@ yardstick-studio.exe
 │   ├─ app.rs            StudioApp: state, job registry, caches, navigation shell
 │   ├─ highlight.rs      YAML/PowerShell syntax highlighting (egui LayoutJob)
 │   ├─ theme.rs          Fluent tokens (light/dark), brand art, fonts, nav items, badges, cards, info bars, accent buttons
-│   └─ views/            home, recipes, designer, editor, testbench, agent, batch, icons, runs, docs, promote
+│   └─ views/            home (launcher), recipes (+ recipe header and tabs in mod.rs), designer, editor,
+│                        testbench, agent, batch (Requests), icons, runs, docs (Help), promote (Publish), settings, update
 └─ crates/ystudio-core   headless engine; no GUI types; unit tested
     ├─ workspace.rs      open + classify a Yardstick folder, layout from Yardstick.Project.psd1, recipe metadata
     ├─ recipe.rs         ordered YAML document model (key order kept, scripts as literal blocks) + templates
     ├─ fields.rs         field catalogue mirroring Test-RecipeSchema's known fields/enums + skill guidance
     ├─ lint.rs           instant Rust-side checks mirroring the skill's rules
-    ├─ harness.rs        builds pwsh invocations of Tests/RecipeHarness/*.ps1, Publish-Yardstick and the shared-content sync
+    ├─ harness.rs        builds pwsh invocations of Tests/RecipeHarness/*.ps1 and the shared-content sync
+    ├─ promote.rs        publishing by pull request: branch in a temporary worktree, push, gh pr create or compare URL
+    ├─ validation.rs     ledger of recipe hashes that passed a live install test ("complete")
     ├─ git.rs            git clone/fetch/pull (ff-only) and ahead/behind status; finds git after a PATH refresh
     ├─ update.rs         self-update: latest GitHub release, SHA-256-verified MSI download, install-and-relaunch helper
     ├─ results.rs        parses _install-tests/<ts>/summary.json into verdicts and phases
-    ├─ agent.rs          prompt (guardrails + task) and CLI command for Copilot CLI / Claude Code
+    ├─ agent.rs          prompt (guardrails + task), CLI command and model list for Copilot CLI / Claude Code
     ├─ intake.rs         request-list readers, quick-scan extraction, recipe matching, Batch persistence
     ├─ icons.rs          multi-source icon search, scoring, dedupe, image clean-up
     ├─ process.rs        child processes with streamed stdout/stderr, cancel (taskkill /T), PATH reload from the registry
@@ -46,7 +49,7 @@ boundaries as well as the core rules.
 ### Jobs
 
 Every external action runs as a `RunningProcess`: harness steps, agent runs, git clone,
-fetch and pull, the shared icon/override sync, and publish. Reader threads pump stdout and stderr into a channel and wake the egui context.
+fetch and pull, the shared icon/override sync, and publishing. Reader threads pump stdout and stderr into a channel and wake the egui context.
 Git writes progress to stderr, so its specs set `stderr_is_progress` and the console shows
 those lines dimmed instead of red.
 The UI calls `poll()` each frame. `poll()` returns *whether anything changed*; use
@@ -59,7 +62,9 @@ dispatches on `JobKind`:
 - harness jobs reload results and verdicts;
 - agent jobs reload the recipe library and open the recipes named in the agent's
   `STUDIO-RECIPES:` line;
-- publish previews record whether the `-WhatIf` run succeeded for the current selection;
+- live harness runs that validate a recipe record its hash in the validation ledger;
+- publishing runs on a background thread that streams git's output into a remote
+  `RunningProcess`; its outcomes become "open in the browser?" prompts;
 - batch extraction jobs load the agent's `agent-items.json` into the batch;
 - agent jobs started from a batch item record changed recipes, then run that item's test-and-repair
   pipeline before starting the next queued item;
@@ -207,19 +212,22 @@ Classification (`workspace::classify`), in priority order:
 Enforcement:
 
 - **Refusals.** `Workspace::ensure_writable` is enforced inside the core builders
-  (`harness::build`, `harness::publish`, `harness::install_development_only`,
-  `agent::build_command`), so no external process can start in production even if a UI
+  (`harness::build`, `harness::install_development_only`, `agent::build_command`,
+  `promote::plan` and `promote::open_pull_request`), so no external process can start in
+  production even if a UI
   path forgets a check. Tests cover these refusals. Saving, creating and copying recipes
   call it in the app before touching disk.
-- **Consent.** Live install tests, `-Force` and real publishes need `Consent::Confirmed`,
-  which is only produced by a modal with an acknowledgement checkbox. Dry runs and
-  `-WhatIf` need no consent.
+- **Consent.** Live install tests and `-Force` need `Consent::Confirmed`, which is only
+  produced by a modal with an acknowledgement checkbox. Dry runs need no consent.
 - **Elevation.** Automatic runs elevate once, through a Studio-owned worker that runs only
   install tests it rebuilds itself and talks only to the Studio that launched it. It never
   outlives the run or the Studio.
-- **Two-step promote.** *Publish…* stays disabled until a successful `-WhatIf` preview of
-  exactly the current selection. Recipes without a validated live install test get a
-  warning.
+- **Publishing by pull request.** The Studio never copies into a production folder. It
+  pushes a `studio/<id>` branch cut from the upstream default branch, in a temporary
+  worktree so the user's checkout is untouched, and opens a pull request; production pulls
+  merged work. Icons go to the shared icon folder, not git. Recipes that are not *complete*
+  (no passing live test of their current contents) show their recorded checks first, and
+  the pull request says they are not validated. Nothing opens in the browser without asking.
 - **Agent guardrails.** Agents run in the development workspace only, and their file
   tools are confined to it (`--add-dir`, no `--allow-all-paths`). The shell tool may not
   run `Yardstick.ps1`, `Invoke-Yardstick`, `Publish-Yardstick.ps1` or `git push`. Review
@@ -232,20 +240,21 @@ Enforcement:
 
 ## User journeys
 
-1. **Design.** Recipes → *New recipe* (from a `Templates\` file) or *Copy to Development*
-   → Designer steps (Identity, Source & version, Download scripts, Install & uninstall,
+1. **Design.** Home or Recipes → *New recipe* (from a `Templates\` file) or *Copy to
+   Development* → the recipe's Design tab steps (Identity, Source & version, Download scripts, Install & uninstall,
    Detection, Lifecycle & assignments, Advanced) with live lint → Ctrl+S.
-2. **Test.** Test Bench → *Run safe checks* (Lint → Schema → install-test dry run). Then,
+2. **Test.** The recipe's Test tab → *Run safe checks* (Lint → Schema → install-test dry run). Then,
    optionally: Lab download/package, and a live install test after consent. Runs shows
    the history and per-phase results.
-3. **Agentic.** Agent → choose a task (Create from a vendor URL/description, Fix with the
-   latest failing run, Review, Update, Freeform) → stream → changed recipes open in the
-   Designer → back to Test.
-4. **Promote.** Promote → select validated Development recipes → Preview (`-WhatIf`) →
-   Publish… → confirm.
-5. **Batch.** Batch → open a ticket export → review the extracted items (optionally
-   *Extract with agent*) → find missing icons → *Run agent on N selected* → test and
-   promote the recipes it produced.
+3. **Agentic.** *New recipe* → *Write it with the agent* makes a one-item request that is
+   written, tested and repaired like any other; or the open recipe's Agent tab (Fix with the
+   latest failing run, Review, Update, Freeform) → stream → back to Test.
+4. **Publish.** Publish → select complete Development recipes → *Open pull requests…* →
+   confirm → open the pull request (or GitHub's compare page) in the browser.
+5. **Requests.** Import a ticket export or paste a list → review the extracted items
+   (optionally *Extract with agent*) → find missing icons → *Run agent on N selected* →
+   publish the recipes it produced. *Update several recipes* makes a request from library
+   recipes to re-test, repair or update together.
 
 ## Platform notes
 

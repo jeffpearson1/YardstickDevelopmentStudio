@@ -253,13 +253,28 @@ impl RunningProcess {
 /// Runs a short command to completion without a window and returns its stdout.
 /// Fails with stderr when it exits non-zero.
 pub fn run_capture(spec: &ProcessSpec) -> Result<String> {
+    let out = run_output(spec)?;
+    if !out.success {
+        anyhow::bail!("{}", out.stderr.trim());
+    }
+    Ok(out.stdout)
+}
+
+/// What a finished process printed, and whether it exited with 0.
+#[derive(Debug, Clone)]
+pub struct Output {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Runs to completion without treating a non-zero exit as an error, for
+/// commands that answer with their exit code (`git diff --quiet`).
+pub fn run_output(spec: &ProcessSpec) -> Result<Output> {
     let mut cmd = spec.command();
     cmd.stdin(Stdio::null());
     let out = cmd.output().with_context(|| format!("starting {}", spec.program.display()))?;
-    if !out.status.success() {
-        anyhow::bail!("{}", decode(&out.stderr).trim());
-    }
-    Ok(decode(&out.stdout))
+    Ok(Output { success: out.status.success(), stdout: decode(&out.stdout), stderr: decode(&out.stderr) })
 }
 
 /// Starts a process without a window and does not track it; it outlives the Studio.

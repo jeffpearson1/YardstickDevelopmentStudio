@@ -12,6 +12,7 @@ pub mod icons;
 pub mod intake;
 pub mod lint;
 pub mod process;
+pub mod promote;
 pub mod recipe;
 pub mod results;
 pub mod settings;

@@ -76,5 +76,5 @@ fn production_folder_is_refused() {
     assert!(harness::build(&ws, &HarnessAction::Schema { recipe: recipe.clone() }, Consent::None, &pwsh).is_err());
     let live = HarnessAction::InstallTest { recipes: vec![recipe], options: InstallTestOptions::live() };
     assert!(harness::build(&ws, &live, Consent::Confirmed, &pwsh).is_err());
-    assert!(harness::publish(&ws, &["7zip".into()], &prod, true, Consent::None, &pwsh).is_err());
+    assert!(ystudio_core::promote::plan(&ws, "7zip").is_err());
 }

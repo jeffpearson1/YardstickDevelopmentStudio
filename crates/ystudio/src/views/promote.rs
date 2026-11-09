@@ -1,39 +1,71 @@
-//! Promote: Publish-Yardstick.ps1 from this development workspace to a
-//! production folder, previewed with -WhatIf first.
+//! Publish: each selected development recipe becomes a pull request on
+//! GitHub (see `ystudio_core::promote`). Production pulls merged changes
+//! itself; the Studio never writes to a production folder.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, channel};
 
 use eframe::egui::{self, RichText, Ui};
-use ystudio_core::harness::{self, Consent};
+use ystudio_core::process::{ProcessSpec, RunningProcess, Stream};
+use ystudio_core::promote::{self, Outcome, Repo};
 use ystudio_core::results::{RecipeResult, VALIDATION_PHASES};
+use ystudio_core::validation::Completion;
 use ystudio_core::workspace::RecipeLocation;
 
 use crate::app::{JobKind, Step, StepState, StudioApp, job_log};
 use crate::theme::{self, FluentText as _};
 
+/// Each recipe's id and what promoting it produced.
+type Results = Vec<(String, Result<Outcome, String>)>;
+
 #[derive(Default)]
 pub struct PromoteState {
-    selected: BTreeSet<String>,
-    target: Option<PathBuf>,
-    modal: bool,
-    ack: bool,
-    previewed: Option<(BTreeSet<String>, bool)>,
+    pub(crate) selected: BTreeSet<String>,
+    /// The confirmation dialog is open.
+    pub(crate) modal: bool,
     job: Option<u64>,
-    /// `is_yardstick_root` result for the last target looked at.
-    target_checked: Option<(PathBuf, bool)>,
+    /// Each recipe's outcome, when the background run finishes.
+    rx: Option<Receiver<Results>>,
+    /// Pull requests and compare pages waiting for "open in the browser?".
+    pub(crate) prompts: Vec<(String, Outcome)>,
+    /// The upstream repository and `gh`, read once per workspace.
+    pub(crate) repo: Option<(PathBuf, Result<Repo, String>, Option<PathBuf>)>,
     /// The open recipe last pre-selected, so unticking it sticks.
     followed: Option<String>,
 }
 
 impl PromoteState {
-    /// Unlocks Publish only after a successful preview of the same selection.
-    pub fn preview_finished(&mut self, job: u64, ok: bool) {
-        if self.job == Some(job)
-            && let Some(p) = &mut self.previewed
-        {
-            p.1 = ok;
-        }
+    pub fn running(&self) -> bool {
+        self.rx.is_some()
+    }
+}
+
+/// The repository, re-read when the workspace changes.
+fn repo(app: &mut StudioApp) -> Option<(Result<Repo, String>, Option<PathBuf>)> {
+    let root = app.ws.as_ref()?.root.clone();
+    if app.promote.repo.as_ref().is_none_or(|(r, ..)| *r != root) {
+        let repo = promote::repo(app.ws.as_ref()?).map_err(|e| format!("{e:#}"));
+        let gh = ystudio_core::process::find_program("gh", &[]);
+        app.promote.repo = Some((root, repo, gh));
+    }
+    app.promote.repo.as_ref().map(|(_, r, gh)| (r.clone(), gh.clone()))
+}
+
+/// What the commit and pull request say about testing.
+fn evidence(app: &StudioApp, id: &str) -> String {
+    match app.completion(id) {
+        Completion::Complete(r) => format!(
+            "Validated: a live install test passed{} on {} with exactly this recipe (SHA-256 {}).",
+            if r.warnings { " with warnings" } else { "" },
+            r.tested,
+            r.sha256
+        ),
+        Completion::Changed(r) => format!("Not validated: a live install test passed on {}, but the recipe has changed since.", r.tested),
+        Completion::NotValidated => match app.verdicts.get(id) {
+            Some((v, ts)) => format!("Not validated: the latest install test ({ts}) was: {}.", v.label()),
+            None => "Not validated: no install test has been recorded.".to_string(),
+        },
     }
 }
 
@@ -42,33 +74,38 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         return;
     }
     super::production_banner(app, ui);
-    theme::page_title(ui, "Promote to production");
+    theme::page_title(ui, "Publish");
     ui.label(RichText::new(
-        "Publish-Yardstick copies the selected recipes (and their icons) from this development workspace into a \
-         production folder. Preview with -WhatIf first. If validation is incomplete, review the checks before publishing anyway.",
+        "Each selected recipe goes to GitHub as a pull request. Production picks it up once the pull request is merged.",
     ).weak());
     ui.add_space(6.0);
-
-    if app.promote.target.is_none() {
-        app.promote.target = app.settings.primary_production().cloned();
-    }
-    ui.horizontal(|ui| {
-        ui.label("Target production folder:");
-        let shown = app.promote.target.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "choose…".into());
-        egui::ComboBox::from_id_salt("promote-target").selected_text(shown).show_ui(ui, |ui| {
-            for p in app.settings.production_paths.clone() {
-                let label = p.display().to_string();
-                ui.selectable_value(&mut app.promote.target, Some(p), label);
+    let repo = repo(app);
+    let share = app.ws.as_ref().and_then(|w| w.shared_icons.clone());
+    theme::card(ui, |ui| {
+        match &repo {
+            Some((Ok(r), gh)) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Repository");
+                    ui.hyperlink_to(RichText::new(&r.web_url).monospace(), &r.web_url);
+                    ui.label(RichText::new(format!("→ {}", r.base)).monospace());
+                });
+                match gh {
+                    Some(_) => ui.label(RichText::new("gh is installed: pull requests are opened for you.").small().weak()),
+                    None => ui.label(RichText::new("gh is not installed: the Studio pushes each branch and offers GitHub's page to open the pull request.").small().weak()),
+                };
             }
-        });
-        if let Some(t) = &app.promote.target {
-            if app.promote.target_checked.as_ref().is_none_or(|(p, _)| p != t) {
-                app.promote.target_checked = Some((t.clone(), ystudio_core::workspace::is_yardstick_root(t)));
+            Some((Err(e), _)) => {
+                ui.colored_label(theme::red(), format!("\u{E711}  {e}"));
             }
-            if app.promote.target_checked.as_ref().is_some_and(|(_, ok)| !ok) {
-                ui.colored_label(theme::red(), "not a Yardstick folder");
-            }
+            None => {}
         }
+        match &share {
+            Some(s) => ui.label(RichText::new(format!("Icons are copied to the shared icon folder {}.", s.display())).small().weak()),
+            None => ui.colored_label(
+                theme::amber(),
+                "No shared icon folder (SharedIcons) is set in Local\\preferences.yaml, so icons will not reach production.",
+            ),
+        };
     });
     ui.add_space(6.0);
 
@@ -81,6 +118,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         }
         app.promote.followed = open_id;
     }
+    app.promote.selected.retain(|id| dev.contains(id));
     egui::Panel::left("promote-list").resizable(true).default_size(420.0).show(ui, |ui| {
         ui.label(RichText::new(format!("Development recipes ({})", dev.len())).semibold());
         if dev.is_empty() {
@@ -105,80 +143,166 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         });
     });
 
-    let writable = app.writable();
     let ids: Vec<String> = app.promote.selected.iter().cloned().collect();
-    let running = app.promote.job.and_then(|j| app.job(j)).is_some_and(|j| j.proc.is_running());
-    let ready = writable && !ids.is_empty() && app.promote.target.is_some() && !running;
-    let previewed_ok = app.promote.previewed.as_ref().is_some_and(|(set, ok)| *ok && *set == app.promote.selected);
+    let running = app.promote.running();
+    let repo_ok = matches!(repo, Some((Ok(_), _)));
+    let ready = app.writable() && !ids.is_empty() && repo_ok && !running;
     ui.horizontal(|ui| {
-        if ui.add_enabled(ready, egui::Button::new("\u{E7B3}  Preview (-WhatIf)")).clicked() {
-            start_publish(app, &ids, true);
-        }
-        if theme::primary(ui, ready && previewed_ok, RichText::new("\u{E898}  Publish…"))
-            .on_disabled_hover_text("Run a successful preview of exactly this selection first.")
-            .clicked()
-        {
+        let label = match ids.len() {
+            0 => "\u{E898}  Open pull requests…".to_string(),
+            1 => "\u{E898}  Open pull request…".to_string(),
+            n => format!("\u{E898}  Open {n} pull requests…"),
+        };
+        if theme::primary(ui, ready, label).on_disabled_hover_text("Select development recipes in a writable clone of the GitHub repository.").clicked() {
             app.refresh_runs();
             app.promote.modal = true;
-            app.promote.ack = false;
+        }
+        if running {
+            ui.spinner();
+            ui.label("Pushing…");
         }
     });
-    let unvalidated: Vec<&String> = ids.iter().filter(|id| !app.completion(id).is_complete()).collect();
-    if !unvalidated.is_empty() {
+    let incomplete: Vec<&String> = ids.iter().filter(|id| !app.completion(id).is_complete()).collect();
+    if !incomplete.is_empty() {
         theme::banner(ui, theme::amber(), |ui| {
             ui.label(format!(
-                "Not complete (no passing live test of the current contents): {}. Publish will show the recorded checks and ask whether to publish anyway.",
-                unvalidated.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                "Not complete (no passing live test of the current contents): {}. You will see the recorded checks and can open the pull request anyway; it says it is not validated.",
+                incomplete.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
             ));
         });
     }
     ui.add_space(4.0);
-    if let Some(job) = app.promote.job.and_then(|j| app.job_mut(j)) {
+    // The console already shows this job; a second copy only takes space.
+    let in_console = app.console_open && app.console_job.is_some() && app.console_job == app.promote.job;
+    if !in_console && let Some(job) = app.promote.job.and_then(|j| app.job_mut(j)) {
         job_log(ui, &mut job.proc, "promote");
     }
 }
 
-fn start_publish(app: &mut StudioApp, ids: &[String], what_if: bool) {
+/// Pushes a branch per recipe in the background, streaming git's output to the console.
+pub(crate) fn start(app: &mut StudioApp, ids: &[String]) {
     let Some(ws) = app.ws.clone() else { return };
-    let Some(target) = app.promote.target.clone() else { return };
-    let consent = if what_if { Consent::None } else { Consent::Confirmed };
-    match harness::publish(&ws, ids, &target, what_if, consent, &app.pwsh()) {
-        Ok(spec) => {
-            app.promote.job = app.start_job(spec, JobKind::Publish { what_if });
-            if what_if {
-                app.promote.previewed = Some((app.promote.selected.clone(), false));
-            } else {
-                app.promote.previewed = None;
-            }
+    let Some((Ok(repo), gh)) = repo(app) else { return };
+    let mut work = Vec::new();
+    for id in ids {
+        match promote::plan(&ws, id) {
+            Ok(plan) => work.push((plan, evidence(app, id))),
+            Err(e) => app.error(format!("{id}: {e:#}")),
         }
-        Err(e) => app.error(format!("{e:#}")),
+    }
+    if work.is_empty() {
+        return;
+    }
+    let label = format!("Pull requests · {}", ids.join(", "));
+    let spec = ProcessSpec::new(label, "git", &ws.root);
+    let (proc, feed) = RunningProcess::remote(spec, "branch, push and open pull requests", Some(app.waker.clone()), Box::new(|| {}));
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let mut results = Vec::new();
+        for (plan, evidence) in work {
+            feed.line(Stream::Studio, format!("--- {} → {}", plan.id, plan.dest.display()));
+            let result = promote::open_pull_request(&ws, &plan, &repo, gh.as_deref(), &evidence, &mut |l| feed.line(Stream::Stdout, l.to_string()));
+            match &result {
+                Ok(o) => feed.line(Stream::Studio, format!("{}: {}", plan.id, o.url())),
+                Err(e) => feed.line(Stream::Stderr, format!("{}: {e:#}", plan.id)),
+            }
+            results.push((plan.id.clone(), result.map_err(|e| format!("{e:#}"))));
+        }
+        let ok = results.iter().all(|(_, r)| r.is_ok());
+        let _ = tx.send(results);
+        feed.exited(Some(if ok { 0 } else { 1 }));
+    });
+    app.promote.rx = Some(rx);
+    app.promote.job = Some(app.add_job(proc, JobKind::PullRequests));
+    app.console_open = true;
+}
+
+/// Collects finished promotions into "open in the browser?" prompts.
+pub(crate) fn poll(app: &mut StudioApp) {
+    let Some(results) = app.promote.rx.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
+    app.promote.rx = None;
+    let (mut done, mut failed) = (Vec::new(), Vec::new());
+    for (id, result) in results {
+        match result {
+            Ok(outcome) => {
+                done.push(id.clone());
+                app.promote.prompts.push((id, outcome));
+            }
+            Err(e) => failed.push(format!("{id}: {e}")),
+        }
+    }
+    app.promote.selected.retain(|id| !done.contains(id));
+    if !failed.is_empty() {
+        app.error(format!("Could not publish {}", failed.join("; ")));
     }
 }
 
-pub fn publish_modal(app: &mut StudioApp, ctx: &egui::Context) {
+/// The confirmation before pushing, and the browser prompts after.
+pub fn modals(app: &mut StudioApp, ctx: &egui::Context) {
+    poll(app);
+    confirm_modal(app, ctx);
+    browser_prompt(app, ctx);
+}
+
+fn browser_prompt(app: &mut StudioApp, ctx: &egui::Context) {
+    let Some((id, outcome)) = app.promote.prompts.first().cloned() else { return };
+    let (mut open, mut close) = (false, false);
+    egui::Modal::new(egui::Id::unique("promote-browser")).show(ctx, |ui| {
+        ui.set_max_width(520.0);
+        let (title, text, button) = match &outcome {
+            Outcome::PullRequest { existing: false, .. } => ("Pull request opened", format!("The pull request for {id} is open on GitHub."), "Open it in the browser"),
+            Outcome::PullRequest { existing: true, .. } => ("Pull request updated", format!("{id} already had an open pull request; it now has the new commit."), "Open it in the browser"),
+            Outcome::Compare { .. } => (
+                "Branch pushed",
+                format!("The branch for {id} is on GitHub. Open GitHub's page to create the pull request?"),
+                "Open GitHub's page",
+            ),
+        };
+        ui.label(RichText::new(format!("\u{E898}  {title}")).heading());
+        ui.label(text);
+        ui.label(RichText::new(outcome.url()).monospace().small());
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            open = theme::primary(ui, true, button).clicked();
+            if ui.button("Copy link").clicked() {
+                ui.ctx().copy_text(outcome.url().to_string());
+            }
+            close = ui.button("Not now").clicked();
+        });
+    });
+    if open {
+        ctx.open_url(egui::OpenUrl::new_tab(outcome.url()));
+    }
+    if open || close {
+        app.promote.prompts.remove(0);
+    }
+}
+
+fn confirm_modal(app: &mut StudioApp, ctx: &egui::Context) {
     if !app.promote.modal {
         return;
     }
     let ids: Vec<String> = app.promote.selected.iter().cloned().collect();
     let incomplete = ids.iter().any(|id| !app.completion(id).is_complete());
-    let target = app.promote.target.clone().unwrap_or_default();
+    let base = app.promote.repo.as_ref().and_then(|(_, r, _)| r.as_ref().ok()).map(|r| r.base.clone()).unwrap_or_else(|| "main".into());
     let mut go = false;
     let mut cancel = false;
     egui::Modal::new(egui::Id::unique("publish-modal")).show(ctx, |ui| {
-        ui.set_max_width(520.0);
-        ui.label(RichText::new("\u{E898}  Publish to production").heading().color(theme::amber()));
-        ui.label(format!("Publish-Yardstick will copy {} recipe(s) into:", ids.len()));
-        ui.label(RichText::new(target.display().to_string()).monospace().strong());
+        ui.set_max_width(560.0);
+        ui.label(RichText::new("\u{E898}  Open pull requests").heading());
+        ui.label(format!(
+            "For each recipe the Studio cuts a studio/<id> branch from {base}, commits the recipe to its shipped path, pushes it and opens a pull request. Your checkout is not changed."
+        ));
         ui.label(RichText::new(ids.join(", ")).monospace());
-        ui.label("The next scheduled Yardstick run in that folder will package and upload them to Intune.");
         if incomplete {
             ui.add_space(8.0);
             ui.label(RichText::new("Validation is incomplete").strong().color(theme::amber()));
-            ui.label("Some checks have failed, were skipped, or have not been recorded. Publishing anyway does not mark the recipes validated.");
+            ui.label("Some recipes have no passing live test of their current contents. The pull request will say so.");
             egui::ScrollArea::vertical().id_salt("publish-checks").max_height(320.0).show(ui, |ui| {
-                for id in &ids {
+                for id in ids.iter().filter(|id| !app.completion(id).is_complete()) {
                     ui.add_space(8.0);
                     ui.label(RichText::new(id).strong().monospace());
+                    ui.label(RichText::new(evidence(app, id)).small());
                     let latest = app.runs.iter().find_map(|run| {
                         run.summary.as_ref()?.results.iter().find(|r| r.id == *id).map(|result| (run, result))
                     });
@@ -187,9 +311,6 @@ pub fn publish_modal(app: &mut StudioApp, ctx: &egui::Context) {
                     }
                     for line in validation_checks(latest.map(|(_, result)| result)) {
                         ui.label(line);
-                    }
-                    if let Some(phase) = latest.and_then(|(_, result)| result.phase("Reinstall")) {
-                        ui.label(format!("Reinstall: {}", phase.status));
                     }
                     let session: Vec<_> = Step::ALL
                         .iter()
@@ -211,20 +332,12 @@ pub fn publish_modal(app: &mut StudioApp, ctx: &egui::Context) {
                     }
                 }
             });
-        } else {
-            ui.checkbox(&mut app.promote.ack, "I reviewed the preview and want to publish these recipes.");
         }
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            if incomplete && ui.button("Go back").clicked() {
-                cancel = true;
-            }
-            let label = if incomplete { "Publish anyway" } else { "Publish" };
-            if theme::primary(ui, incomplete || app.promote.ack, RichText::new(label)).clicked() {
-                go = true;
-            }
-            if !incomplete && ui.button("Cancel").clicked() {
-                cancel = true;
-            }
+            let label = if incomplete { "Open anyway" } else { "Open pull requests" };
+            go = theme::primary(ui, true, label).clicked();
+            cancel = ui.button("Cancel").clicked();
         });
     });
     if cancel {
@@ -232,7 +345,7 @@ pub fn publish_modal(app: &mut StudioApp, ctx: &egui::Context) {
     }
     if go {
         app.promote.modal = false;
-        start_publish(app, &ids, false);
+        start(app, &ids);
     }
 }
 
@@ -262,7 +375,7 @@ mod tests {
     use ystudio_core::results::Phase;
 
     #[test]
-    fn missing_tests_are_explicit_and_do_not_qualify_as_validated() {
+    fn missing_tests_are_explicit() {
         let checks = validation_checks(None);
         assert_eq!(checks.len(), VALIDATION_PHASES.len());
         assert!(checks.iter().all(|s| s.ends_with(": Not recorded")));
