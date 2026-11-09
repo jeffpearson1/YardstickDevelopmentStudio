@@ -11,7 +11,6 @@ use crate::theme::{self, FluentText as _};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TaskKind {
     #[default]
-    Create,
     Fix,
     Review,
     Update,
@@ -19,8 +18,7 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
-    const ALL: [(TaskKind, &'static str, &'static str); 5] = [
-        (TaskKind::Create, "\u{E710}  Create", "Research a vendor and write a new recipe, then dry-run it."),
+    const ALL: [(TaskKind, &'static str, &'static str); 4] = [
         (TaskKind::Fix, "\u{E90F}  Fix", "Diagnose a failing recipe from harness evidence and fix it."),
         (TaskKind::Review, "\u{E721}  Review", "Read-only review against the skill; no files change."),
         (TaskKind::Update, "\u{E895}  Update", "Refresh download source, version scheme or switches."),
@@ -30,9 +28,6 @@ impl TaskKind {
 
 pub struct AgentState {
     pub kind: TaskKind,
-    pub app_name: String,
-    pub id_hint: String,
-    pub vendor_url: String,
     pub notes: String,
     pub target_id: String,
     pub evidence: String,
@@ -49,8 +44,7 @@ pub struct AgentState {
 impl Default for AgentState {
     fn default() -> Self {
         Self {
-            kind: TaskKind::default(), app_name: String::new(), id_hint: String::new(),
-            vendor_url: String::new(), notes: String::new(), target_id: String::new(),
+            kind: TaskKind::default(), notes: String::new(), target_id: String::new(),
             evidence: String::new(), freeform: String::new(), show_prompt: false,
             job: None, changes: Vec::new(), reported: Vec::new(), backends_found: None, auto_test: true,
         }
@@ -92,17 +86,6 @@ impl AgentState {
     fn task(&self) -> Result<AgentTask, &'static str> {
         let need_id = || if self.target_id.trim().is_empty() { Err("Choose the recipe id.") } else { Ok(self.target_id.trim().to_string()) };
         Ok(match self.kind {
-            TaskKind::Create => {
-                if self.app_name.trim().is_empty() {
-                    return Err("Name the application to package.");
-                }
-                AgentTask::Create {
-                    app: self.app_name.trim().to_string(),
-                    id_hint: self.id_hint.trim().to_string(),
-                    vendor_url: self.vendor_url.clone(),
-                    notes: self.notes.clone(),
-                }
-            }
             TaskKind::Fix => AgentTask::Fix { id: need_id()?, evidence: self.evidence.clone(), notes: self.notes.clone() },
             TaskKind::Review => AgentTask::Review { id: need_id()? },
             TaskKind::Update => AgentTask::Update { id: need_id()?, notes: self.notes.clone() },
@@ -117,14 +100,11 @@ impl AgentState {
 }
 
 pub fn show(app: &mut StudioApp, ui: &mut Ui) {
-    if !super::need_workspace(app, ui) {
+    if !super::need_recipe(app, ui) {
         return;
     }
     super::production_banner(app, ui);
-    ui.horizontal(|ui| {
-        theme::page_title(ui, "Agent");
-        ui.label(RichText::new("powered by the yardstick-recipes skill").weak());
-    });
+    super::recipe_header(app, ui);
     let ws = app.ws.clone().unwrap();
     if !app.ws_cache.has_skill {
         theme::banner(ui, theme::amber(), |ui| {
@@ -133,12 +113,13 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     }
     // Two agents writing at once would muddle each other's change lists.
     let running = crate::workflow::busy(app) || !app.batch.queue.is_empty();
-    let open_id = app.recipe.as_ref().map(|r| r.id.clone());
-    let ids: Vec<String> = app.recipes.iter().map(|r| r.id.clone()).collect();
+    let open_id = app.recipe.as_ref().map(|r| r.id.clone()).unwrap_or_default();
 
     egui::Panel::left("agent-form").resizable(true).default_size(430.0).show(ui, |ui| {
         egui::ScrollArea::vertical().id_salt("agent-form-scroll").show(ui, |ui| {
             let st = &mut app.agent;
+            // The tab always works on the open recipe.
+            st.target_id = open_id.clone();
             ui.horizontal_wrapped(|ui| {
                 for (k, label, _) in TaskKind::ALL {
                     ui.selectable_value(&mut st.kind, k, label);
@@ -147,41 +128,6 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             let blurb = TaskKind::ALL.iter().find(|(k, ..)| *k == st.kind).map(|t| t.2).unwrap_or_default();
             ui.label(RichText::new(blurb).weak());
             ui.add_space(6.0);
-            egui::Grid::new("agent-grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                match st.kind {
-                    TaskKind::Create => {
-                        ui.label("Application");
-                        ui.add(egui::TextEdit::singleline(&mut st.app_name).hint_text("e.g. Notepad++").desired_width(ui.available_width()));
-                        ui.end_row();
-                        ui.label("Recipe id");
-                        ui.add(egui::TextEdit::singleline(&mut st.id_hint).hint_text(ystudio_core::recipe::suggest_id(&st.app_name)).desired_width(ui.available_width()));
-                        ui.end_row();
-                        ui.label("Vendor page");
-                        ui.add(egui::TextEdit::singleline(&mut st.vendor_url).hint_text("optional").desired_width(ui.available_width()));
-                        ui.end_row();
-                    }
-                    TaskKind::Fix | TaskKind::Review | TaskKind::Update => {
-                        ui.label("Recipe");
-                        ui.horizontal(|ui| {
-                            egui::ComboBox::from_id_salt("agent-target")
-                                .selected_text(if st.target_id.is_empty() { "choose…".to_string() } else { st.target_id.clone() })
-                                .height(400.0)
-                                .show_ui(ui, |ui| {
-                                    for id in &ids {
-                                        ui.selectable_value(&mut st.target_id, id.clone(), id);
-                                    }
-                                });
-                            if let Some(id) = &open_id
-                                && ui.small_button("use open recipe").clicked()
-                            {
-                                st.target_id = id.clone();
-                            }
-                        });
-                        ui.end_row();
-                    }
-                    TaskKind::Freeform => {}
-                }
-            });
             match st.kind {
                 TaskKind::Freeform => {
                     ui.label("Prompt");

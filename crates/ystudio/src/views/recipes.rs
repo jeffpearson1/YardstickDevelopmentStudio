@@ -1,5 +1,6 @@
 //! The recipe library: browse, filter, open, create from template, duplicate.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use eframe::egui::{self, RichText, Ui};
@@ -7,7 +8,7 @@ use ystudio_core::recipe::{self, RecipeDoc};
 use ystudio_core::workspace::{RecipeEntry, RecipeLocation};
 
 use crate::app::{StudioApp, View};
-use crate::theme;
+use crate::theme::{self, FluentText as _};
 
 #[derive(Default, PartialEq, Clone, Copy)]
 pub enum LocationFilter {
@@ -28,8 +29,15 @@ pub struct LibraryState {
     pub new_publisher: String,
     pub new_id: String,
     pub new_id_touched: bool,
+    pub new_vendor: String,
+    pub new_notes: String,
     pub duplicate_of: Option<(String, PathBuf)>,
     pub duplicate_id: String,
+    /// "Update several recipes": rows get checkboxes, and the picked recipes
+    /// become a request.
+    pub selecting: bool,
+    pub picked: BTreeSet<String>,
+    pub update_notes: String,
     /// Templates listed when the New recipe window opened.
     templates: Option<Vec<PathBuf>>,
 }
@@ -45,6 +53,17 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         ui.add_space(12.0);
         if ui.add_enabled(writable, egui::Button::new("\u{E710}  New recipe")).clicked() {
             app.library.new_open = true;
+        }
+        if ui
+            .add_enabled(writable, egui::Button::selectable(app.library.selecting, "\u{E762}  Update several…"))
+            .on_hover_text("Pick recipes to re-test, repair or bring up to date together, as one request.")
+            .clicked()
+        {
+            app.library.selecting = !app.library.selecting;
+        }
+        if ui.button("\u{E91B}  Missing icons").on_hover_text("Recipes whose iconFile is empty or missing, in the icon finder.").clicked() {
+            app.icons.prepare("", "", "", "");
+            app.view = View::Icons;
         }
         if ui.button("\u{E72C}  Refresh").on_hover_text("Rescan recipes; also git fetch and sync shared icons/overrides when enabled in Settings").clicked() {
             app.refresh_recipes();
@@ -86,7 +105,10 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         .filter(|r| app.library.group.as_ref().is_none_or(|g| r.groups.contains(g)))
         .collect();
     ui.label(RichText::new(format!("{} of {} recipes", rows.len(), app.recipes.len())).weak());
+    let make_request = app.library.selecting && selection_bar(&mut app.library, ui, &rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>());
 
+    let selecting = app.library.selecting;
+    let mut toggle = None;
     let open_path = app.recipe.as_ref().map(|o| o.path.as_path());
     let mut open = None;
     let mut duplicate = None;
@@ -95,6 +117,12 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         for r in &rows[range] {
             ui.horizontal(|ui| {
                 ui.set_height(row_h);
+                if selecting {
+                    let mut on = app.library.picked.contains(&r.id);
+                    if ui.checkbox(&mut on, "").changed() {
+                        toggle = Some((r.id.clone(), on));
+                    }
+                }
                 // Both paths come from the same directory listing, so a plain comparison suffices.
                 let is_open = open_path == Some(r.path.as_path());
                 if ui.selectable_label(is_open, RichText::new(&r.id).monospace().strong()).clicked() {
@@ -125,6 +153,22 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         }
     });
 
+    if make_request {
+        let ids: Vec<String> = app.library.picked.iter().cloned().collect();
+        let notes = app.library.update_notes.trim().to_string();
+        if super::batch::start_update_request(app, &ids, &notes) {
+            app.library.selecting = false;
+            app.library.picked.clear();
+            app.library.update_notes.clear();
+        }
+    }
+    if let Some((id, on)) = toggle {
+        if on {
+            app.library.picked.insert(id);
+        } else {
+            app.library.picked.remove(&id);
+        }
+    }
     if let Some(p) = open {
         app.request_open_recipe(p);
         app.view = View::Designer;
@@ -133,8 +177,45 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         app.library.duplicate_id = id.clone();
         app.library.duplicate_of = Some((id, path));
     }
-    new_recipe_window(app, ui.ctx());
-    duplicate_window(app, ui.ctx());
+}
+
+/// What to do with the picked recipes in "Update several". Returns true when
+/// the user asks for a request.
+fn selection_bar(lib: &mut LibraryState, ui: &mut Ui, shown: &[String]) -> bool {
+    let n = lib.picked.len();
+    let mut create = false;
+    theme::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(format!("{n} selected")).semibold());
+            if ui.small_button(format!("Select the {} shown", shown.len())).clicked() {
+                lib.picked.extend(shown.iter().cloned());
+            }
+            if ui.small_button("Clear").clicked() {
+                lib.picked.clear();
+            }
+        });
+        ui.add(
+            egui::TextEdit::singleline(&mut lib.update_notes)
+                .hint_text("What should change? e.g. \"vendor moved downloads to GitHub releases\" (optional)")
+                .desired_width(f32::INFINITY),
+        );
+        ui.horizontal(|ui| {
+            create = theme::primary(ui, n > 0, format!("\u{E8C3}  Make a request for {n} recipe(s)"))
+                .on_hover_text("Opens them under Requests, where you can re-test them, repair the failures, or have the agent update them.")
+                .clicked();
+            if ui.button("Cancel").clicked() {
+                lib.selecting = false;
+                lib.picked.clear();
+            }
+        });
+    });
+    create
+}
+
+/// The library's dialogs; drawn every frame so Home can open them too.
+pub fn windows(app: &mut StudioApp, ctx: &egui::Context) {
+    new_recipe_window(app, ctx);
+    duplicate_window(app, ctx);
 }
 
 fn new_recipe_window(app: &mut StudioApp, ctx: &egui::Context) {
@@ -146,33 +227,32 @@ fn new_recipe_window(app: &mut StudioApp, ctx: &egui::Context) {
     let known = |id: &str, dev: bool| {
         app.recipes.iter().any(|r| r.id.eq_ignore_ascii_case(id) && (r.location == RecipeLocation::Development) == dev)
     };
+    let can_agent = app.writable() && app.ws_cache.has_skill;
+    let agent_name = app.settings.agent_backend.label();
     let mut open = true;
     let mut create = false;
-    egui::Window::new("New recipe").open(&mut open).collapsible(false).default_width(460.0).pivot(egui::Align2::CENTER_CENTER).default_pos(ctx.content_rect().center()).show(ctx, |ui| {
+    let mut with_agent = false;
+    egui::Window::new("New recipe").open(&mut open).collapsible(false).default_width(500.0).pivot(egui::Align2::CENTER_CENTER).default_pos(ctx.content_rect().center()).show(ctx, |ui| {
         let st = &mut app.library;
-        ui.label("Start from a template. You'll finish it in the Designer.");
-        egui::Grid::new("new-grid").num_columns(2).show(ui, |ui| {
-            ui.label("Template");
-            let name = |i: usize| templates.get(i).and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "(blank)".into());
-            egui::ComboBox::from_id_salt("tpl").selected_text(name(st.new_template)).show_ui(ui, |ui| {
-                for i in 0..templates.len() {
-                    ui.selectable_value(&mut st.new_template, i, name(i));
-                }
-                ui.selectable_value(&mut st.new_template, templates.len(), "(blank)");
-            });
-            ui.end_row();
-            ui.label("Display name");
-            if ui.text_edit_singleline(&mut st.new_display).changed() && !st.new_id_touched {
+        egui::Grid::new("new-grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            ui.label("Application");
+            if ui.add(egui::TextEdit::singleline(&mut st.new_display).hint_text("e.g. Notepad++").desired_width(320.0)).changed() && !st.new_id_touched {
                 st.new_id = recipe::suggest_id(&st.new_display);
             }
             ui.end_row();
             ui.label("Publisher");
-            ui.text_edit_singleline(&mut st.new_publisher);
+            ui.add(egui::TextEdit::singleline(&mut st.new_publisher).hint_text("optional").desired_width(320.0));
+            ui.end_row();
+            ui.label("Vendor page");
+            ui.add(egui::TextEdit::singleline(&mut st.new_vendor).hint_text("optional - where the agent starts its research").desired_width(320.0));
             ui.end_row();
             ui.label("Recipe id");
-            if ui.text_edit_singleline(&mut st.new_id).changed() {
+            if ui.add(egui::TextEdit::singleline(&mut st.new_id).desired_width(320.0)).changed() {
                 st.new_id_touched = true;
             }
+            ui.end_row();
+            ui.label("Notes");
+            ui.add(egui::TextEdit::multiline(&mut st.new_notes).hint_text("optional - licensing, architecture, quirks…").desired_rows(2).desired_width(320.0));
             ui.end_row();
         });
         let id = st.new_id.trim().to_string();
@@ -186,11 +266,44 @@ fn new_recipe_window(app: &mut StudioApp, ctx: &egui::Context) {
         } else if known(&id, false) {
             ui.colored_label(theme::amber(), "A shipped recipe with this id exists - the development copy will take precedence.");
         }
-        ui.label(RichText::new(format!("Creates {}", target.display())).small().weak());
-        if ui.add_enabled(valid && !exists && !st.new_display.trim().is_empty(), egui::Button::new("Create")).clicked() {
-            create = true;
+        let ready = valid && !exists && !st.new_display.trim().is_empty();
+        ui.add_space(6.0);
+        let resp = theme::primary(ui, ready && can_agent, format!("\u{E99A}  Write it with {agent_name}"));
+        if !can_agent {
+            resp.on_disabled_hover_text("Needs a writable development folder with the yardstick-recipes skill.");
+        } else if resp.on_hover_text("The agent researches the vendor and writes the recipe; the Studio then tests and repairs it. Follow it under Requests.").clicked() {
+            with_agent = true;
         }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("or start from a template yourself:");
+            let name = |i: usize| templates.get(i).and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "(blank)".into());
+            egui::ComboBox::from_id_salt("tpl").selected_text(name(st.new_template)).show_ui(ui, |ui| {
+                for i in 0..templates.len() {
+                    ui.selectable_value(&mut st.new_template, i, name(i));
+                }
+                ui.selectable_value(&mut st.new_template, templates.len(), "(blank)");
+            });
+            if ui.add_enabled(ready, egui::Button::new("Create")).on_hover_text(format!("Creates {} and opens it in the Designer.", target.display())).clicked() {
+                create = true;
+            }
+        });
     });
+    if with_agent {
+        let st = &app.library;
+        let item = ystudio_core::intake::BatchItem {
+            app: st.new_display.trim().to_string(),
+            publisher: st.new_publisher.trim().to_string(),
+            vendor_url: st.new_vendor.trim().to_string(),
+            suggested_id: st.new_id.trim().to_string(),
+            notes: st.new_notes.trim().to_string(),
+            ..Default::default()
+        };
+        if super::batch::start_new_recipe(app, item) {
+            app.library = LibraryState::default();
+        }
+        return;
+    }
     if create {
         let st = &app.library;
         let id = st.new_id.trim().to_string();

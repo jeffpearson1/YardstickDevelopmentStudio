@@ -254,12 +254,18 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         app.icons.auto_search = false;
         app.icons.start(app.waker.clone());
     }
-    ui.horizontal(|ui| {
-        theme::page_title(ui, "Icon finder");
-        ui.label(RichText::new("installer resources · Wikidata · Chocolatey · vendor site · image search").weak());
-    });
-
-    egui::Panel::left("icons-missing").resizable(true).default_size(260.0).show(ui, |ui| missing_panel(app, ui));
+    // The open recipe's Icon tab; otherwise the library-wide finder.
+    let for_open_recipe = app.icons.batch_item.is_none()
+        && app.recipe.as_ref().is_some_and(|r| app.icons.recipe_id.as_deref() == Some(r.id.as_str()));
+    if for_open_recipe {
+        super::recipe_header(app, ui);
+    } else {
+        ui.horizontal(|ui| {
+            theme::page_title(ui, "Icon finder");
+            ui.label(RichText::new("installer resources · Wikidata · Chocolatey · vendor site · image search").weak());
+        });
+        egui::Panel::left("icons-missing").resizable(true).default_size(260.0).show(ui, |ui| missing_panel(app, ui));
+    }
     egui::Panel::right("icons-preview").resizable(true).default_size(330.0).show(ui, |ui| preview_panel(app, ui));
     egui::ScrollArea::vertical().id_salt("icons-main").auto_shrink(false).show(ui, |ui| {
         query_form(app, ui);
@@ -381,7 +387,8 @@ fn candidate_grid(app: &mut StudioApp, ui: &mut Ui) {
     if st.candidates.is_empty() {
         ui.add_space(20.0);
         ui.vertical_centered(|ui| {
-            ui.label(RichText::new(if st.searching() { "Looking…" } else { "Pick a recipe on the left, or type a name and search." }).weak());
+            let idle = if st.recipe_id.is_some() { "Search to find candidates for this recipe." } else { "Pick a recipe on the left, or type a name and search." };
+            ui.label(RichText::new(if st.searching() { "Looking…" } else { idle }).weak());
             ui.label(RichText::new("Drop an installer here to read its embedded icons.").small().weak());
         });
         return;

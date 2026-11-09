@@ -38,19 +38,16 @@ pub enum View {
 }
 
 impl View {
-    pub const NAV: [(View, &'static str, &'static str); 12] = [
+    /// The sidebar. The open recipe's pages (Designer, YAML, Test Bench,
+    /// Icons, Agent) are tabs under Recipes.
+    pub const NAV: [(View, &'static str, &'static str); 7] = [
         (View::Home, theme::icon::HOME, "Home"),
         (View::Recipes, theme::icon::LIBRARY, "Recipes"),
-        (View::Designer, theme::icon::EDIT, "Designer"),
-        (View::Editor, theme::icon::CODE, "YAML Editor"),
-        (View::TestBench, theme::icon::CHECKLIST, "Test Bench"),
-        (View::Agent, theme::icon::ROBOT, "Agent"),
-        (View::Batch, theme::icon::INBOX, "Batch"),
-        (View::Icons, theme::icon::PHOTO, "Icons"),
+        (View::Batch, theme::icon::INBOX, "Requests"),
         (View::Runs, theme::icon::CHART, "Runs"),
-        (View::Docs, theme::icon::BOOK, "Docs"),
-        (View::Promote, theme::icon::UPLOAD, "Promote"),
+        (View::Promote, theme::icon::UPLOAD, "Publish"),
         (View::Settings, theme::icon::SETTINGS, "Settings"),
+        (View::Docs, theme::icon::BOOK, "Help"),
     ];
 }
 
@@ -1133,16 +1130,25 @@ impl StudioApp {
         });
         ui.add_space(14.0);
         ui.spacing_mut().item_spacing.y = 0.0;
+        // Recipe pages belong to Recipes; the icon finder to Requests when it works for a batch item.
+        let section = match self.view {
+            View::Designer | View::Editor | View::TestBench | View::Agent => View::Recipes,
+            View::Icons if self.icons.batch_item.is_some() => View::Batch,
+            View::Icons => View::Recipes,
+            v => v,
+        };
         for (view, icon, name) in View::NAV {
             let busy = match view {
-                View::Agent => self.jobs.iter().any(|j| j.is_agent() && j.proc.is_running()),
+                View::Recipes => {
+                    self.jobs.iter().any(|j| matches!(j.kind, JobKind::Agent { batch_item: None, .. }) && j.proc.is_running())
+                        || self.icons.searching()
+                        || self.bench.last_job.and_then(|id| self.job(id)).is_some_and(|j| j.proc.is_running())
+                }
                 View::Batch => self.workflow.busy() || self.jobs.iter().any(|j| matches!(j.kind, JobKind::BatchExtract { .. }) && j.proc.is_running()) || !self.batch.queue.is_empty(),
-                View::Icons => self.icons.searching(),
-                View::TestBench => self.bench.last_job.and_then(|id| self.job(id)).is_some_and(|j| j.proc.is_running()),
                 View::Settings => self.update.badge_version(&self.settings.skipped_update).is_some(),
                 _ => false,
             };
-            let mut resp = theme::nav_item(ui, icon, name, self.view == view, busy);
+            let mut resp = theme::nav_item(ui, icon, name, section == view, busy);
             if busy {
                 resp = resp.on_hover_text(if view == View::Settings { "An update is available" } else { "Running" });
             }
@@ -1152,6 +1158,7 @@ impl StudioApp {
         }
         ui.spacing_mut().item_spacing.y = 6.0;
         let Some(r) = &self.recipe else { return };
+        let mut show_recipe = false;
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
@@ -1161,7 +1168,9 @@ impl StudioApp {
             if r.dirty() {
                 t = RichText::new(format!("{} ●", r.id)).semibold().color(theme::amber());
             }
-            ui.label(t);
+            if ui.link(t).on_hover_text("Back to this recipe").clicked() {
+                show_recipe = true;
+            }
             let errors = lint::count(&r.diagnostics, lint::Severity::Error);
             let warnings = lint::count(&r.diagnostics, lint::Severity::Warning);
             ui.horizontal_wrapped(|ui| {
@@ -1177,6 +1186,9 @@ impl StudioApp {
                 views::recipe_status_badge(self, ui, &r.id);
             });
         });
+        if show_recipe && !matches!(self.view, View::Designer | View::Editor | View::TestBench | View::Agent) {
+            self.view = View::Designer;
+        }
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {
@@ -1400,6 +1412,8 @@ impl StudioApp {
         });
 
         self.pending_modal(&ctx);
+        views::recipes::windows(self, &ctx);
+        views::batch::paste_window(self, &ctx);
         views::testbench::live_modal(self, &ctx);
         views::promote::publish_modal(self, &ctx);
         crate::workflow::modal(self, &ctx);

@@ -24,10 +24,12 @@ pub struct BatchState {
     hide_other: bool,
     show_log: bool,
     verification: Option<crate::workflow::Options>,
+    /// Text being pasted as a new request list; `Some` while the window is open.
+    pub paste: Option<String>,
 }
 
 impl BatchState {
-    fn busy(&self, app_jobs: &StudioApp) -> bool {
+    pub fn busy(&self, app_jobs: &StudioApp) -> bool {
         crate::workflow::busy(app_jobs) || !self.queue.is_empty()
     }
 }
@@ -99,7 +101,91 @@ pub fn open_file(app: &mut StudioApp, path: &Path) {
     }
 }
 
-fn open_saved(app: &mut StudioApp, dir: &Path) {
+/// Opens a request made in the Studio (see [`Batch::from_items`]) under Requests.
+pub(crate) fn open_made(app: &mut StudioApp, batch: Batch) -> bool {
+    if app.batch.busy(app) {
+        app.error("Finish or cancel the active batch/agent/test run first.");
+        return false;
+    }
+    app.batch.batch = Some(batch);
+    app.batch.selected = None;
+    app.batch.saved = None;
+    save(app);
+    app.view = View::Batch;
+    true
+}
+
+/// A new recipe as a one-item request: the agent writes it, then the Studio
+/// tests and repairs it, exactly like an item from an imported list.
+pub fn start_new_recipe(app: &mut StudioApp, item: BatchItem) -> bool {
+    let name = format!("new {}", item.app);
+    if !open_made(app, Batch::from_items(&name, vec![item])) {
+        return false;
+    }
+    crate::workflow::request(app, crate::workflow::Request::BatchAuthor(vec![0]));
+    true
+}
+
+/// Existing recipes as one request, to re-test, repair or update together.
+pub fn start_update_request(app: &mut StudioApp, ids: &[String], notes: &str) -> bool {
+    let items = update_items(app, ids, notes);
+    let name = if ids.len() == 1 { format!("update {}", ids[0]) } else { format!("update {} recipes", ids.len()) };
+    let ok = open_made(app, Batch::from_items(&name, items));
+    if ok {
+        app.notify("Choose what to do with them: test them, repair failures with the agent, or have the agent update them.");
+    }
+    ok
+}
+
+pub(crate) fn update_items(app: &StudioApp, ids: &[String], notes: &str) -> Vec<BatchItem> {
+    ids.iter()
+        .map(|id| {
+            let name = app.recipes.iter().find(|r| &r.id == id).map(|r| r.meta.display_name.clone()).filter(|n| !n.is_empty());
+            BatchItem {
+                app: name.unwrap_or_else(|| id.clone()),
+                request: RequestKind::Update,
+                existing_recipe: id.clone(),
+                notes: notes.to_string(),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+/// Reads text pasted into the Studio as a request list.
+pub fn paste_window(app: &mut StudioApp, ctx: &egui::Context) {
+    let Some(text) = &mut app.batch.paste else { return };
+    let mut open = true;
+    let mut read = false;
+    let mut cancel = false;
+    egui::Window::new("Paste requests").open(&mut open).collapsible(false).default_width(560.0).pivot(egui::Align2::CENTER_CENTER).default_pos(ctx.content_rect().center()).show(ctx, |ui| {
+        ui.label("Paste tickets, an email, a spreadsheet selection or a plain list of software - one app per line works.");
+        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+            ui.add(egui::TextEdit::multiline(text).desired_rows(14).desired_width(f32::INFINITY).hint_text("Notepad++\n7-Zip 24.08\nINC0012345 - please install QGIS for the GIS lab"));
+        });
+        ui.horizontal(|ui| {
+            read = theme::primary(ui, !text.trim().is_empty(), "\u{E8C3}  Read requests").clicked();
+            cancel = ui.button("Cancel").clicked();
+        });
+    });
+    if read {
+        let text = app.batch.paste.take().unwrap_or_default();
+        match Batch::save_pasted(&text) {
+            Ok(path) => {
+                open_file(app, &path);
+                app.view = View::Batch;
+            }
+            Err(e) => {
+                app.batch.paste = Some(text);
+                app.error(format!("{e:#}"));
+            }
+        }
+    } else if !open || cancel {
+        app.batch.paste = None;
+    }
+}
+
+pub fn open_saved(app: &mut StudioApp, dir: &Path) {
     match Batch::load(dir) {
         Ok(mut b) => {
             // A run interrupted by closing the Studio is not running any more.
@@ -380,8 +466,8 @@ pub fn icon_saved(app: &mut StudioApp, batch_id: &str, idx: usize, file: &str) {
 
 pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
-        theme::page_title(ui, "Batch");
-        ui.label(RichText::new("turn a ticket export or request list into recipes").weak());
+        theme::page_title(ui, "Requests");
+        ui.label(RichText::new("new recipes, imported request lists and recipe updates - written, tested and repaired together").weak());
     });
     // Dropped request lists open as a new batch.
     let dropped: Vec<PathBuf> = ui.ctx().input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
@@ -422,11 +508,18 @@ fn toolbar(app: &mut StudioApp, ui: &mut Ui) {
         {
             open_file(app, &p);
         }
+        if ui.add_enabled(!busy, egui::Button::new("\u{E77F}  Paste text…")).clicked() {
+            app.batch.paste = Some(String::new());
+        }
+        if ui.add_enabled(!busy && app.writable(), egui::Button::new("\u{E710}  New recipe…")).clicked() {
+            app.library.new_open = true;
+        }
         let saved = app.batch.saved.get_or_insert_with(Batch::list).clone();
         let current = app.batch.batch.as_ref().map(|b| b.id.clone());
+        let current_label = app.batch.batch.as_ref().map(super::home::request_label);
         ui.add_enabled_ui(!busy, |ui| {
             egui::ComboBox::from_id_salt("batch-saved")
-                .selected_text(current.clone().unwrap_or_else(|| format!("Saved batches ({})", saved.len())))
+                .selected_text(current_label.unwrap_or_else(|| format!("Earlier requests ({})", saved.len())))
                 .height(400.0)
                 .show_ui(ui, |ui| {
                     for (name, dir) in &saved {
@@ -439,7 +532,7 @@ fn toolbar(app: &mut StudioApp, ui: &mut Ui) {
                     }
                 });
         });
-        if ui.small_button("\u{E72C}").on_hover_text("Rescan saved batches").clicked() {
+        if ui.small_button("\u{E72C}").on_hover_text("Rescan earlier requests").clicked() {
             app.batch.saved = None;
         }
         if let Some(b) = &app.batch.batch {
@@ -449,7 +542,7 @@ fn toolbar(app: &mut StudioApp, ui: &mut Ui) {
                 ui.ctx().copy_text(r);
                 app.notify("Report copied to the clipboard.");
             }
-            if ui.button("\u{E8B7}  Batch folder").clicked() {
+            if ui.button("\u{E8B7}  Request folder").clicked() {
                 super::open_in_explorer(&dir);
             }
         }
@@ -459,7 +552,7 @@ fn toolbar(app: &mut StudioApp, ui: &mut Ui) {
 fn start_page(app: &mut StudioApp, ui: &mut Ui) {
     ui.add_space(30.0);
     ui.vertical_centered(|ui| {
-        ui.label(RichText::new("\u{E8C3}  Drop a request list here, or open one above.").heading());
+        ui.label(RichText::new("\u{E8C3}  Drop a request list here, open one, or paste text.").heading());
         ui.add_space(6.0);
         ui.label(format!("Understands {}.", intake::EXTENSIONS.join(", ")));
         ui.label(RichText::new("ServiceNow / Jira exports, spreadsheets, CSVs, emails or plain notes all work.").weak());
@@ -471,7 +564,7 @@ fn start_page(app: &mut StudioApp, ui: &mut Ui) {
         ui.label("2. A quick scan lists the software it can see and matches it against existing recipes.");
         ui.label("3. For messy tickets, “Extract with agent” has Copilot / Claude read every request and return a clean list.");
         ui.label("4. Review the list, then queue agent runs that write (or update) one recipe per item and find icons.");
-        ui.label("5. Studio tests and repairs each recipe. Use Test selected batch to recheck the whole batch, then copy the report.");
+        ui.label("5. Studio tests and repairs each recipe. Use Test selected to recheck them all, then copy the report.");
     });
     if app.ws.is_none() {
         ui.label(RichText::new("Tip: open a Yardstick folder first so items can be matched to existing recipes.").small().weak());
@@ -494,6 +587,8 @@ fn items_table(app: &mut StudioApp, ui: &mut Ui) {
     let repairable = repair_targets(app, b).len();
     let file = b.source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let summary = format!("{} request(s) · {software} software item(s) · extracted by {}", b.records.len(), b.extracted_by);
+    // Requests made in the Studio are already a clean list.
+    let extractable = b.extracted_by != "Studio";
     let format = b.format.clone();
 
     // Header.
@@ -511,23 +606,25 @@ fn items_table(app: &mut StudioApp, ui: &mut Ui) {
             ui.label(summary);
         });
         ui.horizontal_wrapped(|ui| {
-            if running_extract {
-                ui.spinner();
-                ui.label("Agent is reading the requests…");
-                if ui.button("\u{E711}  Cancel").clicked() {
-                    cancel = true;
+            if extractable {
+                if running_extract {
+                    ui.spinner();
+                    ui.label("Agent is reading the requests…");
+                    if ui.button("\u{E711}  Cancel").clicked() {
+                        cancel = true;
+                    }
+                } else if ui
+                    .add_enabled(!busy, egui::Button::new("\u{E99A}  Extract with agent"))
+                    .on_hover_text(format!("{backend} reads every request and returns a structured list (replaces the current items)."))
+                    .clicked()
+                {
+                    extract = true;
                 }
-            } else if ui
-                .add_enabled(!busy, egui::Button::new("\u{E99A}  Extract with agent"))
-                .on_hover_text(format!("{backend} reads every request and returns a structured list (replaces the current items)."))
-                .clicked()
-            {
-                extract = true;
+                ui.separator();
             }
-            ui.separator();
             if running_items {
                 ui.spinner();
-                ui.label(format!("Batch working · {queued} queued"));
+                ui.label(format!("Working · {queued} queued"));
                 if ui.button("\u{E769}  Stop after this item").clicked() {
                     stop = true;
                 }
@@ -543,7 +640,7 @@ fn items_table(app: &mut StudioApp, ui: &mut Ui) {
                     queue = true;
                 }
             }
-            if ui.add_enabled(can_test && included > 0 && !busy, egui::Button::new("Test selected batch")).clicked() {
+            if ui.add_enabled(can_test && included > 0 && !busy, egui::Button::new("Test selected")).clicked() {
                 test = true;
             }
             let resp = ui.add_enabled(can_agent && repairable > 0 && !busy, egui::Button::new(format!("\u{E90F}  Repair {repairable} with agent")));

@@ -974,12 +974,17 @@ impl Batch {
         Self::root().join(&self.id)
     }
 
+    /// `<timestamp>-<name>`, safe as a folder name.
+    fn new_id(stamp: &str, name: &str) -> String {
+        let stem: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+        format!("{}-{}", stamp.replace([':', ' '], "").replace('-', ""), stem.trim_matches('-').chars().take(40).collect::<String>())
+    }
+
     pub fn new(doc: Document, recipes: &[RecipeEntry]) -> Self {
-        let stem: String = doc.path.file_stem().and_then(|s| s.to_str()).unwrap_or("batch").chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
         let stamp = timestamp();
         let items = quick_scan(&doc.records, recipes);
         Batch {
-            id: format!("{}-{}", stamp.replace([':', ' '], "").replace('-', ""), stem.trim_matches('-').chars().take(40).collect::<String>()),
+            id: Self::new_id(&stamp, doc.path.file_stem().and_then(|s| s.to_str()).unwrap_or("batch")),
             source: doc.path,
             format: doc.format,
             created: stamp,
@@ -987,6 +992,44 @@ impl Batch {
             records: doc.records,
             items,
         }
+    }
+
+    /// A request made in the Studio rather than imported - one new recipe, or
+    /// existing recipes to update - so it is authored, tested and reported
+    /// like any other batch. Each item gets a record holding its notes.
+    pub fn from_items(name: &str, mut items: Vec<BatchItem>) -> Self {
+        let stamp = timestamp();
+        let mut records = Vec::new();
+        for (n, it) in items.iter_mut().enumerate() {
+            it.source = format!("#{}", n + 1);
+            it.include = true;
+            records.push(Record { reference: it.source.clone(), title: it.app.clone(), body: it.notes.clone(), fields: Vec::new() });
+        }
+        Batch {
+            id: Self::new_id(&stamp, name),
+            source: PathBuf::from(name),
+            format: "made in Studio".into(),
+            created: stamp,
+            extracted_by: "Studio".into(),
+            records,
+            items,
+        }
+    }
+
+    /// Saves text pasted into the Studio as a request list file, so it reads
+    /// like any other import.
+    pub fn save_pasted(text: &str) -> Result<PathBuf> {
+        anyhow::ensure!(!text.trim().is_empty(), "Paste the requests first.");
+        let dir = Self::root().join("pasted");
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let path = dir.join(format!("{}-pasted.txt", Self::new_id(&timestamp(), "")));
+        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+        Ok(path)
+    }
+
+    /// Items still to do: included software that is not done or skipped.
+    pub fn open_items(&self) -> usize {
+        self.items.iter().filter(|i| i.include && i.request != RequestKind::NotSoftware && !matches!(i.status, ItemStatus::Done | ItemStatus::Skipped)).count()
     }
 
     pub fn save(&self) -> Result<()> {
@@ -1279,6 +1322,20 @@ mod tests {
         assert_eq!(back.items, b.items);
         assert!(b.report().contains("| T1 | Zoom |"));
         assert_eq!(timestamp().len(), 19);
+    }
+
+    #[test]
+    fn studio_made_requests_have_records_and_open_items() {
+        let b = Batch::from_items("New recipe Obsidian", vec![
+            BatchItem { app: "Obsidian".into(), vendor_url: "https://obsidian.md".into(), notes: "per-user".into(), ..Default::default() },
+            BatchItem { app: "7-Zip".into(), request: RequestKind::Update, existing_recipe: "7zip".into(), status: ItemStatus::Done, ..Default::default() },
+        ]);
+        assert!(b.id.ends_with("-New-recipe-Obsidian"), "{}", b.id);
+        assert_eq!(b.items[1].source, "#2");
+        assert!(b.items.iter().all(|i| i.include));
+        assert_eq!(b.record("#1").unwrap().body, "per-user");
+        assert_eq!(b.open_items(), 1);
+        assert!(Batch::save_pasted("  ").is_err());
     }
 
     #[test]

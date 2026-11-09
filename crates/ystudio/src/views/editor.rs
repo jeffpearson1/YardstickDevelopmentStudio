@@ -13,8 +13,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         return;
     }
     super::production_banner(app, ui);
-    super::designer::header(app, ui, "YAML Editor");
-    ui.separator();
+    super::recipe_header(app, ui);
 
     let font_size = app.settings.editor_font_size;
     let dark = app.settings.dark_mode;

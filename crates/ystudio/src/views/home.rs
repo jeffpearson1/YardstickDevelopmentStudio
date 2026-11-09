@@ -1,9 +1,12 @@
-//! Home: workspace status, the production guard, and creating a development
-//! workspace.
+//! Home: what to do next - continue a request, import one, write a new
+//! recipe, edit one, or update several - plus the workspace and creating a
+//! development clone.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText, Ui};
+use ystudio_core::intake::Batch;
 use ystudio_core::{git, harness};
 use ystudio_core::settings::Settings;
 use ystudio_core::workspace::WorkspaceKind;
@@ -16,6 +19,17 @@ pub struct HomeState {
     pub clone_url: String,
     /// Whether `clone_dest` is a production path, keyed by the inputs (canonicalizing hits the disk).
     prod_check: Option<(String, Vec<PathBuf>, bool)>,
+    /// "Edit a recipe" search text.
+    edit_filter: String,
+    /// Saved requests with work left, re-read every few seconds.
+    recent: Option<(Instant, Vec<Recent>)>,
+}
+
+struct Recent {
+    dir: PathBuf,
+    label: String,
+    open: usize,
+    total: usize,
 }
 
 impl HomeState {
@@ -29,6 +43,8 @@ impl HomeState {
             clone_dest: dest.display().to_string(),
             clone_url: settings.repo_url.clone(),
             prod_check: None,
+            edit_filter: String::new(),
+            recent: None,
         }
     }
 }
@@ -41,49 +57,216 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         theme::page_title(ui, "Yardstick Development Studio");
         ui.label(RichText::new("Design, test and agentically author Yardstick recipes - without ever touching production.").weak());
         ui.add_space(20.0);
-        journey(app, ui);
-        ui.add_space(theme::CARD_GAP);
+        if app.ws.is_some() {
+            launcher(app, ui);
+            ui.add_space(theme::CARD_GAP);
+        }
         workspace_card(app, ui);
         ui.add_space(theme::CARD_GAP);
-        theme::card(ui, |ui| {
-            create_body(app, ui);
-            ui.add_space(GROUP_GAP - 6.0);
-            create_footer(app, ui);
-        });
+        if app.writable() {
+            egui::CollapsingHeader::new("Create another development workspace").id_salt("home-create").show(ui, |ui| {
+                theme::card(ui, |ui| {
+                    create_body(app, ui);
+                    ui.add_space(GROUP_GAP - 6.0);
+                    create_footer(app, ui);
+                });
+            });
+        } else {
+            theme::card(ui, |ui| {
+                create_body(app, ui);
+                ui.add_space(GROUP_GAP - 6.0);
+                create_footer(app, ui);
+            });
+        }
         ui.add_space(8.0);
     });
 }
 
-const STEPS: [(&str, &str, &str, View); 4] = [
-    ("1", "Design", "Step through every recipe field with guidance from the skill, or edit YAML with live lint.", View::Recipes),
-    ("2", "Test", "Lint → schema → lab download → dry run → live install test, with verdicts.", View::TestBench),
-    ("3", "Delegate", "Have Copilot CLI write, fix or review recipes using the yardstick-recipes skill.", View::Agent),
-    ("4", "Promote", "Publish validated recipes to production with Publish-Yardstick.", View::Promote),
+/// A request's name: the file it came from, or what the Studio called it.
+pub fn request_label(b: &Batch) -> String {
+    b.source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| b.id.clone())
+}
+
+/// Up to three other saved requests that still have items to do, newest first.
+fn recent_requests(app: &mut StudioApp) -> &[Recent] {
+    let stale = app.home.recent.as_ref().is_none_or(|(at, _)| at.elapsed() > Duration::from_secs(3));
+    if stale {
+        let current = app.batch.batch.as_ref().map(|b| b.id.clone());
+        let list = Batch::list()
+            .into_iter()
+            .filter(|(name, _)| current.as_deref() != Some(name.as_str()))
+            .filter_map(|(_, dir)| {
+                let b = Batch::load(&dir).ok()?;
+                let open = b.open_items();
+                (open > 0).then(|| Recent { label: request_label(&b), open, total: b.items.len(), dir })
+            })
+            .take(3)
+            .collect();
+        app.home.recent = Some((Instant::now(), list));
+    }
+    &app.home.recent.as_ref().unwrap().1
+}
+
+const ACTIONS: [(&str, &str, &str); 5] = [
+    (theme::icon::INBOX, "Continue", "Pick up a request where you left off."),
+    (theme::icon::UPLOAD, "Import requests", "A ticket export, spreadsheet, email or pasted list. The Studio finds the software in it and matches existing recipes."),
+    (theme::icon::ROBOT, "New recipe", "Name the app: the agent researches, writes, tests and repairs it. Or start from a template yourself."),
+    (theme::icon::EDIT, "Edit a recipe", ""),
+    (theme::icon::LIBRARY, "Update several recipes", "Re-test, repair or bring a set of recipes up to date together - for example after a vendor changes its downloads."),
 ];
 
-fn journey(app: &mut StudioApp, ui: &mut Ui) {
+fn action_title(ui: &mut Ui, i: usize) {
+    let (icon, title, text) = ACTIONS[i];
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(icon).family(egui::FontFamily::Name(theme::ICONS.into())).size(18.0).color(theme::accent()));
+        ui.label(RichText::new(title).size(16.0).semibold());
+    });
+    if !text.is_empty() {
+        ui.add_space(2.0);
+        ui.label(RichText::new(text).weak());
+    }
+}
+
+fn launcher(app: &mut StudioApp, ui: &mut Ui) {
     theme::card_row(
         ui,
         app,
-        "home-journey",
-        STEPS.len(),
-        |_, i, ui| {
-            let (n, title, text, _) = STEPS[i];
-            ui.horizontal(|ui| {
-                theme::badge(ui, n, theme::accent());
-                ui.label(RichText::new(title).size(16.0).semibold());
-            });
-            ui.add_space(2.0);
-            ui.label(RichText::new(text).weak());
+        "home-actions-1",
+        3,
+        |app, i, ui| {
+            action_title(ui, i);
+            if i == 0 {
+                continue_body(app, ui);
+            }
         },
         |app, i, ui| {
-            let (_, title, _, view) = STEPS[i];
             ui.add_space(GROUP_GAP - 4.0);
-            if ui.button(format!("Open {title}")).clicked() {
-                app.view = view;
+            let busy = app.batch.busy(app);
+            match i {
+                0 => {
+                    let newest = app.home.recent.as_ref().and_then(|(_, v)| v.first()).map(|r| r.dir.clone());
+                    let current = app.batch.batch.is_some();
+                    if ui.add_enabled(current || newest.is_some(), egui::Button::new("Continue")).clicked() {
+                        match newest.filter(|_| !current) {
+                            Some(dir) if !busy => {
+                                super::batch::open_saved(app, &dir);
+                                app.home.recent = None;
+                            }
+                            _ => {}
+                        }
+                        app.view = View::Batch;
+                    }
+                }
+                1 => {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add_enabled(!busy, egui::Button::new("\u{E838}  Open a file…")).clicked()
+                            && let Some(p) = rfd::FileDialog::new()
+                                .add_filter("Request lists", ystudio_core::intake::EXTENSIONS)
+                                .add_filter("All files", &["*"])
+                                .pick_file()
+                        {
+                            super::batch::open_file(app, &p);
+                            app.view = View::Batch;
+                        }
+                        if ui.add_enabled(!busy, egui::Button::new("\u{E77F}  Paste text…")).clicked() {
+                            app.batch.paste = Some(String::new());
+                        }
+                    });
+                }
+                _ => {
+                    if theme::primary(ui, app.writable(), "\u{E710}  New recipe…").clicked() {
+                        app.library.new_open = true;
+                    }
+                }
             }
         },
     );
+    ui.add_space(theme::CARD_GAP);
+    theme::card_row(
+        ui,
+        app,
+        "home-actions-2",
+        2,
+        |app, i, ui| {
+            action_title(ui, i + 3);
+            if i == 0 {
+                edit_body(app, ui);
+            }
+        },
+        |app, i, ui| {
+            ui.add_space(GROUP_GAP - 4.0);
+            if i == 0 {
+                if ui.button("Browse all recipes").clicked() {
+                    app.view = View::Recipes;
+                }
+            } else if ui.add_enabled(app.writable(), egui::Button::new("Choose recipes…")).clicked() {
+                app.library.selecting = true;
+                app.view = View::Recipes;
+            }
+        },
+    );
+}
+
+fn continue_body(app: &mut StudioApp, ui: &mut Ui) {
+    ui.add_space(4.0);
+    if let Some(b) = &app.batch.batch {
+        ui.label(RichText::new(format!("Open: {}", request_label(b))).semibold());
+        ui.label(RichText::new(format!("{} of {} item(s) still to do", b.open_items(), b.items.len())).small().weak());
+    }
+    let mut open = None;
+    for r in recent_requests(app) {
+        if ui.link(format!("{}  ·  {} of {} to do", r.label, r.open, r.total)).clicked() {
+            open = Some(r.dir.clone());
+        }
+    }
+    if app.batch.batch.is_none() && app.home.recent.as_ref().is_some_and(|(_, v)| v.is_empty()) {
+        ui.label(RichText::new("Nothing in progress.").weak());
+    }
+    if let Some(dir) = open {
+        if app.batch.busy(app) {
+            app.error("Finish or cancel the active run before switching requests.");
+        } else {
+            super::batch::open_saved(app, &dir);
+            app.view = View::Batch;
+            app.home.recent = None;
+        }
+    }
+}
+
+fn edit_body(app: &mut StudioApp, ui: &mut Ui) {
+    ui.add_space(4.0);
+    let resp = ui.add(egui::TextEdit::singleline(&mut app.home.edit_filter).hint_text("Find a recipe by id or name…").desired_width(f32::INFINITY));
+    let needle = app.home.edit_filter.trim().to_lowercase();
+    if needle.is_empty() {
+        return;
+    }
+    let matches: Vec<(String, PathBuf)> = app
+        .recipes
+        .iter()
+        .filter(|r| r.id.to_lowercase().contains(&needle) || r.meta.display_name.to_lowercase().contains(&needle))
+        .take(6)
+        .map(|r| (r.id.clone(), r.path.clone()))
+        .collect();
+    let mut open = None;
+    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        open = matches.first().map(|m| m.1.clone());
+    }
+    for (id, path) in &matches {
+        ui.horizontal(|ui| {
+            if ui.link(RichText::new(id).monospace()).clicked() {
+                open = Some(path.clone());
+            }
+            super::recipe_status_badge(app, ui, id);
+        });
+    }
+    if matches.is_empty() {
+        ui.label(RichText::new("No recipe matches.").weak());
+    }
+    if let Some(p) = open {
+        app.request_open_recipe(p);
+        app.view = View::Designer;
+        app.home.edit_filter.clear();
+    }
 }
 
 fn workspace_card(app: &mut StudioApp, ui: &mut Ui) {

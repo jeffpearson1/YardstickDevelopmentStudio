@@ -22,6 +22,8 @@ pub struct PromoteState {
     job: Option<u64>,
     /// `is_yardstick_root` result for the last target looked at.
     target_checked: Option<(PathBuf, bool)>,
+    /// The open recipe last pre-selected, so unticking it sticks.
+    followed: Option<String>,
 }
 
 impl PromoteState {
@@ -71,6 +73,14 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     ui.add_space(6.0);
 
     let dev: Vec<String> = app.recipes.iter().filter(|r| r.location == RecipeLocation::Development).map(|r| r.id.clone()).collect();
+    // Start from the recipe being worked on.
+    let open_id = app.recipe.as_ref().map(|r| r.id.clone());
+    if open_id.is_some() && app.promote.followed != open_id {
+        if let Some(id) = open_id.as_ref().filter(|id| dev.contains(id)) {
+            app.promote.selected.insert(id.clone());
+        }
+        app.promote.followed = open_id;
+    }
     egui::Panel::left("promote-list").resizable(true).default_size(420.0).show(ui, |ui| {
         ui.label(RichText::new(format!("Development recipes ({})", dev.len())).semibold());
         if dev.is_empty() {

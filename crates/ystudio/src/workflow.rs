@@ -1007,8 +1007,8 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         assert!(app.workflow.request.is_some());
         assert!(app.jobs.is_empty());
         app.workflow.request = None;
+        app.open_recipe_by_id("app");
         app.view = crate::app::View::Agent;
-        app.agent.app_name = "App".into();
         render(&mut app, "agent-narrow", 900, 600);
         app.view = crate::app::View::Batch;
         app.settings.dark_mode = false;
@@ -1061,5 +1061,58 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         render(&mut app, "icons-current", 1400, 900);
         std::fs::remove_file(dir.path().join(r"Icons\app.png")).unwrap();
         render(&mut app, "icons-current-missing", 1400, 900);
+    }
+
+    #[test]
+    fn launcher_recipe_tabs_and_studio_made_requests_render() {
+        let (dir, mut app) = fake_app();
+        std::fs::create_dir_all(dir.path().join(r".claude\skills\yardstick-recipes")).unwrap();
+        std::fs::write(dir.path().join(r".claude\skills\yardstick-recipes\SKILL.md"), "# skill").unwrap();
+        app.refresh_recipes();
+        app.view = crate::app::View::Home;
+        render(&mut app, "home-launcher", 1400, 1000);
+        render(&mut app, "home-launcher-narrow", 900, 700);
+
+        // Every page of the open recipe shares its header and tabs.
+        assert!(app.open_recipe_by_id("app"));
+        for (view, _, name) in crate::views::RECIPE_TABS {
+            crate::views::open_recipe_tab(&mut app, view);
+            app.icons.auto_search = false;
+            render(&mut app, &format!("recipe-tab-{}", name.to_lowercase()), 1400, 900);
+        }
+        assert_eq!(app.icons.recipe_id.as_deref(), Some("app"));
+        assert_eq!(app.agent.target_id, "app");
+
+        app.view = crate::app::View::Recipes;
+        app.library.selecting = true;
+        app.library.picked.extend(["app".to_string(), "user".to_string()]);
+        render(&mut app, "library-update-several", 1400, 900);
+        let items = crate::views::batch::update_items(&app, &["app".into(), "user".into()], "vendor moved");
+        assert_eq!(items[0].app, "App");
+        assert!(items.iter().all(|i| i.request == ystudio_core::intake::RequestKind::Update && i.notes == "vendor moved"));
+        assert_eq!(items[1].existing_recipe, "user");
+
+        app.library.selecting = false;
+        app.library.new_open = true;
+        app.library.new_display = "Obsidian".into();
+        app.library.new_id = "obsidian".into();
+        render(&mut app, "new-recipe-dialog", 1400, 900);
+        app.library.new_open = false;
+        app.batch.paste = Some("Notepad++\n7-Zip 24.08".into());
+        render(&mut app, "paste-requests", 1400, 900);
+        app.batch.paste = None;
+
+        // A new recipe is a one-item request that goes straight to authoring.
+        let mut batch = ystudio_core::intake::Batch::from_items("new Obsidian", vec![ystudio_core::intake::BatchItem {
+            app: "Obsidian".into(), suggested_id: "obsidian".into(), ..Default::default()
+        }]);
+        batch.id = dir.path().join("made-batch").to_string_lossy().into_owned();
+        assert!(crate::views::batch::open_made(&mut app, batch));
+        assert_eq!(app.view, crate::app::View::Batch);
+        request(&mut app, Request::BatchAuthor(vec![0]));
+        assert!(app.workflow.request.is_some() && app.jobs.is_empty());
+        render(&mut app, "requests-new-recipe-consent", 1400, 900);
+        app.workflow.request = None;
+        render(&mut app, "requests-new-recipe", 1400, 900);
     }
 }

@@ -16,8 +16,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         return;
     }
     super::production_banner(app, ui);
-    super::designer::header(app, ui, "Test Bench");
-    ui.separator();
+    super::recipe_header(app, ui);
 
     let writable = app.writable();
     let id = app.recipe.as_ref().unwrap().id.clone();
