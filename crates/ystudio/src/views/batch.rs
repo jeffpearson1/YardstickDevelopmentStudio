@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use eframe::egui::{self, RichText, Ui};
 use ystudio_core::agent::{self, AgentTask, Snapshot};
 use ystudio_core::icons;
-use ystudio_core::intake::{self, Batch, BatchCheck, BatchItem, ItemStatus, RequestKind};
+use ystudio_core::intake::{self, Batch, BatchCheck, BatchItem, ItemAction, ItemStatus, RequestKind};
 
 use crate::app::{JobKind, StudioApp, View, job_log};
 use crate::theme::{self, FluentText as _};
@@ -16,8 +16,8 @@ use crate::theme::{self, FluentText as _};
 #[derive(Default)]
 pub struct BatchState {
     pub batch: Option<Batch>,
-    saved: Option<Vec<(String, PathBuf)>>,
-    selected: Option<usize>,
+    pub saved: Option<Vec<(String, PathBuf)>>,
+    pub(crate) selected: Option<usize>,
     pub extract_job: Option<u64>,
     pub run_job: Option<u64>,
     pub queue: VecDeque<usize>,
@@ -52,13 +52,25 @@ fn item_status_badge(app: &StudioApp, ui: &mut Ui, it: &BatchItem) {
     if it.status != ItemStatus::Done {
         return status_badge(ui, it.status);
     }
+    match it.action {
+        ItemAction::Review => {
+            theme::badge(ui, "reviewed", theme::green()).on_hover_text("The agent reviewed the recipe without changing it; its findings are in the agent's output.");
+            return;
+        }
+        ItemAction::Freeform if it.checks.is_empty() => {
+            theme::badge(ui, "agent finished", theme::blue()).on_hover_text("The agent finished the task.");
+            return;
+        }
+        _ => {}
+    }
     let ids: Vec<String> = if it.recipes.is_empty() { vec![it.recipe_id()] } else { it.recipes.clone() };
     let (text, color, hover) = if ids.iter().all(|id| app.completion(id).is_complete()) {
         ("complete · not published", theme::green(), "Passed a live install test and unchanged since. Ready to publish.")
     } else if !it.checks.is_empty() && it.checks.iter().all(|c| c.passed) {
         ("checks passed", theme::blue(), "The checks that ran passed, but no live install test of the current recipe has.")
     } else {
-        ("recipe written", theme::blue(), "The agent finished. Run the checks to validate it.")
+        let updated = matches!(it.action, ItemAction::Fix | ItemAction::Update);
+        (if updated { "recipe updated" } else { "recipe written" }, theme::blue(), "The agent finished. Run the checks to validate it.")
     };
     theme::badge(ui, text, color).on_hover_text(hover);
 }
@@ -188,10 +200,13 @@ pub fn paste_window(app: &mut StudioApp, ctx: &egui::Context) {
 pub fn open_saved(app: &mut StudioApp, dir: &Path) {
     match Batch::load(dir) {
         Ok(mut b) => {
-            // A run interrupted by closing the Studio is not running any more.
-            for it in &mut b.items {
-                if matches!(it.status, ItemStatus::Running | ItemStatus::Queued) {
-                    it.status = ItemStatus::Pending;
+            // A run interrupted by closing the Studio is not running any more;
+            // one still going (an Agent tab run, say) keeps its status.
+            if !crate::workflow::works_on(app, &b.id) {
+                for it in &mut b.items {
+                    if matches!(it.status, ItemStatus::Running | ItemStatus::Queued) {
+                        it.status = ItemStatus::Pending;
+                    }
                 }
             }
             app.batch.batch = Some(b);
@@ -219,8 +234,12 @@ fn icon_state(app: &StudioApp, it: &BatchItem) -> (String, egui::Color32) {
     if has(&guess) { (format!("ready: {guess}"), theme::blue()) } else { ("—".into(), theme::grey()) }
 }
 
-fn task_for(app: &StudioApp, b: &Batch, idx: usize) -> Option<AgentTask> {
+pub(crate) fn task_for(app: &StudioApp, b: &Batch, idx: usize) -> Option<AgentTask> {
     let it = b.items.get(idx)?;
+    // Runs started from a recipe's Agent tab repeat exactly what was asked.
+    if let Some(task) = it.explicit_task() {
+        return Some(task);
+    }
     let mut notes = it.agent_notes(b.record(&it.source));
     if !it.vendor_url.is_empty() && agent::vendor_start_url(&it.vendor_url, &[]).is_empty() {
         notes += &format!("\nRequest-supplied fallback media: {}. Research vendor downloads first.\n", it.vendor_url);
@@ -877,6 +896,11 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
             ui.label("Version");
             ui.add(egui::TextEdit::singleline(&mut edit.version).desired_width(w));
             ui.end_row();
+            if edit.action != ItemAction::Auto {
+                ui.label("Task");
+                ui.label(RichText::new(edit.action.label()).semibold()).on_hover_text("Started from the recipe's Agent tab; Run agent repeats it.");
+                ui.end_row();
+            }
             ui.label("Request");
             egui::ComboBox::from_id_salt("batch-req").selected_text(edit.request.label()).show_ui(ui, |ui| {
                 for k in RequestKind::ALL {
@@ -908,8 +932,15 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
                 ui.hyperlink_to(RichText::new(u).small(), u);
             }
         }
-        ui.label("Notes for the agent");
+        ui.label(if edit.action == ItemAction::Freeform { "Prompt" } else { "Notes for the agent" });
         ui.add(egui::TextEdit::multiline(&mut edit.notes).desired_rows(3).desired_width(f32::INFINITY));
+        if edit.action == ItemAction::Fix && !edit.evidence.is_empty() {
+            ui.collapsing("Evidence the fix started from", |ui| {
+                egui::ScrollArea::vertical().id_salt("batch-evidence").max_height(200.0).show(ui, |ui| {
+                    ui.add(egui::TextEdit::multiline(&mut edit.evidence).code_editor().desired_width(f32::INFINITY));
+                });
+            });
+        }
         if edit.confidence > 0.0 {
             ui.label(RichText::new(format!("Extractor confidence {:.0}%", edit.confidence * 100.0)).small().weak());
         }

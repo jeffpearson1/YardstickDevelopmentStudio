@@ -4,6 +4,7 @@
 
 use eframe::egui::{self, RichText, Ui};
 use ystudio_core::agent::{self, AgentBackend, AgentTask, Change, Snapshot};
+use ystudio_core::intake::{Batch, BatchItem, ItemStatus};
 
 use crate::app::{JobKind, Step, StudioApp, View, job_log};
 use crate::theme::{self, FluentText as _};
@@ -39,6 +40,8 @@ pub struct AgentState {
     /// Whether each of [`AgentBackend::ALL`] is installed; probed once (PATH scan).
     pub backends_found: Option<[bool; AgentBackend::ALL.len()]>,
     pub auto_test: bool,
+    /// The request tracking the latest run: (request id, name).
+    pub request: Option<(String, String)>,
 }
 
 impl Default for AgentState {
@@ -46,7 +49,7 @@ impl Default for AgentState {
         Self {
             kind: TaskKind::default(), notes: String::new(), target_id: String::new(),
             evidence: String::new(), freeform: String::new(), show_prompt: false,
-            job: None, changes: Vec::new(), reported: Vec::new(), backends_found: None, auto_test: true,
+            job: None, changes: Vec::new(), reported: Vec::new(), backends_found: None, auto_test: true, request: None,
         }
     }
 }
@@ -76,7 +79,19 @@ impl AgentState {
                 app.agent.changes.clear();
                 app.agent.reported.clear();
                 app.workflow.message.clear();
-                app.agent.job = app.start_job(spec, JobKind::Agent { before, batch_item: None, verification });
+                let mut request = tracking_request(app, &task);
+                let batch_item = request.as_ref().map(|b| (b.id.clone(), 0));
+                app.agent.job = app.start_job(spec, JobKind::Agent { before, batch_item, verification });
+                if let Some(b) = &mut request {
+                    let started = app.agent.job.is_some();
+                    b.items[0].status = if started { ItemStatus::Running } else { ItemStatus::Failed };
+                    b.items[0].status_note = if started { format!("{} started", app.settings.agent_backend.label()) } else { "could not start the agent".into() };
+                    match b.save() {
+                        Ok(()) => app.agent.request = Some((b.id.clone(), super::home::request_label(b))),
+                        Err(e) => app.error(format!("Could not save the request for this run: {e:#}")),
+                    }
+                    app.batch.saved = None;
+                }
                 app.save_settings();
             }
             Err(e) => app.error(format!("{e:#}")),
@@ -97,6 +112,25 @@ impl AgentState {
             }
         })
     }
+}
+
+/// A one-item request recording an Agent tab run, so its status and test
+/// results are kept under Requests like any other work. It is saved, not
+/// opened: the request open in Requests stays as it is.
+pub(crate) fn tracking_request(app: &StudioApp, task: &AgentTask) -> Option<Batch> {
+    let recipe = app.agent.target_id.trim().to_string();
+    if recipe.is_empty() {
+        return None;
+    }
+    let name = app.recipes.iter().find(|r| r.id == recipe).map(|r| r.meta.display_name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| recipe.clone());
+    let verb = match task {
+        AgentTask::Create { .. } => "new",
+        AgentTask::Fix { .. } => "fix",
+        AgentTask::Review { .. } => "review",
+        AgentTask::Update { .. } => "update",
+        AgentTask::Freeform { .. } => "agent task on",
+    };
+    Some(Batch::from_items(&format!("{verb} {recipe}"), vec![BatchItem::for_task(task, &recipe, &name)]))
 }
 
 pub fn show(app: &mut StudioApp, ui: &mut Ui) {
@@ -234,6 +268,19 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             app.view = View::TestBench;
             app.run_steps(&[Step::Lint, Step::Schema, Step::DryRun]);
         }
+    }
+    if let Some((id, label)) = app.agent.request.clone() {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Tracked under Requests as").weak());
+            if ui.link(&label).on_hover_text("Its status and test results are kept there.").clicked() {
+                if app.batch.busy(app) && app.batch.batch.as_ref().is_none_or(|b| b.id != id) {
+                    app.error("Finish or cancel the active run before switching requests.");
+                } else {
+                    super::batch::open_saved(app, &Batch::root().join(&id));
+                    app.view = View::Batch;
+                }
+            }
+        });
     }
     match app.agent.job.and_then(|j| app.job_mut(j)) {
         Some(job) => job_log(ui, &mut job.proc, "agent"),

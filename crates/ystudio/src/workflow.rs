@@ -183,6 +183,14 @@ fn recipe_path(app: &StudioApp, id: &str, repair: bool) -> Option<PathBuf> {
     })
 }
 
+/// Whether an agent or a check run is working on an item of `batch_id`.
+pub fn works_on(app: &StudioApp, batch_id: &str) -> bool {
+    let agent = app.jobs.iter().any(|j| {
+        j.proc.is_running() && matches!(&j.kind, JobKind::Agent { batch_item: Some((b, _)), .. } if b == batch_id)
+    });
+    agent || app.workflow.run.as_ref().is_some_and(|r| std::iter::once(&r.current).chain(&r.queue).any(|t| t.items.iter().any(|(b, _)| b == batch_id)))
+}
+
 pub fn task_id(task: &AgentTask) -> Option<String> {
     match task {
         AgentTask::Create { app, id_hint, .. } => Some(if id_hint.trim().is_empty() {
@@ -1162,6 +1170,37 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         let shipped = std::process::Command::new(&git_exe).args(["show", "studio/app:Recipes/app.yaml"]).current_dir(origin.path()).output().unwrap();
         assert!(String::from_utf8_lossy(&shipped.stdout).contains("id: app"));
         render(&mut app, "publish-browser-prompt", 1400, 900);
+    }
+
+    /// Runs from a recipe's Agent tab are tracked as requests and re-run as asked.
+    #[test]
+    fn agent_tab_runs_become_requests_that_repeat_the_task() {
+        let (dir, mut app) = fake_app();
+        assert!(app.open_recipe_by_id("app"));
+        crate::views::open_recipe_tab(&mut app, crate::app::View::Agent);
+        let fix = AgentTask::Fix { id: "app".into(), evidence: "MSI 1603 in the install log".into(), notes: "x64 only".into() };
+        let review = AgentTask::Review { id: "app".into() };
+        let tracked = crate::views::agent::tracking_request(&app, &fix).unwrap();
+        assert_eq!(crate::views::home::request_label(&tracked), "fix app");
+        assert_eq!(tracked.items[0].app, "App");
+        assert_eq!(crate::views::batch::task_for(&app, &tracked, 0), Some(fix.clone()));
+
+        let mut items = tracked.items.clone();
+        items.extend(crate::views::agent::tracking_request(&app, &review).unwrap().items);
+        let mut batch = ystudio_core::intake::Batch::from_items("agent tab runs", items);
+        batch.id = dir.path().join("agent-tab-runs").to_string_lossy().into_owned();
+        let batch_id = batch.id.clone();
+        assert!(crate::views::batch::open_made(&mut app, batch));
+        assert_eq!(crate::views::batch::task_for(&app, app.batch.batch.as_ref().unwrap(), 1), Some(review));
+        // Both finish without checks: the fix wrote the recipe, the review only read it.
+        app.agent.reported = vec!["app".into()];
+        crate::views::batch::agent_finished(&mut app, &batch_id, 0, true, false);
+        crate::views::batch::agent_finished(&mut app, &batch_id, 1, true, false);
+        let saved = ystudio_core::intake::Batch::load(std::path::Path::new(&batch_id)).unwrap();
+        assert!(saved.items.iter().all(|i| i.status == ystudio_core::intake::ItemStatus::Done));
+        assert_eq!(saved.items[1].action, ystudio_core::intake::ItemAction::Review);
+        app.batch.selected = Some(0);
+        render(&mut app, "requests-agent-tab-runs", 1400, 900);
     }
 
     /// The wizard against a stand-in Install-Yardstick.ps1 that follows the

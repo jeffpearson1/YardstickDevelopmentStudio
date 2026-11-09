@@ -426,6 +426,32 @@ pub enum ItemStatus {
     Skipped,
 }
 
+/// What the agent is asked to do with an item. `Auto` writes a new recipe or
+/// updates the existing one, depending on `request`; the others record a task
+/// started from a recipe's Agent tab, so it can be tracked and run again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ItemAction {
+    #[default]
+    Auto,
+    Fix,
+    Review,
+    Update,
+    Freeform,
+}
+
+impl ItemAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            ItemAction::Auto => "Write or update",
+            ItemAction::Fix => "Fix",
+            ItemAction::Review => "Review",
+            ItemAction::Update => "Update",
+            ItemAction::Freeform => "Freeform task",
+        }
+    }
+}
+
 /// One piece of software to package (or a record explaining why there is none).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -460,6 +486,9 @@ pub struct BatchItem {
     pub status_note: String,
     /// Studio-owned harness evidence, retained when the batch is reopened.
     pub checks: Vec<BatchCheck>,
+    pub action: ItemAction,
+    /// The failure evidence a Fix was started with.
+    pub evidence: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -485,6 +514,47 @@ impl BatchCheck {
 }
 
 impl BatchItem {
+    /// An item recording `task` for `recipe` (named `name`), so a run started
+    /// from a recipe's Agent tab is tracked, and can be run again, like any other.
+    pub fn for_task(task: &crate::agent::AgentTask, recipe: &str, name: &str) -> Self {
+        use crate::agent::AgentTask;
+        let existing = |id: &str, request, action, notes: &str| BatchItem {
+            app: name.to_string(),
+            existing_recipe: id.to_string(),
+            request,
+            action,
+            notes: notes.to_string(),
+            ..Default::default()
+        };
+        match task {
+            AgentTask::Create { app, id_hint, vendor_url, notes } => BatchItem {
+                app: app.clone(),
+                suggested_id: id_hint.clone(),
+                vendor_url: vendor_url.clone(),
+                notes: notes.clone(),
+                ..Default::default()
+            },
+            AgentTask::Fix { id, evidence, notes } => BatchItem { evidence: evidence.clone(), ..existing(id, RequestKind::Update, ItemAction::Fix, notes) },
+            AgentTask::Review { id } => existing(id, RequestKind::Existing, ItemAction::Review, ""),
+            AgentTask::Update { id, notes } => existing(id, RequestKind::Update, ItemAction::Update, notes),
+            AgentTask::Freeform { prompt } => existing(recipe, RequestKind::Existing, ItemAction::Freeform, prompt),
+        }
+    }
+
+    /// The task an item made from an Agent tab run asks for; `None` for `Auto`,
+    /// whose task depends on the request and the workspace.
+    pub fn explicit_task(&self) -> Option<crate::agent::AgentTask> {
+        use crate::agent::AgentTask;
+        let id = self.existing_recipe.clone();
+        Some(match self.action {
+            ItemAction::Auto => return None,
+            ItemAction::Fix => AgentTask::Fix { id, evidence: self.evidence.clone(), notes: self.notes.clone() },
+            ItemAction::Review => AgentTask::Review { id },
+            ItemAction::Update => AgentTask::Update { id, notes: self.notes.clone() },
+            ItemAction::Freeform => AgentTask::Freeform { prompt: self.notes.clone() },
+        })
+    }
+
     pub fn recipe_id(&self) -> String {
         if !self.existing_recipe.is_empty() {
             return self.existing_recipe.clone();
@@ -1322,6 +1392,29 @@ mod tests {
         assert_eq!(back.items, b.items);
         assert!(b.report().contains("| T1 | Zoom |"));
         assert_eq!(timestamp().len(), 19);
+    }
+
+    #[test]
+    fn agent_tab_tasks_round_trip_through_items() {
+        use crate::agent::AgentTask;
+        for task in [
+            AgentTask::Fix { id: "7zip".into(), evidence: "MSI 1603".into(), notes: "use the x64 MSI".into() },
+            AgentTask::Review { id: "7zip".into() },
+            AgentTask::Update { id: "7zip".into(), notes: "new download page".into() },
+            AgentTask::Freeform { prompt: "explain the detection".into() },
+        ] {
+            let item = BatchItem::for_task(&task, "7zip", "7-Zip");
+            assert_eq!(item.explicit_task().as_ref(), Some(&task));
+            assert_eq!((item.app.as_str(), item.existing_recipe.as_str()), ("7-Zip", "7zip"));
+            let saved: BatchItem = serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
+            assert_eq!(saved, item);
+        }
+        let create = BatchItem::for_task(&AgentTask::Create { app: "Obsidian".into(), id_hint: "obsidian".into(), vendor_url: String::new(), notes: String::new() }, "", "");
+        assert_eq!((create.action, create.request, create.suggested_id.as_str()), (ItemAction::Auto, RequestKind::New, "obsidian"));
+        assert!(create.explicit_task().is_none());
+        // Items saved before actions existed are Auto.
+        let old: BatchItem = serde_json::from_str(r#"{"app":"Zoom","status":"done"}"#).unwrap();
+        assert_eq!(old.action, ItemAction::Auto);
     }
 
     #[test]
