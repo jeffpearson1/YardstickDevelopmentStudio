@@ -117,6 +117,15 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         tools_card(app, ui);
         ui.add_space(theme::CARD_GAP);
         appearance_card(app, ui);
+        ui.add_space(theme::CARD_GAP);
+        theme::card(ui, |ui| {
+            theme::section_heading(ui, "Setup");
+            ui.label("Walks through the workspace, the tools and Yardstick's development-only setup again.");
+            ui.add_space(6.0);
+            if ui.button("\u{E768}  Run setup again…").clicked() {
+                super::setup::open(app, super::setup::Step::Workspace);
+            }
+        });
         ui.add_space(8.0);
     });
 }

@@ -1163,4 +1163,80 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         assert!(String::from_utf8_lossy(&shipped.stdout).contains("id: app"));
         render(&mut app, "publish-browser-prompt", 1400, 900);
     }
+
+    /// The wizard against a stand-in Install-Yardstick.ps1 that follows the
+    /// installer's -Status / -ResultPath contract.
+    #[test]
+    fn setup_wizard_reads_status_and_runs_development_only_setup() {
+        if ystudio_core::setup::pwsh7(None).is_none() {
+            return;
+        }
+        let (dir, mut app) = fake_app();
+        let root = dir.path();
+        std::fs::write(root.join("status.fake.json"), r#"{
+          "schemaVersion": 1, "powerShellVersion": "7.6.9", "powershellYaml": { "installed": true, "version": "0.4.12" },
+          "optionalModules": [
+            { "name": "Selenium", "purpose": "recipes that drive a browser", "usedByRecipes": true, "minimumVersion": "4.0.0-preview3", "installedVersion": null, "isCurrent": false },
+            { "name": "TUN.CredentialManager", "purpose": "recipes that sign in to a vendor portal", "usedByRecipes": true, "minimumVersion": null, "installedVersion": "3.0.2", "isCurrent": true },
+            { "name": "Pester", "purpose": "running the unit tests in Tests\\Unit", "usedByRecipes": false, "minimumVersion": "5.0.0", "installedVersion": null, "isCurrent": false }
+          ],
+          "executionPolicy": { "policy": "Restricted", "scope": "CurrentUser", "groupPolicy": false, "allowsScripts": false },
+          "preferences": { "exists": false, "path": "x", "readError": null, "developmentOnly": false, "sharedIcons": "", "sharedRecipeOverrides": "", "syncSharedContent": false },
+          "unwritablePaths": { "count": 2, "examples": ["C:\\x\\Tools"] },
+          "intuneWinAppUtil": { "present": false, "path": "x" }
+        }"#).unwrap();
+        std::fs::write(root.join("result.fake.json"), r#"{
+          "schemaVersion": 1, "succeeded": true, "developmentOnly": true,
+          "steps": [
+            { "step": "Prerequisites", "result": "Done", "level": "OK", "detail": "" },
+            { "step": "Preferences", "result": "Done", "level": "OK", "detail": "" },
+            { "step": "AppRegistration", "result": "Skipped", "level": "Skip", "detail": "development-only instance" },
+            { "step": "Verify", "result": "Problems found", "level": "Warn", "detail": "" }
+          ],
+          "messages": [ { "step": "Verify", "level": "Warn", "message": "225 recipe icon(s) missing" } ]
+        }"#).unwrap();
+        let trace = harness::ps_quote(&root.join("setup-trace.txt").to_string_lossy());
+        std::fs::write(root.join("Install-Yardstick.ps1"), format!(r#"
+param([switch]$Status, [string]$ResultPath, [switch]$DevelopmentOnly, [switch]$NonInteractive,
+      [string]$SharedIcons, [string]$SharedRecipeOverrides, [string[]]$InstallOptionalModule, [switch]$SetExecutionPolicy)
+if ($Status) {{ Copy-Item (Join-Path $PSScriptRoot 'status.fake.json') $ResultPath; exit 0 }}
+Add-Content -LiteralPath {trace} -Value "dev=$DevelopmentOnly ni=$NonInteractive modules=$($InstallOptionalModule -join '+') policy=$SetExecutionPolicy icons=[$SharedIcons]"
+New-Item -ItemType Directory -Force (Join-Path $PSScriptRoot 'Local') | Out-Null
+Set-Content (Join-Path $PSScriptRoot 'Local\preferences.yaml') 'developmentOnly: true'
+Copy-Item (Join-Path $PSScriptRoot 'result.fake.json') $ResultPath
+"#)).unwrap();
+        app.reload_workspace();
+        assert_eq!(app.ws.as_ref().unwrap().kind, ystudio_core::workspace::WorkspaceKind::Unconfigured);
+
+        crate::views::setup::open(&mut app, crate::views::setup::Step::Workspace);
+        render(&mut app, "setup-workspace", 1400, 900);
+        app.setup.step = crate::views::setup::Step::Tools;
+        render(&mut app, "setup-tools", 1400, 900);
+
+        // Entering the Yardstick step reads the status in the background.
+        app.setup.step = crate::views::setup::Step::Yardstick;
+        render(&mut app, "setup-checking", 1400, 900);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while app.setup.status_for_tests().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            app.poll_for_tests();
+        }
+        assert!(app.setup.status_for_tests().is_some(), "{:?}", app.jobs.last().map(|j| j.proc.text()));
+        // Pre-filled: the missing recipe module, not the unit-test one; fix the policy.
+        assert_eq!(app.setup.answers_for_tests(), (vec!["Selenium".to_string()], true));
+        render(&mut app, "setup-yardstick", 1400, 1000);
+
+        crate::views::setup::run_setup(&mut app);
+        while app.setup.result_for_tests().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            app.poll_for_tests();
+        }
+        let trace = std::fs::read_to_string(root.join("setup-trace.txt")).unwrap();
+        assert_eq!(trace.trim(), "dev=True ni=True modules=Selenium policy=True icons=[]");
+        assert!(matches!(app.setup.result_for_tests(), Some(Ok(r)) if r.succeeded));
+        assert_eq!(app.ws.as_ref().unwrap().kind, ystudio_core::workspace::WorkspaceKind::Development);
+        render(&mut app, "setup-finished", 1400, 1000);
+        app.setup.step = crate::views::setup::Step::Done;
+        render(&mut app, "setup-done", 1400, 900);
+    }
 }

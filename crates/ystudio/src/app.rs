@@ -35,6 +35,8 @@ pub enum View {
     Docs,
     Promote,
     Settings,
+    /// The first-run wizard; not in the sidebar.
+    Setup,
 }
 
 impl View {
@@ -111,6 +113,10 @@ pub enum JobKind {
     GitFetch,
     GitPull,
     SyncShared,
+    /// `Install-Yardstick -Status`, for the setup wizard.
+    SetupStatus { result: PathBuf },
+    /// The wizard's development-only `Install-Yardstick` run.
+    Setup { result: PathBuf },
 }
 
 pub struct Job {
@@ -284,6 +290,7 @@ pub struct StudioApp {
     pub promote: views::promote::PromoteState,
     pub update: views::update::UpdateState,
     pub settings_ui: views::settings::SettingsState,
+    pub setup: views::setup::SetupState,
     pub workflow: crate::workflow::State,
     pub elevation: crate::elevation::State,
 }
@@ -330,7 +337,7 @@ impl StudioApp {
     pub(crate) fn isolated_for_tests(ws: Workspace) -> Self {
         let settings = Settings::default();
         let mut app = Self {
-            home: views::home::HomeState::new(&settings), settings_ui: views::settings::SettingsState::new(&settings), settings,
+            home: views::home::HomeState::new(&settings), settings_ui: views::settings::SettingsState::new(&settings), setup: Default::default(), settings,
             ws: Some(ws), ws_error: None, view: View::Batch, recipes: Vec::new(),
             ws_cache: WsCache::default(), recipe: None, jobs: Vec::new(), next_job: 1,
             console_job: None, console_open: false, waker: Arc::new(|| {}),
@@ -370,6 +377,7 @@ impl StudioApp {
         let mut app = Self {
             home: views::home::HomeState::new(&settings),
             settings_ui: views::settings::SettingsState::new(&settings),
+            setup: Default::default(),
             settings,
             ws: None,
             ws_error: None,
@@ -416,6 +424,7 @@ impl StudioApp {
             app.open_workspace(&path);
         }
         app.handle_args(std::env::args().skip(1).collect());
+        views::setup::maybe_start(&mut app);
         if app.settings.auto_check_updates {
             views::update::start_check(&mut app, true);
         }
@@ -883,6 +892,8 @@ impl StudioApp {
             JobKind::BatchExtract { batch_id, backend } => {
                 views::batch::extract_finished(self, &batch_id, ok, &backend);
             }
+            JobKind::SetupStatus { result } => views::setup::status_finished(self, ok, &result),
+            JobKind::Setup { result } => views::setup::setup_finished(self, ok, &result),
             JobKind::WorkflowHarness { step, recipe_id } => {
                 crate::workflow::harness_finished(self, step, &recipe_id, ok, started, text);
             }
@@ -946,7 +957,9 @@ impl StudioApp {
                         }
                     }
                     self.open_workspace(&dest);
-                    self.notify(msg + " Next: run Install-Yardstick -DevelopmentOnly.");
+                    self.notify(msg);
+                    // A fresh clone needs Yardstick's development-only setup next.
+                    views::setup::open(self, views::setup::Step::Yardstick);
                 } else {
                     self.error("git clone failed - see the console.");
                 }
@@ -1400,6 +1413,7 @@ impl StudioApp {
                 View::Docs => views::docs::show(self, ui),
                 View::Promote => views::promote::show(self, ui),
                 View::Settings => views::settings::show(self, ui),
+                View::Setup => views::setup::show(self, ui),
             }
         });
 

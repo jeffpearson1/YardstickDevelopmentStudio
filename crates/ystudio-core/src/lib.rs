@@ -16,6 +16,7 @@ pub mod promote;
 pub mod recipe;
 pub mod results;
 pub mod settings;
+pub mod setup;
 pub mod update;
 pub mod validation;
 pub mod workspace;

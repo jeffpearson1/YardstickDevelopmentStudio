@@ -9,6 +9,7 @@ pub mod promote;
 pub mod recipes;
 pub mod runs;
 pub mod settings;
+pub mod setup;
 pub mod testbench;
 pub mod update;
 

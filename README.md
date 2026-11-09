@@ -31,6 +31,7 @@ production pulls them once they are merged.
 | **Requests** | New recipes, imported request lists and recipe updates go through one pipeline: the agent writes (or updates) each recipe, then Studio tests and repairs it. *New recipe…* with the agent makes a one-item request. Import a request list (ServiceNow/JSON export, CSV/TSV, Excel `xlsx/xls/ods`, YAML, text/Markdown/email, HTML, Word `docx`) by picker, *Paste text…*, drag and drop, or `yardstick-studio.exe <file>`; a quick scan pulls out the software, version, vendor URL and ticket for each request and flags requests that aren't software, and *Extract with agent* re-reads messy lists. *Run agent on N selected* creates or updates, tests and repairs each recipe in turn. **Test selected** rechecks the included recipes without editing them. **Repair with agent** tests the recipes no check has confirmed working yet and hands failures to the agent. One consent dialog covers a run's live install/uninstall tests, and system-context live tests share **one UAC prompt per run** through a hidden elevated worker (user-scope recipes run unelevated). Items show *recipe written*, *checks passed* or *complete · not published*. Requests are saved under `%APPDATA%\YardstickStudio\batches`; *Copy report* includes recorded check results. |
 | **Runs** | Browses `Artifacts\RecipeHarness\_install-tests`, parsing `summary.json` into verdicts and phase tables. It opens on the open recipe's newest run. |
 | **Publish** | Each selected development recipe becomes a pull request: the Studio cuts a `studio/<id>` branch from the upstream default branch in a temporary worktree (your checkout is untouched), commits the recipe to its shipped path with its test evidence, pushes it, and opens the pull request with `gh` when it is installed, or offers GitHub's compare page. It asks before opening anything in the browser. The recipe's icon is copied to the shared icon folder (`SharedIcons`), not into git. Production pulls merged changes itself. Recipes without a passing live test of their current contents get a dialog listing the recorded checks before you can *Open anyway*. |
+| **Setup** | The first-run wizard: pick or clone a development workspace, check the tools (PowerShell 7, git, gh, an agent CLI) with links to install what is missing, then Yardstick's development-only setup. It reads what is already in place with `Install-Yardstick.ps1 -Status`, pre-fills the answers (optional PowerShell modules, allowing scripts for your account, shared icon and recipe override folders), and applies them with a non-interactive `Install-Yardstick.ps1 -DevelopmentOnly` run, showing each step's result. It opens on first run, after cloning, from Home's *Set up this clone…*, and from Settings. Needs a Yardstick clone that includes jeffpearson1/Yardstick#36; older clones fall back to running the installer in a console. |
 | **Settings** | Updates, production and trusted development folders, the agent CLI and model (models are read from the CLI), PowerShell, the tool check (pwsh, git, gh, agent CLIs; *Re-check* reloads `PATH`), and appearance. Changes save as you make them. |
 | **Help** | The skill and its reference docs, rendered as Markdown. |
 
@@ -151,12 +152,12 @@ from about 1.8 fps to about 100 fps.
 
 ## First run
 
-1. Launch the Studio. It opens `C:\Intune\Yardstick` read-only, shown by the red
-   *Production* badge.
-2. On **Home**, choose **Clone development workspace**. If the clone is new, run
-   `Install-Yardstick -DevelopmentOnly` from the banner. Settings are stored in
+1. Launch the Studio. The setup wizard opens: clone a development workspace (or open one;
+   `C:\Intune\Yardstick` stays read-only as *Production*), check the tools, and run
+   Yardstick's development-only setup. Settings are stored in
    `%APPDATA%\YardstickStudio\settings.json`, which also holds the production paths and
    trusted development paths.
+2. Run setup again at any time from **Settings**.
 3. From **Home**, start a **New recipe** (the agent writes, tests and repairs it), import
    requests, or open a recipe and *Copy to Development* to edit it on its **Design** tab.
 4. On the recipe's **Test** tab, run *safe checks*, then a live install test. A passing

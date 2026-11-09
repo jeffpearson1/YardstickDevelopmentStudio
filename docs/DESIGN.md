@@ -23,7 +23,8 @@ yardstick-studio.exe
 │   ├─ highlight.rs      YAML/PowerShell syntax highlighting (egui LayoutJob)
 │   ├─ theme.rs          Fluent tokens (light/dark), brand art, fonts, nav items, badges, cards, info bars, accent buttons
 │   └─ views/            home (launcher), recipes (+ recipe header and tabs in mod.rs), designer, editor,
-│                        testbench, agent, batch (Requests), icons, runs, docs (Help), promote (Publish), settings, update
+│                        testbench, agent, batch (Requests), icons, runs, docs (Help), promote (Publish), settings,
+│                        setup (first-run wizard), update
 └─ crates/ystudio-core   headless engine; no GUI types; unit tested
     ├─ workspace.rs      open + classify a Yardstick folder, layout from Yardstick.Project.psd1, recipe metadata
     ├─ recipe.rs         ordered YAML document model (key order kept, scripts as literal blocks) + templates
@@ -32,6 +33,7 @@ yardstick-studio.exe
     ├─ harness.rs        builds pwsh invocations of Tests/RecipeHarness/*.ps1 and the shared-content sync
     ├─ promote.rs        publishing by pull request: branch in a temporary worktree, push, gh pr create or compare URL
     ├─ validation.rs     ledger of recipe hashes that passed a live install test ("complete")
+    ├─ setup.rs          Install-Yardstick -Status / -DevelopmentOnly -NonInteractive commands and their JSON results
     ├─ git.rs            git clone/fetch/pull (ff-only) and ahead/behind status; finds git after a PATH refresh
     ├─ update.rs         self-update: latest GitHub release, SHA-256-verified MSI download, install-and-relaunch helper
     ├─ results.rs        parses _install-tests/<ts>/summary.json into verdicts and phases

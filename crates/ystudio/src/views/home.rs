@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText, Ui};
 use ystudio_core::intake::Batch;
-use ystudio_core::{git, harness};
+use ystudio_core::git;
 use ystudio_core::settings::Settings;
 use ystudio_core::workspace::WorkspaceKind;
 
@@ -273,7 +273,7 @@ fn workspace_card(app: &mut StudioApp, ui: &mut Ui) {
     theme::card(ui, |ui| {
         theme::section_heading(ui, "Workspace");
         let mut open = None;
-        let mut status_msg: Option<String> = None;
+        let mut setup = false;
         match &app.ws {
             Some(ws) => {
                 ui.horizontal(|ui| {
@@ -297,16 +297,11 @@ fn workspace_card(app: &mut StudioApp, ui: &mut Ui) {
                         theme::banner(ui, theme::amber(), |ui| {
                             ui.label(RichText::new("Not set up for testing yet").semibold().color(theme::amber()));
                             ui.label(
-                                "This clone has no Local\\preferences.yaml. Run Install-Yardstick -DevelopmentOnly to install \
-                                 the PowerShell modules and mark it as development-only (no Intune connection).",
+                                "This clone has no Local\\preferences.yaml yet. Setup marks it development-only (no Intune \
+                                 connection) and installs what the recipe harness needs.",
                             );
-                            if ui.button("\u{E768}  Run Install-Yardstick -DevelopmentOnly (new console)").clicked() {
-                                status_msg = Some(
-                                    match harness::install_development_only(ws, &app.pwsh()).and_then(|s| ystudio_core::process::launch_detached(&s)) {
-                                        Ok(()) => "Installer opened in a new console. Reload the workspace when it finishes.".to_string(),
-                                        Err(e) => format!("{e:#}"),
-                                    },
-                                );
+                            if ui.button("\u{E768}  Set up this clone…").clicked() {
+                                setup = true;
                             }
                         });
                     }
@@ -361,8 +356,8 @@ fn workspace_card(app: &mut StudioApp, ui: &mut Ui) {
                 }
             });
         }
-        if let Some(msg) = status_msg {
-            app.notify(msg);
+        if setup {
+            super::setup::open(app, super::setup::Step::Yardstick);
         }
         if let Some(p) = open {
             app.open_workspace(&p);
@@ -370,11 +365,11 @@ fn workspace_card(app: &mut StudioApp, ui: &mut Ui) {
     });
 }
 
-fn create_body(app: &mut StudioApp, ui: &mut Ui) {
+pub(crate) fn create_body(app: &mut StudioApp, ui: &mut Ui) {
     theme::section_heading(ui, "Create a development workspace");
     ui.label(RichText::new(
-        "Clones Yardstick from GitHub, copies icons from production (they are not in Git), then opens the clone. \
-         Finish by running Install-Yardstick -DevelopmentOnly so tests run without an Intune connection.",
+        "Clones Yardstick from GitHub, copies icons from production (they are not in Git), then opens the clone \
+         and sets it up for development, so tests run without an Intune connection.",
     ).weak());
     ui.add_space(GROUP_GAP - 6.0);
     egui::Grid::new("clone-grid").num_columns(2).spacing([12.0, 8.0]).min_col_width(0.0).show(ui, |ui| {
@@ -394,7 +389,7 @@ fn create_body(app: &mut StudioApp, ui: &mut Ui) {
     });
 }
 
-fn create_footer(app: &mut StudioApp, ui: &mut Ui) {
+pub(crate) fn create_footer(app: &mut StudioApp, ui: &mut Ui) {
     let dest = PathBuf::from(app.home.clone_dest.trim());
     let stale = app.home.prod_check.as_ref().is_none_or(|(d, prods, _)| *d != app.home.clone_dest || *prods != app.settings.production_paths);
     if stale {

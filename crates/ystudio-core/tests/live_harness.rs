@@ -78,3 +78,51 @@ fn production_folder_is_refused() {
     assert!(harness::build(&ws, &live, Consent::Confirmed, &pwsh).is_err());
     assert!(ystudio_core::promote::plan(&ws, "7zip").is_err());
 }
+
+#[test]
+#[ignore]
+fn setup_status_reads_the_clone_without_changing_it() {
+    let Some(root) = env_path("YSTUDIO_TEST_CLONE") else {
+        eprintln!("YSTUDIO_TEST_CLONE not set - skipping");
+        return;
+    };
+    let ws = Workspace::open(&root, &[], &[]).expect("open clone");
+    if !ystudio_core::setup::supported(&ws) {
+        eprintln!("this clone's Install-Yardstick.ps1 predates -Status - skipping");
+        return;
+    }
+    let pwsh = ystudio_core::setup::pwsh7(None).expect("PowerShell 7");
+    let out = tempfile::tempdir().unwrap();
+    let result = out.path().join("status.json");
+    let proc = run(ystudio_core::setup::status_spec(&ws, &pwsh, &result).unwrap(), Duration::from_secs(120));
+    assert!(proc.succeeded(), "status failed");
+    let status = ystudio_core::setup::read_status(&result).unwrap();
+    assert_eq!(status.schema_version, 1);
+    assert!(status.powershell_yaml.installed);
+    assert!(status.optional_modules.iter().any(|m| m.name == "Pester"));
+    assert!(!status.execution_policy.policy.is_empty());
+}
+
+/// Changes the clone (preferences, Tools), so it needs a clone made for it.
+#[test]
+#[ignore]
+fn development_only_setup_on_a_scratch_clone() {
+    let Some(root) = env_path("YSTUDIO_TEST_SCRATCH_CLONE") else {
+        eprintln!("YSTUDIO_TEST_SCRATCH_CLONE not set - skipping");
+        return;
+    };
+    let ws = Workspace::open(&root, &[], &[]).expect("open clone");
+    assert!(ystudio_core::setup::supported(&ws), "Install-Yardstick.ps1 predates the wizard");
+    let pwsh = ystudio_core::setup::pwsh7(None).expect("PowerShell 7");
+    let out = tempfile::tempdir().unwrap();
+    let result = out.path().join("result.json");
+    let answers = ystudio_core::setup::Answers { shared_icons: Some(String::new()), ..Default::default() };
+    let proc = run(ystudio_core::setup::setup_spec(&ws, &pwsh, &answers, &result).unwrap(), Duration::from_secs(600));
+    let r = ystudio_core::setup::read_result(&result).unwrap();
+    assert_eq!(r.succeeded, proc.succeeded());
+    assert!(r.development_only, "{r:#?}");
+    assert_eq!(r.steps.len(), 7);
+    assert!(r.steps.iter().filter(|s| ["AppRegistration", "IntuneDefaults", "Email", "ScheduledTask"].contains(&s.step.as_str())).all(|s| s.level == "Skip"));
+    let reopened = Workspace::open(&root, &[], &[]).unwrap();
+    assert!(reopened.development_only);
+}
