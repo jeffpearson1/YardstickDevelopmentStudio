@@ -144,20 +144,8 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                 ui.add(egui::TextEdit::multiline(&mut st.evidence).code_editor().desired_rows(6).desired_width(ui.available_width()));
             }
             ui.add_space(6.0);
-            let found = *app.agent.backends_found.get_or_insert_with(|| AgentBackend::ALL.map(|b| b.locate().is_some()));
-            let backend = app.settings.agent_backend;
-            let available = AgentBackend::ALL.iter().zip(found).any(|(b, f)| *b == backend && f);
-            ui.horizontal(|ui| {
-                let model = app.settings.agent_model.trim();
-                let model = if model.is_empty() { String::new() } else { format!(" · {model}") };
-                ui.label(RichText::new(format!("Agent: {}{model}", backend.label())).weak());
-                if !available {
-                    ui.colored_label(theme::amber(), "not found");
-                }
-                if ui.small_button("Change…").on_hover_text("Agent and model are in Settings.").clicked() {
-                    app.view = crate::app::View::Settings;
-                }
-            });
+            ui.label("Agent and model");
+            ui.add_enabled_ui(!running, |ui| super::settings::agent_picker(app, ui, "agent-tab"));
             ui.collapsing("Guardrails", |ui| {
                 ui.label(RichText::new(
                     "The agent prefers vendor internet downloads; software dropbox is a last resort. It may only write \

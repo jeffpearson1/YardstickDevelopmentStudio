@@ -660,7 +660,13 @@ fn items_table(app: &mut StudioApp, ui: &mut Ui) {
             ui.checkbox(&mut st.show_log, "Show log");
         });
     });
-    ui.add_enabled_ui(!busy, |ui| crate::workflow::configure(&mut app.workflow.options, ui, true));
+    ui.add_enabled_ui(!busy, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Agent");
+            super::settings::agent_picker(app, ui, "requests");
+        });
+        crate::workflow::configure(&mut app.workflow.options, ui, true);
+    });
     crate::workflow::progress(app, ui);
     if extract {
         start_extract(app);

@@ -2,7 +2,9 @@
 //! and updates. Most settings apply and save as they change; the folder lists
 //! reload the workspace, so they wait for Apply.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, channel};
 
 use eframe::egui::{self, RichText, Ui};
 use ystudio_core::agent::AgentBackend;
@@ -17,11 +19,28 @@ pub struct SettingsState {
     trusted_text: String,
     pwsh_text: String,
     pub tools: Option<Vec<(&'static str, Option<PathBuf>, &'static str)>>,
+    /// Models each agent CLI accepts, listed in the background.
+    models: HashMap<AgentBackend, Models>,
+    /// "Other…" was picked: the model is typed in.
+    custom_model: bool,
+}
+
+enum Models {
+    Loading(Receiver<Result<Vec<String>, String>>),
+    Ready(Vec<String>),
+    Failed(String),
 }
 
 impl SettingsState {
     pub fn new(settings: &Settings) -> Self {
-        let mut s = Self { production_text: String::new(), trusted_text: String::new(), pwsh_text: String::new(), tools: None };
+        let mut s = Self {
+            production_text: String::new(),
+            trusted_text: String::new(),
+            pwsh_text: String::new(),
+            tools: None,
+            models: HashMap::new(),
+            custom_model: false,
+        };
         s.sync(settings);
         s
     }
@@ -37,6 +56,24 @@ impl SettingsState {
     /// Proposes trusting `root`; the user confirms with Apply.
     pub fn add_trusted(&mut self, root: &std::path::Path) {
         self.trusted_text = format!("{}\n{}", self.trusted_text, root.display()).trim().to_string();
+    }
+
+    /// The models `backend` accepts; starts listing them on first use.
+    fn models(&mut self, backend: AgentBackend, waker: &ystudio_core::process::Waker) -> &Models {
+        if let Some(Models::Loading(rx)) = self.models.get(&backend)
+            && let Ok(result) = rx.try_recv()
+        {
+            self.models.insert(backend, result.map_or_else(Models::Failed, Models::Ready));
+        }
+        self.models.entry(backend).or_insert_with(|| {
+            let (tx, rx) = channel();
+            let waker = waker.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(backend.models().map_err(|e| format!("{e:#}")));
+                waker();
+            });
+            Models::Loading(rx)
+        })
     }
 
     fn folders_dirty(&self, settings: &Settings) -> bool {
@@ -118,17 +155,8 @@ fn tools_card(app: &mut StudioApp, ui: &mut Ui) {
         ui.add_space(GROUP_GAP - 6.0);
         ui.spacing_mut().item_spacing.y = 8.0;
         let mut save = false;
-        form_row(ui, "Agent", Some("The coding-agent CLI that writes and repairs recipes."), |ui| {
-            let found = *app.agent.backends_found.get_or_insert_with(|| AgentBackend::ALL.map(|b| b.locate().is_some()));
-            ui.horizontal(|ui| {
-                for (b, found) in AgentBackend::ALL.into_iter().zip(found) {
-                    let label = if found { b.label().to_string() } else { format!("{} (not found)", b.label()) };
-                    save |= ui.selectable_value(&mut app.settings.agent_backend, b, label).changed();
-                }
-            });
-        });
-        form_row(ui, "Agent model", Some("Passed to the CLI as --model; blank uses its default."), |ui| {
-            save |= ui.add(egui::TextEdit::singleline(&mut app.settings.agent_model).hint_text("CLI default").desired_width(240.0)).lost_focus();
+        form_row(ui, "Agent and model", Some("The coding-agent CLI that writes and repairs recipes, and the model it uses."), |ui| {
+            agent_picker(app, ui, "settings");
         });
         form_row(ui, "PowerShell", Some("The PowerShell the harness runs with; blank picks pwsh 7, then Windows PowerShell."), |ui| {
             let r = ui.add(egui::TextEdit::singleline(&mut app.settings_ui.pwsh_text).hint_text("automatic").desired_width(f32::INFINITY));
@@ -235,4 +263,70 @@ fn appearance_card(app: &mut StudioApp, ui: &mut Ui) {
             app.save_settings();
         }
     });
+}
+
+/// Agent CLI and model, saved as they change. The model list comes from the
+/// selected CLI; "Other…" takes any model id the CLI accepts.
+pub fn agent_picker(app: &mut StudioApp, ui: &mut Ui, salt: &str) {
+    let found = *app.agent.backends_found.get_or_insert_with(|| AgentBackend::ALL.map(|b| b.locate().is_some()));
+    let mut save = false;
+    ui.horizontal_wrapped(|ui| {
+        let before = app.settings.agent_backend;
+        let label = |b: AgentBackend, f: bool| if f { b.label().to_string() } else { format!("{} (not found)", b.label()) };
+        let current = AgentBackend::ALL.iter().zip(found).find(|(b, _)| **b == before).map(|(b, f)| label(*b, f)).unwrap_or_default();
+        egui::ComboBox::from_id_salt(("agent-backend", salt)).selected_text(current).show_ui(ui, |ui| {
+            for (b, f) in AgentBackend::ALL.into_iter().zip(found) {
+                ui.selectable_value(&mut app.settings.agent_backend, b, label(b, f));
+            }
+        });
+        if app.settings.agent_backend != before {
+            // Model ids belong to one CLI.
+            app.settings.agent_model.clear();
+            app.settings_ui.custom_model = false;
+            save = true;
+        }
+        let backend = app.settings.agent_backend;
+        let available = AgentBackend::ALL.iter().zip(found).any(|(b, f)| *b == backend && f);
+        let waker = app.waker.clone();
+        let models = match available.then(|| app.settings_ui.models(backend, &waker)) {
+            Some(Models::Ready(list)) => list.clone(),
+            Some(Models::Loading(_)) => {
+                ui.spinner().on_hover_text("Asking the CLI which models it offers…");
+                Vec::new()
+            }
+            Some(Models::Failed(e)) => {
+                ui.label(RichText::new("\u{E7BA}").color(theme::amber())).on_hover_text(format!("Could not list models: {e}"));
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
+        let model = app.settings.agent_model.trim().to_string();
+        let custom = app.settings_ui.custom_model || (!model.is_empty() && !models.contains(&model));
+        let shown = if custom { "Other…".to_string() } else if model.is_empty() { "CLI default".to_string() } else { model.clone() };
+        egui::ComboBox::from_id_salt(("agent-model", salt)).selected_text(shown).height(400.0).show_ui(ui, |ui| {
+            if ui.selectable_label(!custom && model.is_empty(), "CLI default").clicked() {
+                app.settings.agent_model.clear();
+                app.settings_ui.custom_model = false;
+                save = true;
+            }
+            for m in &models {
+                if ui.selectable_label(!custom && &model == m, m).clicked() {
+                    app.settings.agent_model = m.clone();
+                    app.settings_ui.custom_model = false;
+                    save = true;
+                }
+            }
+            if ui.selectable_label(custom, "Other…").clicked() {
+                app.settings_ui.custom_model = true;
+            }
+        });
+        if custom {
+            save |= ui
+                .add(egui::TextEdit::singleline(&mut app.settings.agent_model).hint_text("model id").desired_width(160.0))
+                .lost_focus();
+        }
+    });
+    if save {
+        app.save_settings();
+    }
 }
