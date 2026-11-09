@@ -108,7 +108,8 @@ impl Runner {
         }
 
         let started = Instant::now();
-        self.raster.set_textures(&out.textures_delta);
+        let mut textures = out.textures_delta;
+        self.raster.set_textures(&textures);
         let size = g.window.inner_size();
         let result = match (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
             (Some(w), Some(h)) => {
@@ -119,7 +120,9 @@ impl Runner {
             }
             _ => Ok(()), // minimised
         };
-        self.raster.free_textures(&out.textures_delta);
+        self.raster.free_textures(&textures);
+        // Applied above; egui asserts (in debug builds) that handled deltas are cleared.
+        textures.clear();
         app.perf.paint_ms = Some(started.elapsed().as_secs_f32() * 1000.0);
         result
     }
