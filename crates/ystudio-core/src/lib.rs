@@ -4,6 +4,7 @@
 //! state owned by these types and forwards user intent to them.
 
 pub mod agent;
+pub mod elevation;
 pub mod fields;
 pub mod git;
 pub mod harness;

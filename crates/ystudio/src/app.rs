@@ -279,6 +279,7 @@ pub struct StudioApp {
     pub promote: views::promote::PromoteState,
     pub update: views::update::UpdateState,
     pub workflow: crate::workflow::State,
+    pub elevation: crate::elevation::State,
 }
 
 pub struct BenchState {
@@ -332,6 +333,7 @@ impl StudioApp {
             library: Default::default(), bench: Default::default(), agent: Default::default(),
             batch: Default::default(), icons: Default::default(), runs_ui: Default::default(),
             docs: Default::default(), promote: Default::default(), update: Default::default(), workflow: Default::default(),
+            elevation: Default::default(),
         };
         app.refresh_recipes();
         app
@@ -389,6 +391,7 @@ impl StudioApp {
             promote: Default::default(),
             update: Default::default(),
             workflow: Default::default(),
+            elevation: Default::default(),
         };
         theme::install_fonts(egui_ctx);
         app.apply_theme(egui_ctx);
@@ -738,18 +741,21 @@ impl StudioApp {
 
     pub fn start_job(&mut self, spec: ProcessSpec, kind: JobKind) -> Option<u64> {
         match RunningProcess::spawn(spec, Some(self.waker.clone())) {
-            Ok(proc) => {
-                let id = self.next_job;
-                self.next_job += 1;
-                self.jobs.push(Job { id, proc, kind, started_sys: SystemTime::now(), handled: false });
-                self.console_job = Some(id);
-                Some(id)
-            }
+            Ok(proc) => Some(self.add_job(proc, kind)),
             Err(e) => {
                 self.error(format!("{e:#}"));
                 None
             }
         }
+    }
+
+    /// Tracks a process started elsewhere (the elevated worker's) as a job.
+    pub fn add_job(&mut self, proc: RunningProcess, kind: JobKind) -> u64 {
+        let id = self.next_job;
+        self.next_job += 1;
+        self.jobs.push(Job { id, proc, kind, started_sys: SystemTime::now(), handled: false });
+        self.console_job = Some(id);
+        id
     }
 
     /// Like [`Self::start_job`], but leaves the console on the job it was showing.
@@ -782,6 +788,7 @@ impl StudioApp {
         for id in finished {
             self.on_job_finished(id);
         }
+        crate::elevation::poll(self);
         crate::workflow::poll(self);
     }
 
@@ -872,7 +879,7 @@ impl StudioApp {
                         if let Some((batch_id, idx)) = target.items.first() {
                             views::batch::check_finished(self, batch_id, *idx, ystudio_core::intake::BatchCheck {
                                 recipe: target.id, passed: false, note: "Authoring agent failed or reported an environmental blocker.".into(),
-                                timestamp: ystudio_core::intake::timestamp(), summary_dir: None,
+                                timestamp: ystudio_core::intake::timestamp(), summary_dir: None, live: false,
                             });
                             views::batch::start_next(self);
                         }
@@ -1147,6 +1154,7 @@ impl StudioApp {
             if ui.selectable_label(self.console_open, console_label).clicked() {
                 self.console_open = !self.console_open;
             }
+            crate::elevation::badge(self, ui);
             views::update::badge(self, ui);
             if self.perf.show {
                 ui.separator();
@@ -1354,6 +1362,8 @@ impl StudioApp {
                 j.proc.cancel();
             }
         }
+        // Stops the elevated worker and any test it is running.
+        self.elevation = Default::default();
         self.save_settings();
     }
 }

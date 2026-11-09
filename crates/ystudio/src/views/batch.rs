@@ -288,13 +288,24 @@ pub fn checks_started(app: &mut StudioApp, targets: &[crate::workflow::Target]) 
                     it.checks.retain(|c| !c.recipe.eq_ignore_ascii_case(&target.id));
                     it.checks.push(BatchCheck {
                         recipe: target.id.clone(), passed: false, note: "Testing not completed".into(),
-                        timestamp: intake::timestamp(), summary_dir: None,
+                        timestamp: intake::timestamp(), summary_dir: None, live: false,
                     });
                     it.status = ItemStatus::Running;
                     it.status_note = "queued for harness checks".into();
                 }
             });
         }
+    }
+}
+
+/// Shows the running check, and where it runs, on each item it covers.
+pub fn checks_progress(app: &mut StudioApp, items: &[(String, usize)], note: &str) {
+    for (batch_id, idx) in items {
+        with_batch(app, batch_id, |b| {
+            if let Some(it) = b.items.get_mut(*idx) {
+                it.status_note = note.to_string();
+            }
+        });
     }
 }
 
@@ -311,6 +322,20 @@ fn test_targets(batch: &Batch) -> Vec<crate::workflow::Target> {
         }
     }
     targets
+}
+
+/// Included recipes that exist but lack a check confirming them for every
+/// item they serve; with live checks on, only a passed live test confirms.
+/// Items without a recipe yet are left to *Run agent*.
+fn repair_targets(app: &StudioApp, batch: &Batch) -> Vec<crate::workflow::Target> {
+    let live = app.workflow.options.live;
+    let confirmed = |t: &crate::workflow::Target| t.items.iter().all(|(_, idx)| {
+        batch.items[*idx].checks.iter().any(|c| c.recipe.eq_ignore_ascii_case(&t.id) && c.confirms(live))
+    });
+    test_targets(batch)
+        .into_iter()
+        .filter(|t| app.recipes.iter().any(|r| r.id.eq_ignore_ascii_case(&t.id)) && !confirmed(t))
+        .collect()
 }
 
 /// Called by the app when an extraction agent ends.
@@ -360,7 +385,9 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     }
     let show_log = app.batch.show_log;
     let log_job = if app.workflow.busy() { app.workflow.last_job } else { app.batch.run_job.or(app.batch.extract_job) };
-    if show_log && let Some(id) = log_job {
+    // The console already shows this job; a second copy only takes space.
+    let in_console = app.console_open && app.console_job.is_some() && app.console_job == log_job;
+    if show_log && !in_console && let Some(id) = log_job {
         egui::Panel::bottom("batch-log").resizable(true).default_size(220.0).show(ui, |ui| {
             if let Some(job) = app.job_mut(id) {
                 job_log(ui, &mut job.proc, "batch");
@@ -447,6 +474,7 @@ fn items_table(app: &mut StudioApp, ui: &mut Ui) {
     let software = b.items.iter().filter(|i| i.request != RequestKind::NotSoftware).count();
     let included = b.items.iter().filter(|i| i.include && i.request != RequestKind::NotSoftware).count();
     let pending = b.items.iter().filter(|i| i.include && i.request != RequestKind::NotSoftware && i.status != ItemStatus::Done).count();
+    let repairable = repair_targets(app, b).len();
     let file = b.source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let summary = format!("{} request(s) · {software} software item(s) · extracted by {}", b.records.len(), b.extracted_by);
     let format = b.format.clone();
@@ -457,6 +485,7 @@ fn items_table(app: &mut StudioApp, ui: &mut Ui) {
     let mut stop = false;
     let mut cancel = false;
     let mut test = false;
+    let mut repair = false;
     let st = &mut app.batch;
     theme::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -500,6 +529,18 @@ fn items_table(app: &mut StudioApp, ui: &mut Ui) {
             if ui.add_enabled(can_test && included > 0 && !busy, egui::Button::new("Test selected batch")).clicked() {
                 test = true;
             }
+            let resp = ui.add_enabled(can_agent && repairable > 0 && !busy, egui::Button::new(format!("\u{E90F}  Repair {repairable} with agent")));
+            repair = resp.clicked();
+            if !can_agent {
+                resp.on_disabled_hover_text("Needs a writable development folder with the yardstick-recipes skill.");
+            } else if repairable == 0 {
+                resp.on_disabled_hover_text("Every included item's recipe has a passing check. Items without a recipe yet need Run agent.");
+            } else {
+                resp.on_hover_text(
+                    "Tests the included recipes that no check has confirmed working yet and hands each failure to the agent to fix, \
+                     re-testing after every fix. Recipes that pass are not changed. Items without a recipe yet need Run agent.",
+                );
+            }
             ui.separator();
             ui.checkbox(&mut st.hide_other, "Hide non-software");
             ui.checkbox(&mut st.show_log, "Show log");
@@ -520,6 +561,11 @@ fn items_table(app: &mut StudioApp, ui: &mut Ui) {
             .map(|(n, _)| n)
             .collect();
         crate::workflow::request(app, crate::workflow::Request::BatchAuthor(indices));
+    }
+    if repair {
+        let targets = repair_targets(app, app.batch.batch.as_ref().unwrap());
+        app.batch.show_log = true;
+        crate::workflow::request(app, crate::workflow::Request::BatchRepair(targets));
     }
     if test {
         let targets = test_targets(app.batch.batch.as_ref().unwrap());
@@ -580,7 +626,10 @@ fn items_table(app: &mut StudioApp, ui: &mut Ui) {
                 ui.horizontal(|ui| {
                     status_badge(ui, it.status);
                     if !it.status_note.is_empty() {
-                        ui.label(RichText::new(&it.status_note).small().weak());
+                        // Long blocker notes stay readable on hover without widening the table.
+                        let short: String = it.status_note.chars().take(90).collect();
+                        let short = if short.len() < it.status_note.len() { format!("{short}…") } else { short };
+                        ui.label(RichText::new(short).small().weak()).on_hover_text(&it.status_note);
                     }
                 });
                 ui.horizontal(|ui| {
@@ -825,5 +874,41 @@ mod tests {
         assert_eq!(targets[0].id, "shared");
         assert_eq!(targets[0].items, vec![(batch.id.clone(), 0), (batch.id.clone(), 1)]);
         assert_eq!(targets[1].id, "other");
+    }
+
+    #[test]
+    fn repair_picks_existing_recipes_without_a_confirming_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("Yardstick.Project.psd1"), "@{\nRuntimeRoot = '.'\nRecipesPath = 'Recipes'\nDevelopmentRecipes = 'Recipes\\Development'\n}\n").unwrap();
+        std::fs::write(root.join("Yardstick.ps1"), "# never executed").unwrap();
+        std::fs::create_dir_all(root.join(r"Recipes\Development")).unwrap();
+        for id in ["good", "broken", "safeonly"] {
+            std::fs::write(root.join(format!(r"Recipes\Development\{id}.yaml")), format!("id: {id}\n")).unwrap();
+        }
+        std::fs::write(root.join(r"Recipes\shipped.yaml"), "id: shipped\n").unwrap();
+        let ws = ystudio_core::workspace::Workspace::open(root, &[], &[]).unwrap();
+        let mut app = StudioApp::isolated_for_tests(ws);
+
+        let check = |recipe: &str, passed, live, note: &str| BatchCheck {
+            recipe: recipe.into(), passed, note: note.into(), timestamp: intake::timestamp(), summary_dir: None, live,
+        };
+        let item = |id: &str, checks| BatchItem { app: id.into(), include: true, recipes: vec![id.into()], checks, ..Default::default() };
+        let mut batch = Batch::new(intake::Document { path: PathBuf::from("requests.txt"), format: "text".into(), records: Vec::new() }, &[]);
+        batch.items = vec![
+            item("good", vec![check("good", true, true, "Validated")]),
+            item("broken", vec![check("broken", false, true, "Checks failed")]),
+            item("safeonly", vec![check("safeonly", true, false, "Safe checks passed; live test still required")]),
+            item("shipped", Vec::new()),
+            item("notyet", Vec::new()),
+            // Shares a confirmed recipe, but this ticket's own check never ran.
+            BatchItem { app: "Good again".into(), include: true, recipes: vec!["good".into()], ..Default::default() },
+        ];
+        let ids = |app: &StudioApp, batch: &Batch| repair_targets(app, batch).into_iter().map(|t| t.id).collect::<Vec<_>>();
+        assert_eq!(ids(&app, &batch), ["good", "broken", "safeonly", "shipped"]);
+        batch.items.pop();
+        assert_eq!(ids(&app, &batch), ["broken", "safeonly", "shipped"]);
+        app.workflow.options.live = false;
+        assert_eq!(ids(&app, &batch), ["broken", "shipped"]);
     }
 }

@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 
 use crate::process::{ProcessSpec, which};
 use crate::workspace::Workspace;
@@ -16,7 +17,7 @@ pub enum LabStage {
     Package,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstallTestOptions {
     /// Dry run: everything except the install and uninstall commands.
     pub what_if: bool,
@@ -30,6 +31,11 @@ pub struct InstallTestOptions {
     pub install_timeout_minutes: u32,
     pub detection_settle_seconds: u32,
     pub residue_settle_seconds: u32,
+    /// `-ElevatedChild`: set only by the Studio's elevated worker, which, like
+    /// the harness's own elevated relaunch, runs after the unelevated steps
+    /// have synced shared content. Never accepted over the worker's pipe.
+    #[serde(skip)]
+    pub elevated_child: bool,
 }
 
 impl InstallTestOptions {
@@ -45,6 +51,7 @@ impl InstallTestOptions {
             install_timeout_minutes: 30,
             detection_settle_seconds: 120,
             residue_settle_seconds: 30,
+            elevated_child: false,
         }
     }
 
@@ -90,6 +97,16 @@ pub enum Consent {
     None,
     /// The user confirmed a dialog describing exactly what will be installed.
     Confirmed,
+}
+
+/// Whether the harness installs this recipe elevated: everything except
+/// `installExperience: user`, as in `Invoke-RecipeInstallTest.ps1`. An
+/// unreadable recipe counts as system-context, the harness default.
+pub fn runs_elevated(recipe: &Path) -> bool {
+    crate::recipe::RecipeDoc::load(recipe)
+        .ok()
+        .and_then(|doc| doc.get_str("installExperience"))
+        .is_none_or(|experience| !experience.trim().eq_ignore_ascii_case("user"))
 }
 
 pub fn recipe_id(path: &Path) -> String {
@@ -186,6 +203,7 @@ pub fn build(ws: &Workspace, action: &HarnessAction, consent: Consent, pwsh: &Pa
             flag(options.include_reinstall, "-IncludeReinstall");
             flag(options.skip_uninstall, "-SkipUninstall");
             flag(options.force, "-Force");
+            flag(options.elevated_child, "-ElevatedChild");
             if !options.what_if {
                 b.push_str(&format!(
                     " -InstallTimeoutMinutes {} -DetectionSettleSeconds {} -ResidueSettleSeconds {}",
@@ -338,6 +356,34 @@ mod tests {
         let spec = build(&ws, &live, Consent::Confirmed, Path::new("pwsh")).unwrap();
         assert!(!body(&spec).contains("-WhatIf"));
         assert!(body(&spec).contains("-InstallTimeoutMinutes 90"));
+    }
+
+    #[test]
+    fn only_user_scope_recipes_run_unelevated() {
+        let d = tempfile::tempdir().unwrap();
+        let recipe = |name: &str, text: &str| {
+            let p = d.path().join(name);
+            std::fs::write(&p, text).unwrap();
+            p
+        };
+        assert!(runs_elevated(&recipe("default.yaml", "id: a
+")));
+        assert!(runs_elevated(&recipe("system.yaml", "id: a
+installExperience: system
+")));
+        assert!(!runs_elevated(&recipe("user.yaml", "id: a
+installExperience: User
+")));
+        assert!(runs_elevated(&d.path().join("missing.yaml")));
+    }
+
+    #[test]
+    fn elevated_child_flag_is_never_deserialized() {
+        let options = InstallTestOptions { elevated_child: true, ..InstallTestOptions::live() };
+        let json = serde_json::to_string(&options).unwrap();
+        assert!(!json.contains("elevated"));
+        let forged = json.replace('}', ",\"elevated_child\":true}");
+        assert!(!serde_json::from_str::<InstallTestOptions>(&forged).unwrap().elevated_child);
     }
 
     #[test]
