@@ -70,6 +70,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             super::open_in_explorer(&ws.layout.harness_artifacts);
         }
     });
+    egui::CollapsingHeader::new("Agent credits by model").id_salt("runs-usage").default_open(true).show(ui, |ui| super::usage::card(app, ui));
     ui.separator();
 
     egui::Panel::left("runs-list").resizable(true).default_size(330.0).show(ui, |ui| {

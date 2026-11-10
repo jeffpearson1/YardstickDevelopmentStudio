@@ -191,6 +191,9 @@ pub fn works_on(app: &StudioApp, batch_id: &str) -> bool {
     agent || app.workflow.run.as_ref().is_some_and(|r| std::iter::once(&r.current).chain(&r.queue).any(|t| t.items.iter().any(|(b, _)| b == batch_id)))
 }
 
+/// Shown when an agent stopped for an approval the run did not have.
+pub const NEEDS_APPROVAL_NOTE: &str = "The agent needed approval to download or inspect installers. Tick “Allow the agent to download and inspect installers” and run it again.";
+
 pub fn task_id(task: &AgentTask) -> Option<String> {
     match task {
         AgentTask::Create { app, id_hint, .. } => Some(if id_hint.trim().is_empty() {
@@ -231,6 +234,9 @@ pub fn modal(app: &mut StudioApp, ctx: &egui::Context) {
             ui.label(format!("Up to {} test attempts per recipe. Recipe failures go back to the agent; environmental blockers stop repair.", app.workflow.options.attempts));
         } else {
             ui.label("No recipes are changed. A failure stops that recipe, then testing continues with the next.");
+        }
+        if repairs {
+            crate::views::settings::downloads_checkbox(app, ui);
         }
         if app.workflow.options.live {
             let warning = if repairs {
@@ -537,7 +543,7 @@ fn fail(app: &mut StudioApp, evidence: String, summary: String, blocker: bool) {
         notes: "Fix only this recipe's failure. Studio will re-run every check after your reply. Do not run live installs yourself. For environmental blockers report STUDIO-BLOCKED: <reason> without editing the recipe.".into(),
     };
     let ws = app.ws.as_ref().unwrap();
-    let spec = match agent::build_command(ws, app.settings.agent_backend, &app.settings.agent_model, &app.settings.production_paths, &task) {
+    let spec = match agent::build_command(ws, app.settings.agent_backend, &app.settings.agent_model, &app.settings.production_paths, &task, crate::views::settings::agent_options(app)) {
         Ok(spec) => spec,
         Err(e) => { finish(app, false, format!("Could not start repair: {e:#}")); return; }
     };
@@ -571,6 +577,8 @@ pub fn repair_finished(app: &mut StudioApp, before: Snapshot, ok: bool, text: &s
     if let Some(path) = reload { app.open_recipe(&path); }
     if app.workflow.run.as_ref().is_some_and(|r| r.cancelled) {
         finish(app, false, "Cancelled.".into());
+    } else if agent::needs_approval(text) {
+        finish(app, false, format!("Repair agent stopped: {NEEDS_APPROVAL_NOTE}"));
     } else if !ok || agent::blocked_reason(text).is_some() {
         let why = agent::blocked_reason(text).unwrap_or_else(|| "it exited with an error; see the console".into());
         finish(app, false, format!("Repair agent stopped: {why}"));
@@ -1205,6 +1213,57 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         assert_eq!(saved.items[1].action, ystudio_core::intake::ItemAction::Review);
         app.batch.selected = Some(0);
         render(&mut app, "requests-agent-tab-runs", 1400, 900);
+    }
+
+    /// A finished agent run's credits are read, logged and shown per run, per
+    /// app and per model.
+    #[test]
+    fn agent_credits_are_recorded_and_shown() {
+        let (dir, mut app) = fake_app();
+        let rec = |model: &str, recipe: Option<&str>, credits: f64| ystudio_core::usage::UsageRecord {
+            model: model.into(), recipe: recipe.map(String::from), credits, backend: "GitHub Copilot CLI".into(), ..Default::default()
+        };
+        app.usage = vec![
+            rec("gpt-5.4", Some("app"), 4.0), rec("gpt-5.4", Some("app"), 2.0), rec("gpt-5.4", Some("user"), 3.0), rec("gpt-5.4", None, 1.0),
+            rec("claude-opus-5.5", Some("app"), 10.0), rec("claude-opus-5.5", Some("broken"), 6.5),
+            rec("claude-sonnet-5.5", Some("present"), 5.2), rec("claude-haiku-4.5", None, 2.7),
+        ];
+
+        // A run whose CLI wrote its usage file: the real JSON of a two-subagent fleet run.
+        let usage_file = dir.path().join("usage.json");
+        std::fs::write(&usage_file, r#"{"totalNanoAiu": 9191115000, "currentModel": "claude-haiku-4.5",
+            "modelMetrics": {"claude-haiku-4.5": {"totalNanoAiu": 9191115000}},
+            "agentMetrics": {"main": {}, "a": {"agentName": "general-purpose"}, "b": {"agentName": "general-purpose"}}}"#).unwrap();
+        let mut spec = ystudio_core::process::ProcessSpec::new("agent", "cmd", dir.path()).args(["/d", "/c", "exit 0"]);
+        spec.usage = Some(ystudio_core::usage::Pending { file: usage_file.clone(), kind: "fix".into(), recipe: Some("app".into()), backend: "GitHub Copilot CLI".into(), multi_agent: true });
+        let id = app.start_job(spec, JobKind::GitFetch).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !app.usage_by_job.contains_key(&id) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            app.poll_for_tests();
+        }
+        let recorded = &app.usage_by_job[&id];
+        assert!((recorded.credits - 9.191115).abs() < 1e-6 && recorded.subagents == 2 && recorded.recipe.as_deref() == Some("app"));
+        assert!(app.job(id).unwrap().proc.text().contains("Used 9.19 AI credits (claude-haiku-4.5, 2 subagent(s))."));
+        assert!(!usage_file.exists(), "the usage file is consumed");
+        assert_eq!(app.usage.len(), 9);
+
+        app.settings.agent_model = "claude-opus-5.5".into();
+        app.settings.agent_multi = true;
+        app.view = crate::app::View::Runs;
+        render(&mut app, "usage-runs-dark", 1400, 900);
+        app.settings.dark_mode = false;
+        render(&mut app, "usage-runs-light", 1400, 900);
+        app.settings.dark_mode = true;
+        assert!(app.open_recipe_by_id("app"));
+        crate::views::open_recipe_tab(&mut app, crate::app::View::Agent);
+        render(&mut app, "usage-agent-picker", 1400, 900);
+        let mut batch = ystudio_core::intake::Batch::from_items("credits", vec![ystudio_core::intake::BatchItem {
+            app: "App".into(), existing_recipe: "app".into(), request: ystudio_core::intake::RequestKind::Update, ..Default::default()
+        }]);
+        batch.id = dir.path().join("credits-batch").to_string_lossy().into_owned();
+        assert!(crate::views::batch::open_made(&mut app, batch));
+        render(&mut app, "usage-requests", 1400, 900);
     }
 
     /// The wizard against a stand-in Install-Yardstick.ps1 that follows the

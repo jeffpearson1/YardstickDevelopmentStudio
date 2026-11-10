@@ -271,6 +271,12 @@ pub struct StudioApp {
     pub md_cache: CommonMarkCache,
     /// Latest known verdict per recipe id, from the newest install-test runs.
     pub verdicts: BTreeMap<String, (Verdict, String)>,
+    /// Every recorded agent run's AI credits, oldest first.
+    pub usage: Vec<ystudio_core::usage::UsageRecord>,
+    /// The credits of runs finished in this session, by job.
+    pub usage_by_job: HashMap<u64, ystudio_core::usage::UsageRecord>,
+    /// Where usage records are appended.
+    usage_log: PathBuf,
     /// Recipe contents that passed a live install test.
     pub ledger: Ledger,
     /// [`Completion`] of every recipe in the ledger, by lower-case id.
@@ -343,6 +349,7 @@ impl StudioApp {
             console_job: None, console_open: false, waker: Arc::new(|| {}),
             status: Status::default(), pending: None, md_cache: CommonMarkCache::default(),
             verdicts: BTreeMap::new(), ledger: Ledger::default(), completion: BTreeMap::new(),
+            usage: Vec::new(), usage_by_job: HashMap::new(), usage_log: std::env::temp_dir().join(format!("ystudio-test-usage-{}.jsonl", std::process::id())),
             runs: Vec::new(), perf: Perf::default(), git_status: None,
             library: Default::default(), bench: Default::default(), agent: Default::default(),
             batch: Default::default(), icons: Default::default(), runs_ui: Default::default(),
@@ -394,6 +401,9 @@ impl StudioApp {
             pending: None,
             md_cache: CommonMarkCache::default(),
             verdicts: BTreeMap::new(),
+            usage: ystudio_core::usage::UsageLog::at(ystudio_core::usage::UsageLog::default_path()).load(),
+            usage_by_job: HashMap::new(),
+            usage_log: ystudio_core::usage::UsageLog::default_path(),
             ledger: Ledger::default(),
             completion: BTreeMap::new(),
             runs: Vec::new(),
@@ -844,9 +854,26 @@ impl StudioApp {
         crate::workflow::poll(self);
     }
 
+    /// Reads what a finished agent run cost, notes it in its log, and keeps it.
+    fn record_usage(&mut self, idx: usize) {
+        let Some(pending) = self.jobs[idx].proc.spec.usage.clone() else { return };
+        let Ok(record) = ystudio_core::usage::read(&pending) else { return };
+        let subagents = if record.subagents > 0 { format!(", {} subagent(s)", record.subagents) } else { String::new() };
+        self.jobs[idx].proc.lines.push(ystudio_core::process::LogLine {
+            stream: Stream::Studio,
+            text: format!("Used {:.2} AI credits ({}{subagents}).", record.credits, record.model),
+        });
+        if let Err(e) = ystudio_core::usage::UsageLog::at(self.usage_log.clone()).append(&record) {
+            self.error(format!("Could not record the run's AI credits: {e:#}"));
+        }
+        self.usage_by_job.insert(self.jobs[idx].id, record.clone());
+        self.usage.push(record);
+    }
+
     fn on_job_finished(&mut self, id: u64) {
         let Some(idx) = self.jobs.iter().position(|j| j.id == id) else { return };
         self.jobs[idx].handled = true;
+        self.record_usage(idx);
         let ok = self.jobs[idx].proc.succeeded();
         let cancelled = self.jobs[idx].proc.cancelled;
         let started = self.jobs[idx].started_sys;
@@ -923,7 +950,11 @@ impl StudioApp {
                 } else {
                     self.error(format!("Agent exited with an error ({n} file(s) changed)."));
                 }
-                let blocked = ystudio_core::agent::blocked_reason(&text).is_some();
+                let needs_approval = ystudio_core::agent::needs_approval(&text);
+                if needs_approval {
+                    self.error(crate::workflow::NEEDS_APPROVAL_NOTE);
+                }
+                let blocked = needs_approval || ystudio_core::agent::blocked_reason(&text).is_some();
                 if let Some((batch_id, idx)) = &batch_item {
                     views::batch::agent_finished(self, batch_id, *idx, ok && !blocked, verification.is_some());
                 }
@@ -936,7 +967,13 @@ impl StudioApp {
                     } else {
                         if let Some((batch_id, idx)) = target.items.first() {
                             views::batch::check_finished(self, batch_id, *idx, ystudio_core::intake::BatchCheck {
-                                recipe: target.id, passed: false, note: "Authoring agent failed or reported an environmental blocker.".into(),
+                                recipe: target.id,
+                                passed: false,
+                                note: if needs_approval {
+                                    crate::workflow::NEEDS_APPROVAL_NOTE.into()
+                                } else {
+                                    "Authoring agent failed or reported an environmental blocker.".into()
+                                },
                                 timestamp: ystudio_core::intake::timestamp(), summary_dir: None, live: false,
                             });
                             views::batch::start_next(self);
@@ -1251,7 +1288,8 @@ impl StudioApp {
                     "\u{EA39}"
                 };
                 let selected = self.console_job == Some(j.id);
-                if ui.selectable_label(selected, format!("{icon} {}", j.proc.spec.label)).clicked() {
+                let credits = self.usage_by_job.get(&j.id).map(|u| format!(" · {:.1} cr", u.credits)).unwrap_or_default();
+                if ui.selectable_label(selected, format!("{icon} {}{credits}", j.proc.spec.label)).clicked() {
                     select = Some(j.id);
                 }
             }

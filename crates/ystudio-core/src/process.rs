@@ -43,6 +43,8 @@ pub struct ProcessSpec {
     /// The program writes progress, not errors, to stderr (git does), so the
     /// log should not colour it as an error.
     pub stderr_is_progress: bool,
+    /// An agent run's usage statistics, read when it ends.
+    pub usage: Option<crate::usage::Pending>,
 }
 
 impl ProcessSpec {
@@ -55,6 +57,7 @@ impl ProcessSpec {
             env: Vec::new(),
             new_console: false,
             stderr_is_progress: false,
+            usage: None,
         }
     }
 

@@ -73,7 +73,7 @@ impl AgentState {
             app.error("Open a development workspace before starting the agent.");
             return;
         };
-        match agent::build_command(ws, app.settings.agent_backend, &app.settings.agent_model, &app.settings.production_paths, &task) {
+        match agent::build_command(ws, app.settings.agent_backend, &app.settings.agent_model, &app.settings.production_paths, &task, super::settings::agent_options(app)) {
             Ok(spec) => {
                 let before = Snapshot::take(ws);
                 app.agent.changes.clear();
@@ -179,7 +179,10 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             }
             ui.add_space(6.0);
             ui.label("Agent and model");
-            ui.add_enabled_ui(!running, |ui| super::settings::agent_picker(app, ui, "agent-tab"));
+            ui.add_enabled_ui(!running, |ui| {
+                super::settings::agent_picker(app, ui, "agent-tab");
+                super::settings::downloads_checkbox(app, ui);
+            });
             ui.collapsing("Guardrails", |ui| {
                 ui.label(RichText::new(
                     "The agent prefers vendor internet downloads; software dropbox is a last resort. It may only write \
@@ -200,7 +203,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             if st.show_prompt
                 && let Ok(t) = &task
             {
-                let mut prompt = agent::full_prompt(&ws, &app.settings.production_paths, t);
+                let mut prompt = agent::full_prompt(&ws, &app.settings.production_paths, t, super::settings::agent_options(app));
                 ui.add(egui::TextEdit::multiline(&mut prompt).code_editor().desired_rows(10).desired_width(ui.available_width()).interactive(false));
             }
             ui.add_space(6.0);
@@ -254,6 +257,9 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                         });
                     }
                 });
+            }
+            if let Some(u) = app.agent.job.and_then(|j| app.usage_by_job.get(&j)) {
+                ui.label(format!("Used {:.1} AI credits ({}{}).", u.credits, u.model, if u.subagents > 0 { format!(", {} subagent(s)", u.subagents) } else { String::new() }));
             }
             ui.label(RichText::new("Only Studio's recorded harness evidence establishes validation; the agent's claims do not.").small().weak());
         });

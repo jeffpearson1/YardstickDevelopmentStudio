@@ -18,6 +18,7 @@ pub mod results;
 pub mod settings;
 pub mod setup;
 pub mod update;
+pub mod usage;
 pub mod validation;
 pub mod workspace;
 
