@@ -191,6 +191,9 @@ pub fn works_on(app: &StudioApp, batch_id: &str) -> bool {
     agent || app.workflow.run.as_ref().is_some_and(|r| std::iter::once(&r.current).chain(&r.queue).any(|t| t.items.iter().any(|(b, _)| b == batch_id)))
 }
 
+/// Shown when an agent stopped for an approval the run did not have.
+pub const NEEDS_APPROVAL_NOTE: &str = "The agent needed approval to download or inspect installers. Tick “Allow the agent to download and inspect installers” and run it again.";
+
 pub fn task_id(task: &AgentTask) -> Option<String> {
     match task {
         AgentTask::Create { app, id_hint, .. } => Some(if id_hint.trim().is_empty() {
@@ -231,6 +234,9 @@ pub fn modal(app: &mut StudioApp, ctx: &egui::Context) {
             ui.label(format!("Up to {} test attempts per recipe. Recipe failures go back to the agent; environmental blockers stop repair.", app.workflow.options.attempts));
         } else {
             ui.label("No recipes are changed. A failure stops that recipe, then testing continues with the next.");
+        }
+        if repairs {
+            crate::views::settings::downloads_checkbox(app, ui);
         }
         if app.workflow.options.live {
             let warning = if repairs {
@@ -537,7 +543,7 @@ fn fail(app: &mut StudioApp, evidence: String, summary: String, blocker: bool) {
         notes: "Fix only this recipe's failure. Studio will re-run every check after your reply. Do not run live installs yourself. For environmental blockers report STUDIO-BLOCKED: <reason> without editing the recipe.".into(),
     };
     let ws = app.ws.as_ref().unwrap();
-    let spec = match agent::build_command(ws, app.settings.agent_backend, &app.settings.agent_model, &app.settings.production_paths, &task) {
+    let spec = match agent::build_command(ws, app.settings.agent_backend, &app.settings.agent_model, &app.settings.production_paths, &task, crate::views::settings::approvals(app)) {
         Ok(spec) => spec,
         Err(e) => { finish(app, false, format!("Could not start repair: {e:#}")); return; }
     };
@@ -571,6 +577,8 @@ pub fn repair_finished(app: &mut StudioApp, before: Snapshot, ok: bool, text: &s
     if let Some(path) = reload { app.open_recipe(&path); }
     if app.workflow.run.as_ref().is_some_and(|r| r.cancelled) {
         finish(app, false, "Cancelled.".into());
+    } else if agent::needs_approval(text) {
+        finish(app, false, format!("Repair agent stopped: {NEEDS_APPROVAL_NOTE}"));
     } else if !ok || agent::blocked_reason(text).is_some() {
         let why = agent::blocked_reason(text).unwrap_or_else(|| "it exited with an error; see the console".into());
         finish(app, false, format!("Repair agent stopped: {why}"));

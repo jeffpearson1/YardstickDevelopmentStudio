@@ -39,6 +39,9 @@ pub struct Settings {
     pub skipped_update: String,
     /// The first-run setup wizard was finished or skipped.
     pub setup_done: bool,
+    /// The user approves agents downloading installers and inspecting them
+    /// with tools outside the workspace (see `agent::Approvals`).
+    pub agent_downloads: bool,
 }
 
 impl Default for Settings {
@@ -60,6 +63,7 @@ impl Default for Settings {
             auto_check_updates: true,
             skipped_update: String::new(),
             setup_done: false,
+            agent_downloads: false,
         }
     }
 }

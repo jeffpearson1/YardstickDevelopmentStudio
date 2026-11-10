@@ -166,6 +166,7 @@ fn tools_card(app: &mut StudioApp, ui: &mut Ui) {
         let mut save = false;
         form_row(ui, "Agent and model", Some("The coding-agent CLI that writes and repairs recipes, and the model it uses."), |ui| {
             agent_picker(app, ui, "settings");
+            downloads_checkbox(app, ui);
         });
         form_row(ui, "PowerShell", Some("The PowerShell the harness runs with; blank picks pwsh 7, then Windows PowerShell."), |ui| {
             let r = ui.add(egui::TextEdit::singleline(&mut app.settings_ui.pwsh_text).hint_text("automatic").desired_width(f32::INFINITY));
@@ -272,6 +273,24 @@ fn appearance_card(app: &mut StudioApp, ui: &mut Ui) {
             app.save_settings();
         }
     });
+}
+
+/// What the user has approved for agent runs.
+pub fn approvals(app: &StudioApp) -> ystudio_core::agent::Approvals {
+    ystudio_core::agent::Approvals { downloads: app.settings.agent_downloads }
+}
+
+/// The download approval, wherever an agent run starts. Saved as it changes,
+/// so it carries to the next run.
+pub fn downloads_checkbox(app: &mut StudioApp, ui: &mut Ui) {
+    let r = ui.checkbox(&mut app.settings.agent_downloads, "Allow the agent to download and inspect installers").on_hover_text(
+        "The agent runs without a window, so it cannot ask. With this ticked it is told you approved downloading vendor \
+         files and unpacking them with tools such as 7-Zip, and Copilot CLI's path checks are lifted for the run. It is \
+         still never allowed to run installers, touch production, or push.",
+    );
+    if r.changed() {
+        app.save_settings();
+    }
 }
 
 /// Agent CLI and model, saved as they change. The model list comes from the

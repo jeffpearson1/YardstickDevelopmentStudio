@@ -923,7 +923,11 @@ impl StudioApp {
                 } else {
                     self.error(format!("Agent exited with an error ({n} file(s) changed)."));
                 }
-                let blocked = ystudio_core::agent::blocked_reason(&text).is_some();
+                let needs_approval = ystudio_core::agent::needs_approval(&text);
+                if needs_approval {
+                    self.error(crate::workflow::NEEDS_APPROVAL_NOTE);
+                }
+                let blocked = needs_approval || ystudio_core::agent::blocked_reason(&text).is_some();
                 if let Some((batch_id, idx)) = &batch_item {
                     views::batch::agent_finished(self, batch_id, *idx, ok && !blocked, verification.is_some());
                 }
@@ -936,7 +940,13 @@ impl StudioApp {
                     } else {
                         if let Some((batch_id, idx)) = target.items.first() {
                             views::batch::check_finished(self, batch_id, *idx, ystudio_core::intake::BatchCheck {
-                                recipe: target.id, passed: false, note: "Authoring agent failed or reported an environmental blocker.".into(),
+                                recipe: target.id,
+                                passed: false,
+                                note: if needs_approval {
+                                    crate::workflow::NEEDS_APPROVAL_NOTE.into()
+                                } else {
+                                    "Authoring agent failed or reported an environmental blocker.".into()
+                                },
                                 timestamp: ystudio_core::intake::timestamp(), summary_dir: None, live: false,
                             });
                             views::batch::start_next(self);

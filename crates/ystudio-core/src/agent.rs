@@ -129,6 +129,48 @@ impl AgentTask {
     }
 }
 
+/// The line an agent ends with when a command it needed was not approved.
+pub const NEEDS_APPROVAL: &str = "STUDIO-NEEDS-APPROVAL:";
+
+/// What the user approved for a run, before it started. The agent CLI runs
+/// headless, so it cannot ask; anything it would ask about is denied unless
+/// approved here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Approvals {
+    /// Download vendor files and unpack/inspect them with tools anywhere on
+    /// this computer (Copilot CLI's path checks are lifted for the run).
+    pub downloads: bool,
+}
+
+/// The approvals section of the prompt: what the user granted for this run.
+fn approvals_prompt(ws: &Workspace, production_paths: &[PathBuf], approvals: Approvals) -> String {
+    if approvals.downloads {
+        let prod = if production_paths.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", production_paths.iter().map(|p| format!("`{}`", p.display())).collect::<Vec<_>>().join(", "))
+        };
+        format!(
+            "Approvals the user gave in the Studio before this run started. They are explicit and stand for the whole \
+             run: do not stop to ask for them, and do not report a blocker for lack of approval.\n\
+             - Download installers and other vendor files from the internet into `{downloads}` or the system temp folder.\n\
+             - Unpack and inspect them without running them: 7-Zip, lessmsi, `msiexec /a` administrative extracts, \
+               Get-AuthenticodeSignature, file, MSI and registry metadata. Tools installed anywhere on this computer \
+               may be used for this.\n\
+             Still not approved: running an installer, installing or uninstalling software (the Studio runs live \
+             install tests after you finish, with the user's consent), and anything in the production folder(s){prod}.\n",
+            downloads = ws.root.join(r"Artifacts\AgentDownloads").display(),
+        )
+    } else {
+        format!(
+            "The user has not approved downloading or unpacking installers outside the recipe harness for this run. \
+             Use the harness's own download stage and the vendor's documentation. If a command is denied because it \
+             needs approval, do not work around the denial: finish your report, then add a line \
+             `{NEEDS_APPROVAL} downloads` so the Studio can ask the user to approve downloads and run you again.\n"
+        )
+    }
+}
+
 /// Guardrails prepended to every prompt.
 pub fn guardrails(ws: &Workspace, production_paths: &[PathBuf]) -> String {
     let prod = if production_paths.is_empty() {
@@ -225,8 +267,20 @@ pub fn task_prompt(task: &AgentTask) -> String {
     }
 }
 
-pub fn full_prompt(ws: &Workspace, production_paths: &[PathBuf], task: &AgentTask) -> String {
-    format!("{}\n---\n\n{}", guardrails(ws, production_paths), task_prompt(task))
+pub fn full_prompt(ws: &Workspace, production_paths: &[PathBuf], task: &AgentTask, approvals: Approvals) -> String {
+    format!(
+        "{}\n{}\n---\n\n{}",
+        guardrails(ws, production_paths),
+        approvals_prompt(ws, production_paths, approvals),
+        task_prompt(task)
+    )
+}
+
+/// Whether the agent stopped because a command needed an approval this run
+/// did not have: it said so, or Copilot CLI denied a command headlessly.
+pub fn needs_approval(output: &str) -> bool {
+    output.lines().any(|l| l.trim().trim_start_matches(['*', '`']).starts_with(NEEDS_APPROVAL))
+        || output.contains("no interactive user response was available")
 }
 
 /// Avoid treating a request's shared-media link as its vendor research source.
@@ -257,27 +311,17 @@ pub fn build_command(
     model: &str,
     production_paths: &[PathBuf],
     task: &AgentTask,
+    approvals: Approvals,
 ) -> Result<ProcessSpec> {
     ws.ensure_writable("run a coding agent")?;
     if !ws.has_skill() {
         bail!("This Yardstick folder has no .claude\\skills\\yardstick-recipes\\SKILL.md; update it from GitHub first.");
     }
-    let prompt = full_prompt(ws, production_paths, task);
+    let prompt = full_prompt(ws, production_paths, task, approvals);
     let root = ws.root.to_string_lossy().into_owned();
     let mut spec = backend.spec(task.title(), &ws.root)?;
     match backend {
-        AgentBackend::CopilotCli => {
-            spec = spec.args(["-p", &prompt, "--no-color", "--no-ask-user", "--stream", "on", "--add-dir", &root]);
-            // File tools are confined to the workspace (no --allow-all-paths).
-            // Web access is needed to research vendors.
-            spec = spec.args(["--allow-all-tools", "--allow-all-urls"]);
-            for denied in DENIED_COMMANDS {
-                spec = spec.arg(format!("--deny-tool=shell({denied})"));
-            }
-            if !task.writes() {
-                spec = spec.arg("--deny-tool=write");
-            }
-        }
+        AgentBackend::CopilotCli => spec = spec.args(copilot_args(&prompt, &root, task.writes(), approvals)),
         AgentBackend::ClaudeCode => {
             let allowed = if task.writes() {
                 "Bash Read Edit Write Glob Grep WebFetch WebSearch TodoWrite Skill"
@@ -341,6 +385,29 @@ pub fn build_extract_command(backend: AgentBackend, model: &str, batch_dir: &Pat
         spec = spec.args(["--model", model.trim()]);
     }
     Ok(spec)
+}
+
+/// Copilot CLI arguments for an agent run. It runs headless, so anything it
+/// would ask about is denied: tools and URLs are allowed outright, and paths
+/// outside the workspace and temp folder only when downloads are approved.
+/// Deny rules beat every allow, so the denied commands stay denied.
+fn copilot_args(prompt: &str, root: &str, writes: bool, approvals: Approvals) -> Vec<String> {
+    let mut args: Vec<String> = ["-p", prompt, "--no-color", "--no-ask-user", "--stream", "on", "--add-dir", root]
+        .map(String::from)
+        .to_vec();
+    // Web access is needed to research vendors.
+    args.extend(["--allow-all-tools".into(), "--allow-all-urls".into()]);
+    if approvals.downloads {
+        // Unpacking and inspecting installers uses tools outside the
+        // workspace (7-Zip in Program Files, say), which the path check
+        // would otherwise refuse with nobody there to approve it.
+        args.push("--allow-all-paths".into());
+    }
+    args.extend(DENIED_COMMANDS.iter().map(|d| format!("--deny-tool=shell({d})")));
+    if !writes {
+        args.push("--deny-tool=write".into());
+    }
+    args
 }
 
 /// Command prefixes the agent's shell tool may never run.
@@ -452,7 +519,7 @@ mod tests {
     fn prompt_carries_guardrails_and_task() {
         let (_d, ws) = dev_ws();
         let task = AgentTask::Create { app: "Obsidian".into(), id_hint: "obsidian".into(), vendor_url: "https://obsidian.md".into(), notes: String::new() };
-        let p = full_prompt(&ws, &[PathBuf::from(r"C:\Intune\Yardstick")], &task);
+        let p = full_prompt(&ws, &[PathBuf::from(r"C:\Intune\Yardstick")], &task, Approvals::default());
         assert!(p.contains("SKILL.md"));
         assert!(p.contains(r"C:\Intune\Yardstick"));
         assert!(p.contains("-WhatIf -NoElevate -DiscardInstaller"));
@@ -476,6 +543,36 @@ mod tests {
     }
 
     #[test]
+    fn download_approval_is_explicit_in_the_prompt_and_the_flags() {
+        let (_d, ws) = dev_ws();
+        let task = AgentTask::Fix { id: "brave".into(), evidence: String::new(), notes: String::new() };
+        let prod = [PathBuf::from(r"C:\Intune\Yardstick")];
+
+        let approved = full_prompt(&ws, &prod, &task, Approvals { downloads: true });
+        assert!(approved.contains("Approvals the user gave in the Studio before this run started"));
+        assert!(approved.contains("do not report a blocker for lack of approval"));
+        assert!(approved.contains(r"Artifacts\AgentDownloads"));
+        assert!(approved.contains("Still not approved: running an installer") && approved.contains(r"`C:\Intune\Yardstick`"));
+        let args = copilot_args(&approved, "C:\\ws", true, Approvals { downloads: true });
+        assert!(args.contains(&"--allow-all-paths".to_string()));
+        assert!(args.contains(&"--deny-tool=shell(git push)".to_string()));
+
+        let plain = full_prompt(&ws, &prod, &task, Approvals::default());
+        assert!(plain.contains("has not approved downloading") && plain.contains("STUDIO-NEEDS-APPROVAL: downloads"));
+        assert!(!plain.contains("Approvals the user gave"));
+        let args = copilot_args(&plain, "C:\\ws", false, Approvals::default());
+        assert!(!args.contains(&"--allow-all-paths".to_string()));
+        assert!(args.contains(&"--deny-tool=write".to_string()));
+    }
+
+    #[test]
+    fn recognises_runs_that_needed_approval() {
+        assert!(needs_approval("report...\n**STUDIO-NEEDS-APPROVAL: downloads**\n"));
+        assert!(needs_approval("Permission denied because no interactive user response was available. Retry..."));
+        assert!(!needs_approval("STUDIO-RECIPES: brave\n"));
+    }
+
+    #[test]
     fn review_is_read_only() {
         assert!(!AgentTask::Review { id: "x".into() }.writes());
         assert!(task_prompt(&AgentTask::Review { id: "x".into() }).contains("Do NOT modify"));
@@ -493,7 +590,7 @@ mod tests {
     fn production_workspace_refused() {
         let d = fake_workspace(Some("developmentOnly: true\n"));
         let ws = Workspace::open(d.path(), &[d.path().to_path_buf()], &[]).unwrap();
-        let err = build_command(&ws, AgentBackend::CopilotCli, "", &[], &AgentTask::Review { id: "x".into() }).unwrap_err();
+        let err = build_command(&ws, AgentBackend::CopilotCli, "", &[], &AgentTask::Review { id: "x".into() }, Approvals::default()).unwrap_err();
         assert!(err.to_string().contains("production"));
     }
 

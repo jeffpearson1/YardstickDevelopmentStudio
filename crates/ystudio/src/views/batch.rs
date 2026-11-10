@@ -295,7 +295,7 @@ pub fn start_next(app: &mut StudioApp) {
         let Some(b) = app.batch.batch.as_ref() else { break };
         let Some(task) = task_for(app, b, idx) else { continue };
         let batch_id = b.id.clone();
-        match agent::build_command(&ws, app.settings.agent_backend, &app.settings.agent_model, &app.settings.production_paths, &task) {
+        match agent::build_command(&ws, app.settings.agent_backend, &app.settings.agent_model, &app.settings.production_paths, &task, super::settings::approvals(app)) {
             Ok(spec) => {
                 let before = Snapshot::take(&ws);
                 let verification = app.batch.verification.clone().and_then(|options| crate::workflow::task_id(&task)
@@ -684,6 +684,7 @@ fn items_table(app: &mut StudioApp, ui: &mut Ui) {
             ui.label("Agent");
             super::settings::agent_picker(app, ui, "requests");
         });
+        super::settings::downloads_checkbox(app, ui);
         crate::workflow::configure(&mut app.workflow.options, ui, true);
     });
     crate::workflow::progress(app, ui);
