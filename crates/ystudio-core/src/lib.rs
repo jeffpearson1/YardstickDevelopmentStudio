@@ -12,10 +12,13 @@ pub mod icons;
 pub mod intake;
 pub mod lint;
 pub mod process;
+pub mod promote;
 pub mod recipe;
 pub mod results;
 pub mod settings;
+pub mod setup;
 pub mod update;
+pub mod validation;
 pub mod workspace;
 
 pub use workspace::{Workspace, WorkspaceKind};

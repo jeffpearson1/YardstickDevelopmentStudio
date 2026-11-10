@@ -4,6 +4,7 @@
 
 use eframe::egui::{self, RichText, Ui};
 use ystudio_core::agent::{self, AgentBackend, AgentTask, Change, Snapshot};
+use ystudio_core::intake::{Batch, BatchItem, ItemStatus};
 
 use crate::app::{JobKind, Step, StudioApp, View, job_log};
 use crate::theme::{self, FluentText as _};
@@ -11,7 +12,6 @@ use crate::theme::{self, FluentText as _};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TaskKind {
     #[default]
-    Create,
     Fix,
     Review,
     Update,
@@ -19,8 +19,7 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
-    const ALL: [(TaskKind, &'static str, &'static str); 5] = [
-        (TaskKind::Create, "\u{E710}  Create", "Research a vendor and write a new recipe, then dry-run it."),
+    const ALL: [(TaskKind, &'static str, &'static str); 4] = [
         (TaskKind::Fix, "\u{E90F}  Fix", "Diagnose a failing recipe from harness evidence and fix it."),
         (TaskKind::Review, "\u{E721}  Review", "Read-only review against the skill; no files change."),
         (TaskKind::Update, "\u{E895}  Update", "Refresh download source, version scheme or switches."),
@@ -30,9 +29,6 @@ impl TaskKind {
 
 pub struct AgentState {
     pub kind: TaskKind,
-    pub app_name: String,
-    pub id_hint: String,
-    pub vendor_url: String,
     pub notes: String,
     pub target_id: String,
     pub evidence: String,
@@ -42,17 +38,18 @@ pub struct AgentState {
     pub changes: Vec<Change>,
     pub reported: Vec<String>,
     /// Whether each of [`AgentBackend::ALL`] is installed; probed once (PATH scan).
-    backends_found: Option<[bool; AgentBackend::ALL.len()]>,
+    pub backends_found: Option<[bool; AgentBackend::ALL.len()]>,
     pub auto_test: bool,
+    /// The request tracking the latest run: (request id, name).
+    pub request: Option<(String, String)>,
 }
 
 impl Default for AgentState {
     fn default() -> Self {
         Self {
-            kind: TaskKind::default(), app_name: String::new(), id_hint: String::new(),
-            vendor_url: String::new(), notes: String::new(), target_id: String::new(),
+            kind: TaskKind::default(), notes: String::new(), target_id: String::new(),
             evidence: String::new(), freeform: String::new(), show_prompt: false,
-            job: None, changes: Vec::new(), reported: Vec::new(), backends_found: None, auto_test: true,
+            job: None, changes: Vec::new(), reported: Vec::new(), backends_found: None, auto_test: true, request: None,
         }
     }
 }
@@ -82,7 +79,19 @@ impl AgentState {
                 app.agent.changes.clear();
                 app.agent.reported.clear();
                 app.workflow.message.clear();
-                app.agent.job = app.start_job(spec, JobKind::Agent { before, batch_item: None, verification });
+                let mut request = tracking_request(app, &task);
+                let batch_item = request.as_ref().map(|b| (b.id.clone(), 0));
+                app.agent.job = app.start_job(spec, JobKind::Agent { before, batch_item, verification });
+                if let Some(b) = &mut request {
+                    let started = app.agent.job.is_some();
+                    b.items[0].status = if started { ItemStatus::Running } else { ItemStatus::Failed };
+                    b.items[0].status_note = if started { format!("{} started", app.settings.agent_backend.label()) } else { "could not start the agent".into() };
+                    match b.save() {
+                        Ok(()) => app.agent.request = Some((b.id.clone(), super::home::request_label(b))),
+                        Err(e) => app.error(format!("Could not save the request for this run: {e:#}")),
+                    }
+                    app.batch.saved = None;
+                }
                 app.save_settings();
             }
             Err(e) => app.error(format!("{e:#}")),
@@ -92,17 +101,6 @@ impl AgentState {
     fn task(&self) -> Result<AgentTask, &'static str> {
         let need_id = || if self.target_id.trim().is_empty() { Err("Choose the recipe id.") } else { Ok(self.target_id.trim().to_string()) };
         Ok(match self.kind {
-            TaskKind::Create => {
-                if self.app_name.trim().is_empty() {
-                    return Err("Name the application to package.");
-                }
-                AgentTask::Create {
-                    app: self.app_name.trim().to_string(),
-                    id_hint: self.id_hint.trim().to_string(),
-                    vendor_url: self.vendor_url.clone(),
-                    notes: self.notes.clone(),
-                }
-            }
             TaskKind::Fix => AgentTask::Fix { id: need_id()?, evidence: self.evidence.clone(), notes: self.notes.clone() },
             TaskKind::Review => AgentTask::Review { id: need_id()? },
             TaskKind::Update => AgentTask::Update { id: need_id()?, notes: self.notes.clone() },
@@ -116,15 +114,31 @@ impl AgentState {
     }
 }
 
+/// A one-item request recording an Agent tab run, so its status and test
+/// results are kept under Requests like any other work. It is saved, not
+/// opened: the request open in Requests stays as it is.
+pub(crate) fn tracking_request(app: &StudioApp, task: &AgentTask) -> Option<Batch> {
+    let recipe = app.agent.target_id.trim().to_string();
+    if recipe.is_empty() {
+        return None;
+    }
+    let name = app.recipes.iter().find(|r| r.id == recipe).map(|r| r.meta.display_name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| recipe.clone());
+    let verb = match task {
+        AgentTask::Create { .. } => "new",
+        AgentTask::Fix { .. } => "fix",
+        AgentTask::Review { .. } => "review",
+        AgentTask::Update { .. } => "update",
+        AgentTask::Freeform { .. } => "agent task on",
+    };
+    Some(Batch::from_items(&format!("{verb} {recipe}"), vec![BatchItem::for_task(task, &recipe, &name)]))
+}
+
 pub fn show(app: &mut StudioApp, ui: &mut Ui) {
-    if !super::need_workspace(app, ui) {
+    if !super::need_recipe(app, ui) {
         return;
     }
     super::production_banner(app, ui);
-    ui.horizontal(|ui| {
-        theme::page_title(ui, "Agent");
-        ui.label(RichText::new("powered by the yardstick-recipes skill").weak());
-    });
+    super::recipe_header(app, ui);
     let ws = app.ws.clone().unwrap();
     if !app.ws_cache.has_skill {
         theme::banner(ui, theme::amber(), |ui| {
@@ -133,12 +147,13 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     }
     // Two agents writing at once would muddle each other's change lists.
     let running = crate::workflow::busy(app) || !app.batch.queue.is_empty();
-    let open_id = app.recipe.as_ref().map(|r| r.id.clone());
-    let ids: Vec<String> = app.recipes.iter().map(|r| r.id.clone()).collect();
+    let open_id = app.recipe.as_ref().map(|r| r.id.clone()).unwrap_or_default();
 
     egui::Panel::left("agent-form").resizable(true).default_size(430.0).show(ui, |ui| {
         egui::ScrollArea::vertical().id_salt("agent-form-scroll").show(ui, |ui| {
             let st = &mut app.agent;
+            // The tab always works on the open recipe.
+            st.target_id = open_id.clone();
             ui.horizontal_wrapped(|ui| {
                 for (k, label, _) in TaskKind::ALL {
                     ui.selectable_value(&mut st.kind, k, label);
@@ -147,41 +162,6 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             let blurb = TaskKind::ALL.iter().find(|(k, ..)| *k == st.kind).map(|t| t.2).unwrap_or_default();
             ui.label(RichText::new(blurb).weak());
             ui.add_space(6.0);
-            egui::Grid::new("agent-grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                match st.kind {
-                    TaskKind::Create => {
-                        ui.label("Application");
-                        ui.add(egui::TextEdit::singleline(&mut st.app_name).hint_text("e.g. Notepad++").desired_width(ui.available_width()));
-                        ui.end_row();
-                        ui.label("Recipe id");
-                        ui.add(egui::TextEdit::singleline(&mut st.id_hint).hint_text(ystudio_core::recipe::suggest_id(&st.app_name)).desired_width(ui.available_width()));
-                        ui.end_row();
-                        ui.label("Vendor page");
-                        ui.add(egui::TextEdit::singleline(&mut st.vendor_url).hint_text("optional").desired_width(ui.available_width()));
-                        ui.end_row();
-                    }
-                    TaskKind::Fix | TaskKind::Review | TaskKind::Update => {
-                        ui.label("Recipe");
-                        ui.horizontal(|ui| {
-                            egui::ComboBox::from_id_salt("agent-target")
-                                .selected_text(if st.target_id.is_empty() { "choose…".to_string() } else { st.target_id.clone() })
-                                .height(400.0)
-                                .show_ui(ui, |ui| {
-                                    for id in &ids {
-                                        ui.selectable_value(&mut st.target_id, id.clone(), id);
-                                    }
-                                });
-                            if let Some(id) = &open_id
-                                && ui.small_button("use open recipe").clicked()
-                            {
-                                st.target_id = id.clone();
-                            }
-                        });
-                        ui.end_row();
-                    }
-                    TaskKind::Freeform => {}
-                }
-            });
             match st.kind {
                 TaskKind::Freeform => {
                     ui.label("Prompt");
@@ -198,19 +178,8 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                 ui.add(egui::TextEdit::multiline(&mut st.evidence).code_editor().desired_rows(6).desired_width(ui.available_width()));
             }
             ui.add_space(6.0);
-            ui.collapsing("Agent backend", |ui| {
-                let found = app.agent.backends_found.get_or_insert_with(|| AgentBackend::ALL.map(|b| b.locate().is_some()));
-                ui.horizontal(|ui| {
-                    for (b, found) in AgentBackend::ALL.into_iter().zip(*found) {
-                        let label = if found { b.label().to_string() } else { format!("{} (not found)", b.label()) };
-                        ui.selectable_value(&mut app.settings.agent_backend, b, label);
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Model");
-                    ui.add(egui::TextEdit::singleline(&mut app.settings.agent_model).hint_text("CLI default").desired_width(200.0));
-                });
-            });
+            ui.label("Agent and model");
+            ui.add_enabled_ui(!running, |ui| super::settings::agent_picker(app, ui, "agent-tab"));
             ui.collapsing("Guardrails", |ui| {
                 ui.label(RichText::new(
                     "The agent prefers vendor internet downloads; software dropbox is a last resort. It may only write \
@@ -299,6 +268,19 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             app.view = View::TestBench;
             app.run_steps(&[Step::Lint, Step::Schema, Step::DryRun]);
         }
+    }
+    if let Some((id, label)) = app.agent.request.clone() {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Tracked under Requests as").weak());
+            if ui.link(&label).on_hover_text("Its status and test results are kept there.").clicked() {
+                if app.batch.busy(app) && app.batch.batch.as_ref().is_none_or(|b| b.id != id) {
+                    app.error("Finish or cancel the active run before switching requests.");
+                } else {
+                    super::batch::open_saved(app, &Batch::root().join(&id));
+                    app.view = View::Batch;
+                }
+            }
+        });
     }
     match app.agent.job.and_then(|j| app.job_mut(j)) {
         Some(job) => job_log(ui, &mut job.proc, "agent"),

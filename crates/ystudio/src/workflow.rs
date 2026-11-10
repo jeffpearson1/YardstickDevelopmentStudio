@@ -183,6 +183,14 @@ fn recipe_path(app: &StudioApp, id: &str, repair: bool) -> Option<PathBuf> {
     })
 }
 
+/// Whether an agent or a check run is working on an item of `batch_id`.
+pub fn works_on(app: &StudioApp, batch_id: &str) -> bool {
+    let agent = app.jobs.iter().any(|j| {
+        j.proc.is_running() && matches!(&j.kind, JobKind::Agent { batch_item: Some((b, _)), .. } if b == batch_id)
+    });
+    agent || app.workflow.run.as_ref().is_some_and(|r| std::iter::once(&r.current).chain(&r.queue).any(|t| t.items.iter().any(|(b, _)| b == batch_id)))
+}
+
 pub fn task_id(task: &AgentTask) -> Option<String> {
     match task {
         AgentTask::Create { app, id_hint, .. } => Some(if id_hint.trim().is_empty() {
@@ -483,8 +491,11 @@ pub fn harness_finished(app: &mut StudioApp, step: Step, id: &str, ok: bool, sta
     } else { StepState::Fail });
     if let Some(run) = run {
         app.workflow.run.as_mut().unwrap().summary_dir = Some(run.dir.clone());
-        app.bench.last_run = Some(run);
         app.refresh_runs();
+        if passed && step == Step::Live {
+            app.record_validation(id, started, &run);
+        }
+        app.bench.last_run = Some(run);
     }
     if app.workflow.run.as_ref().is_some_and(|r| r.cancelled) {
         finish(app, false, "Cancelled; live-test cleanup may need manual review.".into());
@@ -795,6 +806,13 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         assert_eq!(saved.items[1].status, ystudio_core::intake::ItemStatus::Failed);
         assert_eq!(saved.items[2].status, ystudio_core::intake::ItemStatus::Done);
         assert!(saved.items[2].checks[0].passed);
+        // The passing live run is recorded against the recipe's contents.
+        assert!(app.completion("app").is_complete());
+        assert!(!app.completion("broken").is_complete());
+        let recipe = dir.path().join(r"Recipes\Development\app.yaml");
+        std::fs::write(&recipe, std::fs::read_to_string(&recipe).unwrap() + "notes: edited\n").unwrap();
+        app.refresh_recipes();
+        assert!(matches!(app.completion("app"), ystudio_core::validation::Completion::Changed(_)));
         assert!(saved.items[2].checks[0].summary_dir.as_ref().unwrap().is_dir());
         assert!(saved.report().contains("app: Validated"));
         assert!(saved.items[2].checks[0].note.contains("live test elevated"), "{}", saved.items[2].checks[0].note);
@@ -997,8 +1015,8 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         assert!(app.workflow.request.is_some());
         assert!(app.jobs.is_empty());
         app.workflow.request = None;
+        app.open_recipe_by_id("app");
         app.view = crate::app::View::Agent;
-        app.agent.app_name = "App".into();
         render(&mut app, "agent-narrow", 900, 600);
         app.view = crate::app::View::Batch;
         app.settings.dark_mode = false;
@@ -1021,5 +1039,247 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         app.workflow.message = "app: waiting for UAC approval to run the system-context live test".into();
         render(&mut app, "elevation-waiting", 1400, 900);
         app.workflow.run = None;
+    }
+
+    #[test]
+    fn settings_update_banner_current_icon_and_completion_render() {
+        let (dir, mut app) = fake_app();
+        let icon = image::RgbaImage::from_fn(64, 64, |x, y| image::Rgba([40, 120 + (x * 2) as u8, 200 - (y * 2) as u8, 255]));
+        icon.save(dir.path().join(r"Icons\app.png")).unwrap();
+        let ws = app.ws.clone().unwrap();
+        let mut ledger = ystudio_core::validation::Ledger::load(&ws.layout.harness_artifacts);
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        assert!(ledger.record("app", &ws.development_recipe_path("app"), later, results::Verdict::Validated, "2026-11-09 10:00:00", None).unwrap());
+        ledger.save().unwrap();
+        app.refresh_runs();
+        assert!(app.completion("app").is_complete());
+
+        app.update.status = crate::views::update::Status::Available(ystudio_core::update::Release {
+            version: "9.9.9".into(), notes: "Big release".into(), html_url: String::new(),
+            asset_name: "x.msi".into(), asset_url: String::new(), size: 1, sha256: None,
+        });
+        app.view = crate::app::View::Recipes;
+        render(&mut app, "recipes-complete-update-banner", 1400, 900);
+        app.view = crate::app::View::Settings;
+        render(&mut app, "settings", 1400, 1100);
+        render(&mut app, "settings-narrow", 900, 600);
+        crate::views::icons::prepare_for_recipe(&mut app, "app");
+        app.icons.auto_search = false;
+        app.view = crate::app::View::Icons;
+        render(&mut app, "icons-current", 1400, 900);
+        std::fs::remove_file(dir.path().join(r"Icons\app.png")).unwrap();
+        render(&mut app, "icons-current-missing", 1400, 900);
+    }
+
+    #[test]
+    fn launcher_recipe_tabs_and_studio_made_requests_render() {
+        let (dir, mut app) = fake_app();
+        std::fs::create_dir_all(dir.path().join(r".claude\skills\yardstick-recipes")).unwrap();
+        std::fs::write(dir.path().join(r".claude\skills\yardstick-recipes\SKILL.md"), "# skill").unwrap();
+        app.refresh_recipes();
+        app.view = crate::app::View::Home;
+        render(&mut app, "home-launcher", 1400, 1000);
+        render(&mut app, "home-launcher-narrow", 900, 700);
+
+        // Every page of the open recipe shares its header and tabs.
+        assert!(app.open_recipe_by_id("app"));
+        for (view, _, name) in crate::views::RECIPE_TABS {
+            crate::views::open_recipe_tab(&mut app, view);
+            app.icons.auto_search = false;
+            render(&mut app, &format!("recipe-tab-{}", name.to_lowercase()), 1400, 900);
+        }
+        assert_eq!(app.icons.recipe_id.as_deref(), Some("app"));
+        assert_eq!(app.agent.target_id, "app");
+
+        app.view = crate::app::View::Recipes;
+        app.library.selecting = true;
+        app.library.picked.extend(["app".to_string(), "user".to_string()]);
+        render(&mut app, "library-update-several", 1400, 900);
+        let items = crate::views::batch::update_items(&app, &["app".into(), "user".into()], "vendor moved");
+        assert_eq!(items[0].app, "App");
+        assert!(items.iter().all(|i| i.request == ystudio_core::intake::RequestKind::Update && i.notes == "vendor moved"));
+        assert_eq!(items[1].existing_recipe, "user");
+
+        app.library.selecting = false;
+        app.library.new_open = true;
+        app.library.new_display = "Obsidian".into();
+        app.library.new_id = "obsidian".into();
+        render(&mut app, "new-recipe-dialog", 1400, 900);
+        app.library.new_open = false;
+        app.batch.paste = Some("Notepad++\n7-Zip 24.08".into());
+        render(&mut app, "paste-requests", 1400, 900);
+        app.batch.paste = None;
+
+        // A new recipe is a one-item request that goes straight to authoring.
+        let mut batch = ystudio_core::intake::Batch::from_items("new Obsidian", vec![ystudio_core::intake::BatchItem {
+            app: "Obsidian".into(), suggested_id: "obsidian".into(), ..Default::default()
+        }]);
+        batch.id = dir.path().join("made-batch").to_string_lossy().into_owned();
+        assert!(crate::views::batch::open_made(&mut app, batch));
+        assert_eq!(app.view, crate::app::View::Batch);
+        request(&mut app, Request::BatchAuthor(vec![0]));
+        assert!(app.workflow.request.is_some() && app.jobs.is_empty());
+        render(&mut app, "requests-new-recipe-consent", 1400, 900);
+        app.workflow.request = None;
+        render(&mut app, "requests-new-recipe", 1400, 900);
+    }
+
+    #[test]
+    fn publish_pushes_a_branch_and_offers_the_compare_page() {
+        let Ok(git_exe) = ystudio_core::git::git_exe() else { return };
+        let (dir, mut app) = fake_app();
+        let root = dir.path().to_path_buf();
+        let origin = tempfile::tempdir().unwrap();
+        let g = |cwd: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new(&git_exe).args(args).current_dir(cwd).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        g(origin.path(), &["init", "--bare", "-b", "main"]);
+        std::fs::write(root.join(".gitignore"), "/Recipes/Development/*\n/Icons/*\n/Artifacts/\n").unwrap();
+        g(&root, &["init", "-b", "main"]);
+        g(&root, &["config", "user.name", "Studio Test"]);
+        g(&root, &["config", "user.email", "studio@example.com"]);
+        g(&root, &["add", "-A"]);
+        g(&root, &["commit", "-m", "base"]);
+        g(&root, &["remote", "add", "origin", &origin.path().to_string_lossy()]);
+        g(&root, &["push", "-u", "origin", "main"]);
+        g(&root, &["remote", "set-head", "origin", "main"]);
+
+        app.view = crate::app::View::Promote;
+        render(&mut app, "publish-local-remote", 1400, 900);
+        // The bare remote has no GitHub address; point the view at one.
+        app.promote.repo = Some((root.clone(), Ok(ystudio_core::promote::Repo {
+            remote_url: origin.path().to_string_lossy().into_owned(), web_url: "https://github.com/o/r".into(), base: "main".into(),
+        }), None));
+        app.promote.selected.insert("app".into());
+        render(&mut app, "publish", 1400, 900);
+        app.promote.modal = true;
+        render(&mut app, "publish-confirm", 1400, 900);
+        app.promote.modal = false;
+
+        crate::views::promote::start(&mut app, &["app".to_string()]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while app.promote.running() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            app.poll_for_tests();
+            crate::views::promote::poll(&mut app);
+        }
+        assert_eq!(app.promote.prompts.len(), 1, "{:?}", app.jobs.last().map(|j| j.proc.text()));
+        assert_eq!(app.promote.prompts[0].1.url(), "https://github.com/o/r/compare/main...studio/app?expand=1");
+        assert!(app.promote.selected.is_empty());
+        let shipped = std::process::Command::new(&git_exe).args(["show", "studio/app:Recipes/app.yaml"]).current_dir(origin.path()).output().unwrap();
+        assert!(String::from_utf8_lossy(&shipped.stdout).contains("id: app"));
+        // Never tested here, so the evidence says so and Yardstick's check will ask for a test or a waiver.
+        let evidence = std::process::Command::new(&git_exe).args(["show", "studio/app:Tests/RecipeEvidence/app.json"]).current_dir(origin.path()).output().unwrap();
+        let evidence: serde_json::Value = serde_json::from_slice(&evidence.stdout).unwrap();
+        assert_eq!((evidence["recipePath"].as_str(), evidence["validated"].as_bool()), (Some("Recipes/app.yaml"), Some(false)));
+        render(&mut app, "publish-browser-prompt", 1400, 900);
+    }
+
+    /// Runs from a recipe's Agent tab are tracked as requests and re-run as asked.
+    #[test]
+    fn agent_tab_runs_become_requests_that_repeat_the_task() {
+        let (dir, mut app) = fake_app();
+        assert!(app.open_recipe_by_id("app"));
+        crate::views::open_recipe_tab(&mut app, crate::app::View::Agent);
+        let fix = AgentTask::Fix { id: "app".into(), evidence: "MSI 1603 in the install log".into(), notes: "x64 only".into() };
+        let review = AgentTask::Review { id: "app".into() };
+        let tracked = crate::views::agent::tracking_request(&app, &fix).unwrap();
+        assert_eq!(crate::views::home::request_label(&tracked), "fix app");
+        assert_eq!(tracked.items[0].app, "App");
+        assert_eq!(crate::views::batch::task_for(&app, &tracked, 0), Some(fix.clone()));
+
+        let mut items = tracked.items.clone();
+        items.extend(crate::views::agent::tracking_request(&app, &review).unwrap().items);
+        let mut batch = ystudio_core::intake::Batch::from_items("agent tab runs", items);
+        batch.id = dir.path().join("agent-tab-runs").to_string_lossy().into_owned();
+        let batch_id = batch.id.clone();
+        assert!(crate::views::batch::open_made(&mut app, batch));
+        assert_eq!(crate::views::batch::task_for(&app, app.batch.batch.as_ref().unwrap(), 1), Some(review));
+        // Both finish without checks: the fix wrote the recipe, the review only read it.
+        app.agent.reported = vec!["app".into()];
+        crate::views::batch::agent_finished(&mut app, &batch_id, 0, true, false);
+        crate::views::batch::agent_finished(&mut app, &batch_id, 1, true, false);
+        let saved = ystudio_core::intake::Batch::load(std::path::Path::new(&batch_id)).unwrap();
+        assert!(saved.items.iter().all(|i| i.status == ystudio_core::intake::ItemStatus::Done));
+        assert_eq!(saved.items[1].action, ystudio_core::intake::ItemAction::Review);
+        app.batch.selected = Some(0);
+        render(&mut app, "requests-agent-tab-runs", 1400, 900);
+    }
+
+    /// The wizard against a stand-in Install-Yardstick.ps1 that follows the
+    /// installer's -Status / -ResultPath contract.
+    #[test]
+    fn setup_wizard_reads_status_and_runs_development_only_setup() {
+        if ystudio_core::setup::pwsh7(None).is_none() {
+            return;
+        }
+        let (dir, mut app) = fake_app();
+        let root = dir.path();
+        std::fs::write(root.join("status.fake.json"), r#"{
+          "schemaVersion": 1, "powerShellVersion": "7.6.9", "powershellYaml": { "installed": true, "version": "0.4.12" },
+          "optionalModules": [
+            { "name": "Selenium", "purpose": "recipes that drive a browser", "usedByRecipes": true, "minimumVersion": "4.0.0-preview3", "installedVersion": null, "isCurrent": false },
+            { "name": "TUN.CredentialManager", "purpose": "recipes that sign in to a vendor portal", "usedByRecipes": true, "minimumVersion": null, "installedVersion": "3.0.2", "isCurrent": true },
+            { "name": "Pester", "purpose": "running the unit tests in Tests\\Unit", "usedByRecipes": false, "minimumVersion": "5.0.0", "installedVersion": null, "isCurrent": false }
+          ],
+          "executionPolicy": { "policy": "Restricted", "scope": "CurrentUser", "groupPolicy": false, "allowsScripts": false },
+          "preferences": { "exists": false, "path": "x", "readError": null, "developmentOnly": false, "sharedIcons": "", "sharedRecipeOverrides": "", "syncSharedContent": false },
+          "unwritablePaths": { "count": 2, "examples": ["C:\\x\\Tools"] },
+          "intuneWinAppUtil": { "present": false, "path": "x" }
+        }"#).unwrap();
+        std::fs::write(root.join("result.fake.json"), r#"{
+          "schemaVersion": 1, "succeeded": true, "developmentOnly": true,
+          "steps": [
+            { "step": "Prerequisites", "result": "Done", "level": "OK", "detail": "" },
+            { "step": "Preferences", "result": "Done", "level": "OK", "detail": "" },
+            { "step": "AppRegistration", "result": "Skipped", "level": "Skip", "detail": "development-only instance" },
+            { "step": "Verify", "result": "Problems found", "level": "Warn", "detail": "" }
+          ],
+          "messages": [ { "step": "Verify", "level": "Warn", "message": "225 recipe icon(s) missing" } ]
+        }"#).unwrap();
+        let trace = harness::ps_quote(&root.join("setup-trace.txt").to_string_lossy());
+        std::fs::write(root.join("Install-Yardstick.ps1"), format!(r#"
+param([switch]$Status, [string]$ResultPath, [switch]$DevelopmentOnly, [switch]$NonInteractive,
+      [string]$SharedIcons, [string]$SharedRecipeOverrides, [string[]]$InstallOptionalModule, [switch]$SetExecutionPolicy)
+if ($Status) {{ Copy-Item (Join-Path $PSScriptRoot 'status.fake.json') $ResultPath; exit 0 }}
+Add-Content -LiteralPath {trace} -Value "dev=$DevelopmentOnly ni=$NonInteractive modules=$($InstallOptionalModule -join '+') policy=$SetExecutionPolicy icons=[$SharedIcons]"
+New-Item -ItemType Directory -Force (Join-Path $PSScriptRoot 'Local') | Out-Null
+Set-Content (Join-Path $PSScriptRoot 'Local\preferences.yaml') 'developmentOnly: true'
+Copy-Item (Join-Path $PSScriptRoot 'result.fake.json') $ResultPath
+"#)).unwrap();
+        app.reload_workspace();
+        assert_eq!(app.ws.as_ref().unwrap().kind, ystudio_core::workspace::WorkspaceKind::Unconfigured);
+
+        crate::views::setup::open(&mut app, crate::views::setup::Step::Workspace);
+        render(&mut app, "setup-workspace", 1400, 900);
+        app.setup.step = crate::views::setup::Step::Tools;
+        render(&mut app, "setup-tools", 1400, 900);
+
+        // Entering the Yardstick step reads the status in the background.
+        app.setup.step = crate::views::setup::Step::Yardstick;
+        render(&mut app, "setup-checking", 1400, 900);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while app.setup.status_for_tests().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            app.poll_for_tests();
+        }
+        assert!(app.setup.status_for_tests().is_some(), "{:?}", app.jobs.last().map(|j| j.proc.text()));
+        // Pre-filled: the missing recipe module, not the unit-test one; fix the policy.
+        assert_eq!(app.setup.answers_for_tests(), (vec!["Selenium".to_string()], true));
+        render(&mut app, "setup-yardstick", 1400, 1000);
+
+        crate::views::setup::run_setup(&mut app);
+        while app.setup.result_for_tests().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            app.poll_for_tests();
+        }
+        let trace = std::fs::read_to_string(root.join("setup-trace.txt")).unwrap();
+        assert_eq!(trace.trim(), "dev=True ni=True modules=Selenium policy=True icons=[]");
+        assert!(matches!(app.setup.result_for_tests(), Some(Ok(r)) if r.succeeded));
+        assert_eq!(app.ws.as_ref().unwrap().kind, ystudio_core::workspace::WorkspaceKind::Development);
+        render(&mut app, "setup-finished", 1400, 1000);
+        app.setup.step = crate::views::setup::Step::Done;
+        render(&mut app, "setup-done", 1400, 900);
     }
 }

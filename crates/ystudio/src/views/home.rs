@@ -1,12 +1,13 @@
-//! Home: workspace status, the production guard, creating a development
-//! workspace, environment checks and settings.
+//! Home: what to do next - continue a request, import one, write a new
+//! recipe, edit one, or update several - plus the workspace and creating a
+//! development clone.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText, Ui};
-use ystudio_core::agent::AgentBackend;
-use ystudio_core::{git, harness};
-use ystudio_core::process::which;
+use ystudio_core::intake::Batch;
+use ystudio_core::git;
 use ystudio_core::settings::Settings;
 use ystudio_core::workspace::WorkspaceKind;
 
@@ -16,17 +17,23 @@ use crate::theme::{self, FluentText as _};
 pub struct HomeState {
     pub clone_dest: String,
     pub clone_url: String,
-    pub production_text: String,
-    pub trusted_text: String,
-    pub pwsh_text: String,
-    tools: Option<Vec<(&'static str, Option<PathBuf>, &'static str)>>,
     /// Whether `clone_dest` is a production path, keyed by the inputs (canonicalizing hits the disk).
     prod_check: Option<(String, Vec<PathBuf>, bool)>,
+    /// "Edit a recipe" search text.
+    edit_filter: String,
+    /// Saved requests with work left, re-read every few seconds.
+    recent: Option<(Instant, Vec<Recent>)>,
+}
+
+struct Recent {
+    dir: PathBuf,
+    label: String,
+    open: usize,
+    total: usize,
 }
 
 impl HomeState {
     pub fn new(settings: &Settings) -> Self {
-        let lines = |v: &[PathBuf]| v.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n");
         let dest = settings
             .primary_production()
             .and_then(|p| p.parent())
@@ -35,19 +42,12 @@ impl HomeState {
         Self {
             clone_dest: dest.display().to_string(),
             clone_url: settings.repo_url.clone(),
-            production_text: lines(&settings.production_paths),
-            trusted_text: lines(&settings.trusted_dev_paths),
-            pwsh_text: settings.powershell_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
-            tools: None,
             prod_check: None,
+            edit_filter: String::new(),
+            recent: None,
         }
     }
 }
-
-fn parse_lines(text: &str) -> Vec<PathBuf> {
-    text.lines().map(str::trim).filter(|l| !l.is_empty()).map(PathBuf::from).collect()
-}
-
 
 /// Vertical rhythm inside a card: heading to content, and content to actions.
 const GROUP_GAP: f32 = 12.0;
@@ -57,63 +57,223 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         theme::page_title(ui, "Yardstick Development Studio");
         ui.label(RichText::new("Design, test and agentically author Yardstick recipes - without ever touching production.").weak());
         ui.add_space(20.0);
-        journey(app, ui);
-        ui.add_space(theme::CARD_GAP);
+        if app.ws.is_some() {
+            launcher(app, ui);
+            ui.add_space(theme::CARD_GAP);
+        }
         workspace_card(app, ui);
         ui.add_space(theme::CARD_GAP);
-        theme::card_row(
-            ui,
-            app,
-            "home-setup",
-            2,
-            |app, i, ui| if i == 0 { create_body(app, ui) } else { environment_body(app, ui) },
-            |app, i, ui| if i == 0 { create_footer(app, ui) } else { environment_footer(app, ui) },
-        );
-        ui.add_space(theme::CARD_GAP);
-        settings_card(app, ui);
-        ui.add_space(theme::CARD_GAP);
-        theme::card(ui, |ui| super::update::card(app, ui));
+        if app.writable() {
+            egui::CollapsingHeader::new("Create another development workspace").id_salt("home-create").show(ui, |ui| {
+                theme::card(ui, |ui| {
+                    create_body(app, ui);
+                    ui.add_space(GROUP_GAP - 6.0);
+                    create_footer(app, ui);
+                });
+            });
+        } else {
+            theme::card(ui, |ui| {
+                create_body(app, ui);
+                ui.add_space(GROUP_GAP - 6.0);
+                create_footer(app, ui);
+            });
+        }
         ui.add_space(8.0);
     });
 }
 
-const STEPS: [(&str, &str, &str, View); 4] = [
-    ("1", "Design", "Step through every recipe field with guidance from the skill, or edit YAML with live lint.", View::Recipes),
-    ("2", "Test", "Lint → schema → lab download → dry run → live install test, with verdicts.", View::TestBench),
-    ("3", "Delegate", "Have Copilot CLI write, fix or review recipes using the yardstick-recipes skill.", View::Agent),
-    ("4", "Promote", "Publish validated recipes to production with Publish-Yardstick.", View::Promote),
+/// A request's name: the file it came from, or what the Studio called it.
+pub fn request_label(b: &Batch) -> String {
+    b.source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| b.id.clone())
+}
+
+/// Up to three other saved requests that still have items to do, newest first.
+fn recent_requests(app: &mut StudioApp) -> &[Recent] {
+    let stale = app.home.recent.as_ref().is_none_or(|(at, _)| at.elapsed() > Duration::from_secs(3));
+    if stale {
+        let current = app.batch.batch.as_ref().map(|b| b.id.clone());
+        let list = Batch::list()
+            .into_iter()
+            .filter(|(name, _)| current.as_deref() != Some(name.as_str()))
+            .filter_map(|(_, dir)| {
+                let b = Batch::load(&dir).ok()?;
+                let open = b.open_items();
+                (open > 0).then(|| Recent { label: request_label(&b), open, total: b.items.len(), dir })
+            })
+            .take(3)
+            .collect();
+        app.home.recent = Some((Instant::now(), list));
+    }
+    &app.home.recent.as_ref().unwrap().1
+}
+
+const ACTIONS: [(&str, &str, &str); 5] = [
+    (theme::icon::INBOX, "Continue", "Pick up a request where you left off."),
+    (theme::icon::UPLOAD, "Import requests", "A ticket export, spreadsheet, email or pasted list. The Studio finds the software in it and matches existing recipes."),
+    (theme::icon::ROBOT, "New recipe", "Name the app: the agent researches, writes, tests and repairs it. Or start from a template yourself."),
+    (theme::icon::EDIT, "Edit a recipe", ""),
+    (theme::icon::LIBRARY, "Update several recipes", "Re-test, repair or bring a set of recipes up to date together - for example after a vendor changes its downloads."),
 ];
 
-fn journey(app: &mut StudioApp, ui: &mut Ui) {
+fn action_title(ui: &mut Ui, i: usize) {
+    let (icon, title, text) = ACTIONS[i];
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(icon).family(egui::FontFamily::Name(theme::ICONS.into())).size(18.0).color(theme::accent()));
+        ui.label(RichText::new(title).size(16.0).semibold());
+    });
+    if !text.is_empty() {
+        ui.add_space(2.0);
+        ui.label(RichText::new(text).weak());
+    }
+}
+
+fn launcher(app: &mut StudioApp, ui: &mut Ui) {
     theme::card_row(
         ui,
         app,
-        "home-journey",
-        STEPS.len(),
-        |_, i, ui| {
-            let (n, title, text, _) = STEPS[i];
-            ui.horizontal(|ui| {
-                theme::badge(ui, n, theme::accent());
-                ui.label(RichText::new(title).size(16.0).semibold());
-            });
-            ui.add_space(2.0);
-            ui.label(RichText::new(text).weak());
+        "home-actions-1",
+        3,
+        |app, i, ui| {
+            action_title(ui, i);
+            if i == 0 {
+                continue_body(app, ui);
+            }
         },
         |app, i, ui| {
-            let (_, title, _, view) = STEPS[i];
             ui.add_space(GROUP_GAP - 4.0);
-            if ui.button(format!("Open {title}")).clicked() {
-                app.view = view;
+            let busy = app.batch.busy(app);
+            match i {
+                0 => {
+                    let newest = app.home.recent.as_ref().and_then(|(_, v)| v.first()).map(|r| r.dir.clone());
+                    let current = app.batch.batch.is_some();
+                    if ui.add_enabled(current || newest.is_some(), egui::Button::new("Continue")).clicked() {
+                        match newest.filter(|_| !current) {
+                            Some(dir) if !busy => {
+                                super::batch::open_saved(app, &dir);
+                                app.home.recent = None;
+                            }
+                            _ => {}
+                        }
+                        app.view = View::Batch;
+                    }
+                }
+                1 => {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add_enabled(!busy, egui::Button::new("\u{E838}  Open a file…")).clicked()
+                            && let Some(p) = rfd::FileDialog::new()
+                                .add_filter("Request lists", ystudio_core::intake::EXTENSIONS)
+                                .add_filter("All files", &["*"])
+                                .pick_file()
+                        {
+                            super::batch::open_file(app, &p);
+                            app.view = View::Batch;
+                        }
+                        if ui.add_enabled(!busy, egui::Button::new("\u{E77F}  Paste text…")).clicked() {
+                            app.batch.paste = Some(String::new());
+                        }
+                    });
+                }
+                _ => {
+                    if theme::primary(ui, app.writable(), "\u{E710}  New recipe…").clicked() {
+                        app.library.new_open = true;
+                    }
+                }
             }
         },
     );
+    ui.add_space(theme::CARD_GAP);
+    theme::card_row(
+        ui,
+        app,
+        "home-actions-2",
+        2,
+        |app, i, ui| {
+            action_title(ui, i + 3);
+            if i == 0 {
+                edit_body(app, ui);
+            }
+        },
+        |app, i, ui| {
+            ui.add_space(GROUP_GAP - 4.0);
+            if i == 0 {
+                if ui.button("Browse all recipes").clicked() {
+                    app.view = View::Recipes;
+                }
+            } else if ui.add_enabled(app.writable(), egui::Button::new("Choose recipes…")).clicked() {
+                app.library.selecting = true;
+                app.view = View::Recipes;
+            }
+        },
+    );
+}
+
+fn continue_body(app: &mut StudioApp, ui: &mut Ui) {
+    ui.add_space(4.0);
+    if let Some(b) = &app.batch.batch {
+        ui.label(RichText::new(format!("Open: {}", request_label(b))).semibold());
+        ui.label(RichText::new(format!("{} of {} item(s) still to do", b.open_items(), b.items.len())).small().weak());
+    }
+    let mut open = None;
+    for r in recent_requests(app) {
+        if ui.link(format!("{}  ·  {} of {} to do", r.label, r.open, r.total)).clicked() {
+            open = Some(r.dir.clone());
+        }
+    }
+    if app.batch.batch.is_none() && app.home.recent.as_ref().is_some_and(|(_, v)| v.is_empty()) {
+        ui.label(RichText::new("Nothing in progress.").weak());
+    }
+    if let Some(dir) = open {
+        if app.batch.busy(app) {
+            app.error("Finish or cancel the active run before switching requests.");
+        } else {
+            super::batch::open_saved(app, &dir);
+            app.view = View::Batch;
+            app.home.recent = None;
+        }
+    }
+}
+
+fn edit_body(app: &mut StudioApp, ui: &mut Ui) {
+    ui.add_space(4.0);
+    let resp = ui.add(egui::TextEdit::singleline(&mut app.home.edit_filter).hint_text("Find a recipe by id or name…").desired_width(f32::INFINITY));
+    let needle = app.home.edit_filter.trim().to_lowercase();
+    if needle.is_empty() {
+        return;
+    }
+    let matches: Vec<(String, PathBuf)> = app
+        .recipes
+        .iter()
+        .filter(|r| r.id.to_lowercase().contains(&needle) || r.meta.display_name.to_lowercase().contains(&needle))
+        .take(6)
+        .map(|r| (r.id.clone(), r.path.clone()))
+        .collect();
+    let mut open = None;
+    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        open = matches.first().map(|m| m.1.clone());
+    }
+    for (id, path) in &matches {
+        ui.horizontal(|ui| {
+            if ui.link(RichText::new(id).monospace()).clicked() {
+                open = Some(path.clone());
+            }
+            super::recipe_status_badge(app, ui, id);
+        });
+    }
+    if matches.is_empty() {
+        ui.label(RichText::new("No recipe matches.").weak());
+    }
+    if let Some(p) = open {
+        app.request_open_recipe(p);
+        app.view = View::Designer;
+        app.home.edit_filter.clear();
+    }
 }
 
 fn workspace_card(app: &mut StudioApp, ui: &mut Ui) {
     theme::card(ui, |ui| {
         theme::section_heading(ui, "Workspace");
         let mut open = None;
-        let mut status_msg: Option<String> = None;
+        let mut setup = false;
         match &app.ws {
             Some(ws) => {
                 ui.horizontal(|ui| {
@@ -137,16 +297,11 @@ fn workspace_card(app: &mut StudioApp, ui: &mut Ui) {
                         theme::banner(ui, theme::amber(), |ui| {
                             ui.label(RichText::new("Not set up for testing yet").semibold().color(theme::amber()));
                             ui.label(
-                                "This clone has no Local\\preferences.yaml. Run Install-Yardstick -DevelopmentOnly to install \
-                                 the PowerShell modules and mark it as development-only (no Intune connection).",
+                                "This clone has no Local\\preferences.yaml yet. Setup marks it development-only (no Intune \
+                                 connection) and installs what the recipe harness needs.",
                             );
-                            if ui.button("\u{E768}  Run Install-Yardstick -DevelopmentOnly (new console)").clicked() {
-                                status_msg = Some(
-                                    match harness::install_development_only(ws, &app.pwsh()).and_then(|s| ystudio_core::process::launch_detached(&s)) {
-                                        Ok(()) => "Installer opened in a new console. Reload the workspace when it finishes.".to_string(),
-                                        Err(e) => format!("{e:#}"),
-                                    },
-                                );
+                            if ui.button("\u{E768}  Set up this clone…").clicked() {
+                                setup = true;
                             }
                         });
                     }
@@ -184,7 +339,8 @@ fn workspace_card(app: &mut StudioApp, ui: &mut Ui) {
                     super::open_in_explorer(&ws.root);
                 }
                 if !ws.is_writable() && ui.button("Trust as development…").on_hover_text("Only for full installs you are certain are scratch machines.").clicked() {
-                    app.home.trusted_text = format!("{}\n{}", app.home.trusted_text, ws.root.display()).trim().to_string();
+                    app.settings_ui.add_trusted(&ws.root);
+                    app.view = View::Settings;
                 }
             }
         });
@@ -200,8 +356,8 @@ fn workspace_card(app: &mut StudioApp, ui: &mut Ui) {
                 }
             });
         }
-        if let Some(msg) = status_msg {
-            app.notify(msg);
+        if setup {
+            super::setup::open(app, super::setup::Step::Yardstick);
         }
         if let Some(p) = open {
             app.open_workspace(&p);
@@ -209,29 +365,11 @@ fn workspace_card(app: &mut StudioApp, ui: &mut Ui) {
     });
 }
 
-/// Width of the label column in the settings form.
-const LABEL_WIDTH: f32 = 200.0;
-
-/// A form row: a fixed-width label aligned with the first line of its field.
-fn form_row<R>(ui: &mut Ui, label: &str, hover: Option<&str>, field: impl FnOnce(&mut Ui) -> R) -> R {
-    ui.horizontal_top(|ui| {
-        ui.allocate_ui_with_layout(egui::vec2(LABEL_WIDTH, 28.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.set_width(LABEL_WIDTH);
-            let r = ui.label(label);
-            if let Some(h) = hover {
-                r.on_hover_text(h);
-            }
-        });
-        ui.vertical(|ui| field(ui)).inner
-    })
-    .inner
-}
-
-fn create_body(app: &mut StudioApp, ui: &mut Ui) {
+pub(crate) fn create_body(app: &mut StudioApp, ui: &mut Ui) {
     theme::section_heading(ui, "Create a development workspace");
     ui.label(RichText::new(
-        "Clones Yardstick from GitHub, copies icons from production (they are not in Git), then opens the clone. \
-         Finish by running Install-Yardstick -DevelopmentOnly so tests run without an Intune connection.",
+        "Clones Yardstick from GitHub, copies icons from production (they are not in Git), then opens the clone \
+         and sets it up for development, so tests run without an Intune connection.",
     ).weak());
     ui.add_space(GROUP_GAP - 6.0);
     egui::Grid::new("clone-grid").num_columns(2).spacing([12.0, 8.0]).min_col_width(0.0).show(ui, |ui| {
@@ -251,7 +389,7 @@ fn create_body(app: &mut StudioApp, ui: &mut Ui) {
     });
 }
 
-fn create_footer(app: &mut StudioApp, ui: &mut Ui) {
+pub(crate) fn create_footer(app: &mut StudioApp, ui: &mut Ui) {
     let dest = PathBuf::from(app.home.clone_dest.trim());
     let stale = app.home.prod_check.as_ref().is_none_or(|(d, prods, _)| *d != app.home.clone_dest || *prods != app.settings.production_paths);
     if stale {
@@ -266,8 +404,10 @@ fn create_footer(app: &mut StudioApp, ui: &mut Ui) {
                 Ok(spec) => {
                     app.console_open = true;
                     app.start_job(spec, JobKind::Clone { dest });
+                    app.settings.repo_url = app.home.clone_url.trim().to_string();
+                    app.save_settings();
                     // The PATH may have been refreshed to find git.
-                    app.home.tools = None;
+                    app.settings_ui.tools = None;
                 }
                 Err(e) => app.error(format!("{e:#}")),
             }
@@ -279,115 +419,5 @@ fn create_footer(app: &mut StudioApp, ui: &mut Ui) {
             ui.spinner();
             ui.label("Cloning…");
         }
-    });
-}
-
-fn environment_body(app: &mut StudioApp, ui: &mut Ui) {
-    theme::section_heading(ui, "Environment");
-    let shell = app.pwsh();
-    let tools = app.home.tools.get_or_insert_with(|| {
-        vec![
-            ("pwsh", which("pwsh"), "PowerShell 7 (preferred for the harness)"),
-            ("powershell", which("powershell"), "Windows PowerShell 5.1"),
-            ("git", which("git"), "Cloning development workspaces"),
-            ("copilot", AgentBackend::CopilotCli.locate(), "GitHub Copilot CLI agent"),
-            ("claude", AgentBackend::ClaudeCode.locate(), "Claude Code agent (optional)"),
-            ("code", which("code"), "Open files in VS Code (optional)"),
-        ]
-    });
-    let name_width = 120.0;
-    let path_width = (ui.available_width() - name_width - 12.0).max(80.0);
-    let row = |ui: &mut Ui, glyph: &str, glyph_color: egui::Color32, name: &str, hover: &str, value: RichText, full: Option<&str>| {
-        ui.allocate_ui_with_layout(egui::vec2(name_width, 22.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.set_width(name_width);
-            ui.label(RichText::new(glyph).color(glyph_color));
-            ui.label(name).on_hover_text(hover);
-        });
-        ui.allocate_ui_with_layout(egui::vec2(path_width, 22.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            let r = ui.add(egui::Label::new(value).truncate());
-            if let Some(full) = full {
-                r.on_hover_text(full);
-            }
-        });
-        ui.end_row();
-    };
-    egui::Grid::new("env-grid").num_columns(2).spacing([12.0, 2.0]).min_col_width(0.0).show(ui, |ui| {
-        for (name, path, what) in tools.iter() {
-            match path {
-                Some(p) => {
-                    let full = p.display().to_string();
-                    row(ui, "\u{E73E}", theme::green(), name, what, RichText::new(&full).small().monospace(), Some(&full));
-                }
-                None => row(ui, "\u{E711}", theme::grey(), name, what, RichText::new(format!("Not found - {what}")).small().weak(), None),
-            }
-        }
-        let full = shell.display().to_string();
-        row(ui, "\u{E756}", theme::grey(), "Harness shell", "The PowerShell the Studio runs the harness with", RichText::new(&full).small().monospace(), Some(&full));
-    });
-}
-
-fn environment_footer(app: &mut StudioApp, ui: &mut Ui) {
-    if ui
-        .button("\u{E72C}  Re-check")
-        .on_hover_text("Reloads PATH from Windows, so tools installed since the Studio started (e.g. Git from Company Portal) are found.")
-        .clicked()
-    {
-        if let Err(e) = ystudio_core::process::refresh_path() {
-            app.error(format!("Could not reload PATH: {e:#}"));
-        }
-        app.home.tools = None;
-        app.refresh_git_status();
-    }
-}
-
-fn settings_card(app: &mut StudioApp, ui: &mut Ui) {
-    theme::card(ui, |ui| {
-        theme::section_heading(ui, "Settings");
-        ui.add_space(GROUP_GAP - 6.0);
-        ui.spacing_mut().item_spacing.y = 8.0;
-        form_row(ui, "Production folders", Some("Always read-only in the Studio; the first is the default promotion target."), |ui| {
-            ui.add(egui::TextEdit::multiline(&mut app.home.production_text).desired_rows(2).desired_width(f32::INFINITY));
-        });
-        form_row(ui, "Trusted development folders", Some("Full installs you have confirmed are scratch (rare)."), |ui| {
-            ui.add(egui::TextEdit::multiline(&mut app.home.trusted_text).desired_rows(2).desired_width(f32::INFINITY));
-        });
-        form_row(ui, "PowerShell executable", None, |ui| {
-            ui.add(egui::TextEdit::singleline(&mut app.home.pwsh_text).hint_text("auto (pwsh, then powershell)").desired_width(f32::INFINITY));
-        });
-        form_row(ui, "Theme", None, |ui| {
-            ui.horizontal(|ui| {
-                let before = app.settings.dark_mode;
-                ui.selectable_value(&mut app.settings.dark_mode, true, "\u{E708}  Dark");
-                ui.selectable_value(&mut app.settings.dark_mode, false, "\u{E706}  Light");
-                if before != app.settings.dark_mode {
-                    app.apply_theme(ui.ctx());
-                }
-            });
-        });
-        form_row(ui, "Editor font size", None, |ui| {
-            ui.add(egui::Slider::new(&mut app.settings.editor_font_size, 10.0..=22.0));
-        });
-        form_row(ui, "Editors", None, |ui| {
-            ui.checkbox(&mut app.settings.line_numbers, "Show line numbers");
-        });
-        form_row(ui, "On open and Refresh", Some("Production folders are never fetched or synced."), |ui| {
-            ui.checkbox(&mut app.settings.auto_git_fetch, "git fetch, and show how far behind the clone is");
-            ui.checkbox(&mut app.settings.auto_sync_shared, "Sync shared icons and recipe overrides (when syncSharedContent is on)");
-        });
-        ui.add_space(GROUP_GAP - 8.0);
-        ui.horizontal(|ui| {
-            if theme::primary(ui, true, "\u{E74E}  Apply settings").clicked() {
-                let prod = parse_lines(&app.home.production_text);
-                app.settings.production_paths = prod;
-                app.settings.trusted_dev_paths = parse_lines(&app.home.trusted_text);
-                let p = app.home.pwsh_text.trim();
-                app.settings.powershell_path = (!p.is_empty()).then(|| PathBuf::from(p));
-                app.settings.repo_url = app.home.clone_url.trim().to_string();
-                app.save_settings();
-                app.reload_workspace();
-                app.notify("Settings saved.");
-            }
-            ui.label(RichText::new(format!("Stored in {}", Settings::default_path().display())).small().weak());
-        });
     });
 }

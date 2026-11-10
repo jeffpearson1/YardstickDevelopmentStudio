@@ -175,6 +175,7 @@ pub mod icon {
     pub const CHART: &str = "\u{E9D2}";
     pub const BOOK: &str = "\u{E736}";
     pub const UPLOAD: &str = "\u{E898}";
+    pub const SETTINGS: &str = "\u{E713}";
     pub const CONSOLE: &str = "\u{E756}";
 }
 

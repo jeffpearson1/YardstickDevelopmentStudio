@@ -14,10 +14,10 @@ use std::time::SystemTime;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::process::{ProcessSpec, which};
+use crate::process::{ProcessSpec, find_program, launcher};
 use crate::workspace::Workspace;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum AgentBackend {
     #[default]
     CopilotCli,
@@ -41,9 +41,62 @@ impl AgentBackend {
         }
     }
 
-    pub fn locate(self) -> Option<PathBuf> {
-        which(self.executable())
+    /// Where the CLI's installers put it, in case PATH does not have it yet.
+    fn install_dirs(self) -> Vec<PathBuf> {
+        let local = dirs::data_local_dir().unwrap_or_default();
+        let npm = dirs::data_dir().unwrap_or_default().join("npm");
+        let winget = local.join(r"Microsoft\WinGet\Links");
+        match self {
+            AgentBackend::CopilotCli => vec![local.join("GitHubCopilotCLI"), winget, npm],
+            AgentBackend::ClaudeCode => vec![dirs::home_dir().unwrap_or_default().join(r".local\bin"), winget, npm],
+        }
     }
+
+    pub fn locate(self) -> Option<PathBuf> {
+        find_program(self.executable(), &self.install_dirs())
+    }
+
+    /// A process for this CLI, ready for arguments.
+    fn spec(self, label: impl Into<String>, cwd: &Path) -> Result<ProcessSpec> {
+        let exe = self.locate().ok_or_else(|| {
+            anyhow::anyhow!("{} (`{}`) was not found on PATH or in its usual install folders.", self.label(), self.executable())
+        })?;
+        let (program, prefix) = launcher(&exe)?;
+        Ok(ProcessSpec::new(label, program, cwd).args(prefix).env("NO_COLOR", "1"))
+    }
+
+    /// Models the CLI accepts for `--model`. Copilot CLI lists them in
+    /// `copilot help config`, so the list follows the installed version;
+    /// Claude Code has no such listing, so its stable aliases are offered.
+    /// Runs a process for Copilot CLI: call it off the UI thread.
+    pub fn models(self) -> Result<Vec<String>> {
+        match self {
+            AgentBackend::CopilotCli => {
+                let spec = self.spec("list models", &std::env::temp_dir())?.args(["help", "config"]);
+                let models = parse_copilot_models(&crate::process::run_capture(&spec)?);
+                if models.is_empty() {
+                    bail!("`copilot help config` listed no models.");
+                }
+                Ok(models)
+            }
+            AgentBackend::ClaudeCode => Ok(["opus", "sonnet", "haiku"].map(String::from).to_vec()),
+        }
+    }
+}
+
+/// The quoted values under the `model` setting in `copilot help config`.
+fn parse_copilot_models(help: &str) -> Vec<String> {
+    let mut lines = help.lines().skip_while(|l| !l.trim_start().starts_with("`model`:")).skip(1);
+    let mut models = Vec::new();
+    for line in lines.by_ref() {
+        let Some(item) = line.trim().strip_prefix("- ") else { break };
+        let value = item.trim().trim_matches('"');
+        if value.is_empty() || value.contains(char::is_whitespace) {
+            break;
+        }
+        models.push(value.to_string());
+    }
+    models
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -209,12 +262,9 @@ pub fn build_command(
     if !ws.has_skill() {
         bail!("This Yardstick folder has no .claude\\skills\\yardstick-recipes\\SKILL.md; update it from GitHub first.");
     }
-    let exe = backend.locate().ok_or_else(|| {
-        anyhow::anyhow!("{} (`{}`) was not found on PATH.", backend.label(), backend.executable())
-    })?;
     let prompt = full_prompt(ws, production_paths, task);
     let root = ws.root.to_string_lossy().into_owned();
-    let mut spec = ProcessSpec::new(task.title(), exe, &ws.root).env("NO_COLOR", "1");
+    let mut spec = backend.spec(task.title(), &ws.root)?;
     match backend {
         AgentBackend::CopilotCli => {
             spec = spec.args(["-p", &prompt, "--no-color", "--no-ask-user", "--stream", "on", "--add-dir", &root]);
@@ -274,12 +324,9 @@ pub fn extract_prompt(batch_dir: &Path) -> String {
 
 /// Agent invocation for batch extraction: confined to the batch folder, no shell.
 pub fn build_extract_command(backend: AgentBackend, model: &str, batch_dir: &Path) -> Result<ProcessSpec> {
-    let exe = backend.locate().ok_or_else(|| {
-        anyhow::anyhow!("{} (`{}`) was not found on PATH.", backend.label(), backend.executable())
-    })?;
     let prompt = extract_prompt(batch_dir);
     let dir = batch_dir.to_string_lossy().into_owned();
-    let mut spec = ProcessSpec::new("Extract software from request list", exe, batch_dir).env("NO_COLOR", "1");
+    let mut spec = backend.spec("Extract software from request list", batch_dir)?;
     match backend {
         AgentBackend::CopilotCli => {
             spec = spec.args(["-p", &prompt, "--no-color", "--no-ask-user", "--stream", "on", "--add-dir", &dir]);
@@ -469,6 +516,20 @@ mod tests {
         assert!(changes.contains(&Change::Added(ws.development_recipe_path("new"))));
         assert!(changes.contains(&Change::Modified(ws.development_recipe_path("brave"))));
         assert!(changes.iter().any(|c| matches!(c, Change::Removed(_))));
+    }
+
+    #[test]
+    fn parses_copilot_model_list() {
+        let help = "  `logLevel`: ...\n  `model`: AI model to use for Copilot CLI; can be changed with /model.\n    - \"claude-sonnet-5.5\"\n    - \"gpt-5.4\"\n\n  `contextTier`: tier\n    - \"default\"\n";
+        assert_eq!(parse_copilot_models(help), vec!["claude-sonnet-5.5", "gpt-5.4"]);
+        assert!(parse_copilot_models("no models here").is_empty());
+    }
+
+    #[test]
+    #[ignore = "runs the installed Copilot CLI"]
+    fn lists_installed_copilot_models() {
+        let models = AgentBackend::CopilotCli.models().unwrap();
+        assert!(models.len() > 3, "{models:?}");
     }
 
     #[test]

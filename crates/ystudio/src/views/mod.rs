@@ -8,12 +8,16 @@ pub mod icons;
 pub mod promote;
 pub mod recipes;
 pub mod runs;
+pub mod settings;
+pub mod setup;
 pub mod testbench;
 pub mod update;
 
 use eframe::egui::{self, RichText, Ui};
 
-use crate::app::StudioApp;
+use ystudio_core::workspace::RecipeLocation;
+
+use crate::app::{StudioApp, View};
 use crate::theme::{self, FluentText as _};
 
 /// Shows a placeholder when no workspace is open. Returns true if one is.
@@ -41,17 +45,122 @@ pub fn need_recipe(app: &mut StudioApp, ui: &mut Ui) -> bool {
     }
     ui.add_space(24.0);
     ui.label(RichText::new("No recipe is open.").heading());
-    ui.label(RichText::new("Pick one in the library, create one from a template, or ask the agent to write one.").weak());
+    ui.label(RichText::new("Pick one in the library, or start a new one - written by the agent or from a template.").weak());
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         if theme::primary(ui, true, format!("{}  Recipe library", theme::icon::LIBRARY)).clicked() {
             app.view = crate::app::View::Recipes;
         }
-        if ui.button(format!("{}  Agent", theme::icon::ROBOT)).clicked() {
-            app.view = crate::app::View::Agent;
+        if ui.add_enabled(app.writable(), egui::Button::new("\u{E710}  New recipe…")).clicked() {
+            app.library.new_open = true;
         }
     });
     false
+}
+
+/// Shows how far a recipe has got: complete (the tested contents, not yet
+/// published), changed since it was validated, or its latest test verdict.
+/// Returns false when there is nothing to show.
+pub fn recipe_status_badge(app: &StudioApp, ui: &mut Ui, id: &str) -> bool {
+    use ystudio_core::validation::Completion;
+    let development = app.recipes.iter().find(|r| r.id.eq_ignore_ascii_case(id))
+        .is_some_and(|r| r.location == ystudio_core::workspace::RecipeLocation::Development);
+    match app.completion(id) {
+        Completion::Complete(r) => {
+            let text = if development { "Complete · not published" } else { "Validated" };
+            let warn = if r.warnings { " with warnings" } else { "" };
+            theme::badge(ui, text, theme::green()).on_hover_text(format!("Passed its live install test{warn} on {}, and is unchanged since.", r.tested));
+        }
+        Completion::Changed(r) => {
+            theme::badge(ui, "Changed since validation", theme::amber())
+                .on_hover_text(format!("Passed its live install test on {}, but has been edited since. Run the live test again.", r.tested));
+        }
+        Completion::NotValidated => {
+            let Some((v, ts)) = app.verdicts.get(id) else { return false };
+            theme::badge(ui, v.label(), theme::verdict_color(*v)).on_hover_text(format!("Install test {ts}"));
+        }
+    }
+    true
+}
+
+/// The pages of the open recipe, shown as tabs under its header.
+pub const RECIPE_TABS: [(View, &str, &str); 5] = [
+    (View::Designer, theme::icon::EDIT, "Design"),
+    (View::Editor, theme::icon::CODE, "YAML"),
+    (View::TestBench, theme::icon::CHECKLIST, "Test"),
+    (View::Icons, theme::icon::PHOTO, "Icon"),
+    (View::Agent, theme::icon::ROBOT, "Agent"),
+];
+
+/// Shows one of the open recipe's pages, pointing the icon finder and the
+/// agent at it so every tab works on the same app.
+pub fn open_recipe_tab(app: &mut StudioApp, view: View) {
+    let Some(id) = app.recipe.as_ref().map(|r| r.id.clone()) else { return };
+    match view {
+        View::Icons if app.icons.recipe_id.as_deref() != Some(id.as_str()) || app.icons.batch_item.is_some() => {
+            icons::prepare_for_recipe(app, &id);
+            // Search the web only when the recipe has no usable icon yet.
+            let file = app.recipes.iter().find(|r| r.id == id).map(|r| r.meta.icon_file.clone()).unwrap_or_default();
+            app.icons.auto_search = file.is_empty() || !app.ws_cache.icons.iter().any(|i| i.eq_ignore_ascii_case(&file));
+        }
+        View::Agent => app.agent.target_id = id,
+        _ => {}
+    }
+    app.view = view;
+}
+
+/// The open recipe's id, location, status, Save/Revert, and its page tabs.
+pub fn recipe_header(app: &mut StudioApp, ui: &mut Ui) {
+    let Some(r) = &app.recipe else { return };
+    let id = r.id.clone();
+    let mut save = false;
+    let mut revert = false;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(&r.id).monospace().size(24.0).strong());
+        match &r.location {
+            RecipeLocation::Development => theme::badge(ui, "development", theme::amber()),
+            RecipeLocation::Shipped(Some(group)) => theme::badge(ui, format!("shipped / {group}"), theme::grey()),
+            RecipeLocation::Shipped(None) => theme::badge(ui, "shipped", theme::grey()),
+        };
+        if r.dirty() {
+            theme::badge(ui, "unsaved", theme::amber());
+        }
+        if r.read_only {
+            theme::badge(ui, "read-only", theme::red());
+        }
+        recipe_status_badge(app, ui, &id);
+        let r = app.recipe.as_ref().unwrap();
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if theme::primary(ui, r.dirty() && !r.read_only, "\u{E74E}  Save  (Ctrl+S)").clicked() {
+                save = true;
+            }
+            if ui.add_enabled(r.dirty(), egui::Button::new("\u{E7A7}  Revert")).clicked() {
+                revert = true;
+            }
+            if ui.small_button("\u{E838}").on_hover_text(format!("Open {} in VS Code / the default editor", r.path.display())).clicked() {
+                open_external(&r.path);
+            }
+        });
+    });
+    let mut goto = None;
+    ui.horizontal(|ui| {
+        for (view, icon, name) in RECIPE_TABS {
+            if ui.selectable_label(app.view == view, format!("{icon}  {name}")).clicked() && app.view != view {
+                goto = Some(view);
+            }
+        }
+    });
+    ui.separator();
+    if save {
+        app.save_recipe();
+    }
+    if revert && let Some(r) = &mut app.recipe {
+        r.text = r.saved.clone();
+        r.changed();
+    }
+    if let Some(view) = goto {
+        open_recipe_tab(app, view);
+    }
 }
 
 /// Banner explaining why actions are disabled in a production folder.

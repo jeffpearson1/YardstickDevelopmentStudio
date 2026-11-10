@@ -5,7 +5,6 @@ use eframe::egui::{self, RichText, Ui};
 use ystudio_core::fields::{self, FieldKind, FieldSpec, Section};
 use ystudio_core::lint::{Diagnostic, Severity};
 use ystudio_core::recipe::RecipeDoc;
-use ystudio_core::workspace::RecipeLocation;
 
 use crate::app::{OpenRecipe, Step, StudioApp, View};
 use crate::theme::FluentText as _;
@@ -23,53 +22,12 @@ fn is_required(name: &str, doc: &RecipeDoc) -> bool {
     fields::detection_requirements(dt.trim()).contains(&name)
 }
 
-pub fn header(app: &mut StudioApp, ui: &mut Ui, title: &str) {
-    let Some(r) = &app.recipe else { return };
-    let mut save = false;
-    let mut revert = false;
-    ui.horizontal(|ui| {
-        theme::page_title(ui, title);
-        ui.label(RichText::new(&r.id).monospace().size(20.0).color(theme::accent()));
-        match &r.location {
-            RecipeLocation::Development => theme::badge(ui, "development", theme::green()),
-            RecipeLocation::Shipped(Some(group)) => theme::badge(ui, format!("shipped / {group}"), theme::blue()),
-            RecipeLocation::Shipped(None) => theme::badge(ui, "shipped", theme::blue()),
-        };
-        if r.dirty() {
-            theme::badge(ui, "unsaved", theme::amber());
-        }
-        if r.read_only {
-            theme::badge(ui, "read-only", theme::red());
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if theme::primary(ui, r.dirty() && !r.read_only, "\u{E74E}  Save  (Ctrl+S)").clicked() {
-                save = true;
-            }
-            if ui.add_enabled(r.dirty(), egui::Button::new("\u{E7A7}  Revert")).clicked() {
-                revert = true;
-            }
-            if ui.small_button("\u{E838}").on_hover_text("Open in VS Code / default editor").clicked() {
-                super::open_external(&r.path);
-            }
-        });
-    });
-    ui.label(RichText::new(r.path.display().to_string()).small().monospace().weak());
-    if save {
-        app.save_recipe();
-    }
-    if revert && let Some(r) = &mut app.recipe {
-        r.text = r.saved.clone();
-        r.changed();
-    }
-}
-
 pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     if !super::need_recipe(app, ui) {
         return;
     }
     super::production_banner(app, ui);
-    header(app, ui, "Designer");
-    ui.separator();
+    super::recipe_header(app, ui);
 
     let font_size = app.settings.editor_font_size;
     let dark = app.settings.dark_mode;

@@ -16,8 +16,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         return;
     }
     super::production_banner(app, ui);
-    super::designer::header(app, ui, "Test Bench");
-    ui.separator();
+    super::recipe_header(app, ui);
 
     let writable = app.writable();
     let id = app.recipe.as_ref().unwrap().id.clone();
@@ -25,7 +24,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
 
     if matches!(app.ws.as_ref().map(|w| &w.kind), Some(WorkspaceKind::Unconfigured)) {
         theme::banner(ui, theme::amber(), |ui| {
-            ui.label("This clone has not been set up with Install-Yardstick -DevelopmentOnly. Schema and lab runs may fail until the modules are installed (see Home).");
+            ui.label("This clone is not set up for development yet, so schema and lab runs may fail. Set it up from Home (Set up this clone).");
         });
     }
 

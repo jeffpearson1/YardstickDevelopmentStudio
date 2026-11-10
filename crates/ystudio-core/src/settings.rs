@@ -37,6 +37,8 @@ pub struct Settings {
     pub auto_check_updates: bool,
     /// A version the user chose to skip; startup checks stay quiet about it.
     pub skipped_update: String,
+    /// The first-run setup wizard was finished or skipped.
+    pub setup_done: bool,
 }
 
 impl Default for Settings {
@@ -57,6 +59,7 @@ impl Default for Settings {
             auto_sync_shared: true,
             auto_check_updates: true,
             skipped_update: String::new(),
+            setup_done: false,
         }
     }
 }

@@ -21,6 +21,8 @@ enum Tab {
 #[derive(Default)]
 pub struct RunsState {
     selected: Option<PathBuf>,
+    /// The open recipe the selection last followed.
+    followed: Option<String>,
     tab: Tab,
     loaded: bool,
 }
@@ -100,6 +102,15 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         });
     });
 
+    // Follow the open recipe: show its newest run when it changes.
+    let open_id = app.recipe.as_ref().map(|r| r.id.clone());
+    if open_id.is_some() && app.runs_ui.followed != open_id {
+        let id = open_id.as_deref().unwrap();
+        if let Some(run) = app.runs.iter().find(|run| run.summary.as_ref().is_some_and(|s| s.results.iter().any(|r| r.id == id))) {
+            app.runs_ui.selected = Some(run.dir.clone());
+        }
+        app.runs_ui.followed = open_id;
+    }
     if app.runs_ui.selected.is_none() {
         app.runs_ui.selected = app.runs.first().map(|r| r.dir.clone());
     }
@@ -225,7 +236,11 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             evidence += "\n\n--- transcript tail ---\n";
             evidence += &tail.into_iter().rev().collect::<Vec<_>>().join("\n");
         }
-        app.agent.prepare_fix(&id, evidence);
-        app.view = View::Agent;
+        // The Agent tab works on the open recipe; if another has unsaved
+        // edits, the save prompt comes first and the user can ask again.
+        if app.open_recipe_by_id(&id) && app.recipe.as_ref().is_some_and(|r| r.id == id) {
+            app.agent.prepare_fix(&id, evidence);
+            app.view = View::Agent;
+        }
     }
 }

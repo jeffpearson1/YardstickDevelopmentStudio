@@ -157,6 +157,9 @@ pub struct Workspace {
     /// `syncSharedContent: true` in preferences: icons and recipe overrides are
     /// shared with a team location.
     pub sync_shared_content: bool,
+    /// `SharedIcons` in preferences: the team's icon folder. Promotion copies
+    /// icons there; they are not kept in git.
+    pub shared_icons: Option<PathBuf>,
 }
 
 /// Parses the flat `@{ Key = 'value' }` hashtable in `Yardstick.Project.psd1`.
@@ -186,9 +189,17 @@ impl Workspace {
         let flag = |key: &str| prefs.as_ref().and_then(|p| p.get(key)).and_then(serde_yaml::Value::as_bool).unwrap_or(false);
         let development_only = flag("developmentOnly");
         let sync_shared_content = flag("syncSharedContent");
+        // Explorer's "Copy as path" adds quotes; Yardstick strips one pair too.
+        let shared_icons = prefs
+            .as_ref()
+            .and_then(|p| p.get("SharedIcons"))
+            .and_then(serde_yaml::Value::as_str)
+            .map(|s| s.trim().trim_matches(['"', '\'']).trim())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
 
         let kind = classify(root, prefs.is_some(), development_only, production_paths, trusted_dev_paths);
-        Ok(Workspace { root: root.to_path_buf(), layout, kind, development_only, sync_shared_content })
+        Ok(Workspace { root: root.to_path_buf(), layout, kind, development_only, sync_shared_content, shared_icons })
     }
 
     pub fn is_writable(&self) -> bool {

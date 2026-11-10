@@ -218,36 +218,6 @@ pub fn build(ws: &Workspace, action: &HarnessAction, consent: Consent, pwsh: &Pa
     Ok(pwsh_spec(action.title(), ws, pwsh, &body))
 }
 
-/// `Publish-Yardstick.ps1 -RecipeId ... -ProductionPath ...` run from the
-/// development workspace. A real publish needs consent; previews never do.
-pub fn publish(ws: &Workspace, recipe_ids: &[String], production: &Path, what_if: bool, consent: Consent, pwsh: &Path) -> Result<ProcessSpec> {
-    ws.ensure_writable("publish from")?;
-    if recipe_ids.is_empty() {
-        bail!("Select at least one recipe to promote.");
-    }
-    if crate::same_path(&ws.root, production) {
-        bail!("The production path is this workspace.");
-    }
-    if !crate::workspace::is_yardstick_root(production) {
-        bail!("'{}' is not a Yardstick folder.", production.display());
-    }
-    if let Some(bad) = recipe_ids.iter().find(|id| !id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))) {
-        bail!("Invalid recipe id '{bad}'.");
-    }
-    if !what_if && consent != Consent::Confirmed {
-        bail!("Publishing to production needs explicit confirmation.");
-    }
-    let ids = recipe_ids.iter().map(|i| ps_quote(i)).collect::<Vec<_>>().join(", ");
-    let mut body = format!(
-        "& {} -RecipeId {ids} -ProductionPath {}",
-        ps_quote(&ws.root.join("Publish-Yardstick.ps1").to_string_lossy()),
-        ps_quote(&production.to_string_lossy())
-    );
-    body.push_str(if what_if { " -WhatIf" } else { " -Confirm:$false" });
-    let label = format!("{} · {}", if what_if { "Publish preview" } else { "PUBLISH" }, recipe_ids.join(", "));
-    Ok(pwsh_spec(label, ws, pwsh, &body))
-}
-
 /// Opens `Install-Yardstick.ps1 -DevelopmentOnly` in its own console; it is interactive.
 pub fn install_development_only(ws: &Workspace, pwsh: &Path) -> Result<ProcessSpec> {
     ws.ensure_writable("configure")?;
@@ -400,20 +370,6 @@ installExperience: User
         let (_d, ws) = dev_ws();
         let action = HarnessAction::Schema { recipe: PathBuf::from(r"C:\Windows\evil.yaml") };
         assert!(build(&ws, &action, Consent::None, Path::new("pwsh")).is_err());
-    }
-
-    #[test]
-    fn publish_rules() {
-        let (_d, ws) = dev_ws();
-        let prod = fake_workspace(Some("x: 1\n"));
-        let ids = vec!["brave".to_string()];
-        let preview = publish(&ws, &ids, prod.path(), true, Consent::None, Path::new("pwsh")).unwrap();
-        assert!(body(&preview).contains("-WhatIf"));
-        assert!(publish(&ws, &ids, prod.path(), false, Consent::None, Path::new("pwsh")).is_err());
-        let real = publish(&ws, &ids, prod.path(), false, Consent::Confirmed, Path::new("pwsh")).unwrap();
-        assert!(body(&real).contains("-Confirm:$false"));
-        assert!(publish(&ws, &ids, &ws.root, true, Consent::None, Path::new("pwsh")).is_err());
-        assert!(publish(&ws, &["a;rm".to_string()], prod.path(), true, Consent::None, Path::new("pwsh")).is_err());
     }
 
     #[test]
