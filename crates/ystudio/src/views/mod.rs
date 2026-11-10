@@ -12,6 +12,7 @@ pub mod settings;
 pub mod setup;
 pub mod testbench;
 pub mod update;
+pub mod usage;
 
 use eframe::egui::{self, RichText, Ui};
 

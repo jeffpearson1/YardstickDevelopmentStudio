@@ -42,6 +42,8 @@ pub struct Settings {
     /// The user approves agents downloading installers and inspecting them
     /// with tools outside the workspace (see `agent::Approvals`).
     pub agent_downloads: bool,
+    /// Agents run as a coordinator with parallel subagents.
+    pub agent_multi: bool,
 }
 
 impl Default for Settings {
@@ -64,6 +66,7 @@ impl Default for Settings {
             skipped_update: String::new(),
             setup_done: false,
             agent_downloads: false,
+            agent_multi: false,
         }
     }
 }

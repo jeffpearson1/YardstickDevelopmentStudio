@@ -295,7 +295,7 @@ pub fn start_next(app: &mut StudioApp) {
         let Some(b) = app.batch.batch.as_ref() else { break };
         let Some(task) = task_for(app, b, idx) else { continue };
         let batch_id = b.id.clone();
-        match agent::build_command(&ws, app.settings.agent_backend, &app.settings.agent_model, &app.settings.production_paths, &task, super::settings::approvals(app)) {
+        match agent::build_command(&ws, app.settings.agent_backend, &app.settings.agent_model, &app.settings.production_paths, &task, super::settings::agent_options(app)) {
             Ok(spec) => {
                 let before = Snapshot::take(&ws);
                 let verification = app.batch.verification.clone().and_then(|options| crate::workflow::task_id(&task)
@@ -742,8 +742,8 @@ fn items_table(app: &mut StudioApp, ui: &mut Ui) {
     let mut icon_for = None;
     let mut open = None;
     egui::ScrollArea::both().id_salt("batch-items").auto_shrink(false).show(ui, |ui| {
-        egui::Grid::new("batch-grid").striped(true).num_columns(8).spacing([12.0, 6.0]).min_row_height(24.0).show(ui, |ui| {
-            for h in ["", "Ticket", "Software", "Version", "Request", "Status", "Icon", "Recipe"] {
+        egui::Grid::new("batch-grid").striped(true).num_columns(9).spacing([12.0, 6.0]).min_row_height(24.0).show(ui, |ui| {
+            for h in ["", "Ticket", "Software", "Version", "Request", "Status", "Icon", "Recipe", "Credits"] {
                 ui.label(RichText::new(h).semibold());
             }
             ui.end_row();
@@ -792,6 +792,14 @@ fn items_table(app: &mut StudioApp, ui: &mut Ui) {
                         ui.label(RichText::new(id).monospace().weak()).on_hover_text("Suggested id - no recipe yet");
                     }
                 });
+                // Every agent run on the item's recipes, in any request.
+                let ids = if it.recipes.is_empty() { vec![it.recipe_id()] } else { it.recipes.clone() };
+                let credits: f64 = ids.iter().map(|id| ystudio_core::usage::recipe_credits(&app.usage, id)).sum();
+                if credits > 0.0 {
+                    ui.label(format!("{credits:.1}")).on_hover_text("AI credits spent by agents on this app so far");
+                } else {
+                    ui.label("");
+                }
                 ui.end_row();
             }
         });
@@ -828,7 +836,7 @@ fn start_extract(app: &mut StudioApp) {
         app.error(format!("Could not prepare the batch: {e:#}"));
         return;
     }
-    match agent::build_extract_command(app.settings.agent_backend, &app.settings.agent_model, &dir) {
+    match agent::build_extract_command(app.settings.agent_backend, &app.settings.agent_model, &dir, super::settings::agent_options(app)) {
         Ok(spec) => {
             app.batch.extract_job = app.start_job(spec, JobKind::BatchExtract { batch_id, backend: app.settings.agent_backend.label().to_string() });
             app.batch.show_log = true;

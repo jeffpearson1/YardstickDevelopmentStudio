@@ -275,9 +275,20 @@ fn appearance_card(app: &mut StudioApp, ui: &mut Ui) {
     });
 }
 
-/// What the user has approved for agent runs.
-pub fn approvals(app: &StudioApp) -> ystudio_core::agent::Approvals {
-    ystudio_core::agent::Approvals { downloads: app.settings.agent_downloads }
+/// How agent runs work: what the user approved, and multi-agent mode.
+pub fn agent_options(app: &StudioApp) -> ystudio_core::agent::AgentOptions {
+    ystudio_core::agent::AgentOptions { downloads: app.settings.agent_downloads, multi_agent: app.settings.agent_multi }
+}
+
+/// The model runs use: the chosen one, or what the CLI's default resolved
+/// to in the latest recorded run.
+fn effective_model(app: &StudioApp) -> Option<String> {
+    let chosen = app.settings.agent_model.trim();
+    if !chosen.is_empty() {
+        return Some(chosen.to_string());
+    }
+    let backend = app.settings.agent_backend.label();
+    app.usage.iter().rev().find(|r| r.backend == backend).map(|r| r.model.clone())
 }
 
 /// The download approval, wherever an agent run starts. Saved as it changes,
@@ -352,6 +363,25 @@ pub fn agent_picker(app: &mut StudioApp, ui: &mut Ui, salt: &str) {
             save |= ui
                 .add(egui::TextEdit::singleline(&mut app.settings.agent_model).hint_text("model id").desired_width(160.0))
                 .lost_focus();
+        }
+        save |= ui
+            .checkbox(&mut app.settings.agent_multi, "Multi-agent (coordinator)")
+            .on_hover_text(
+                "A coordinating agent splits the work into parts (download source, switches, detection, icon) and runs them \
+                 as parallel subagents, then writes the recipe itself. Faster on big recipes, but uses more AI credits.",
+            )
+            .changed();
+        // What an app has cost with this model so far.
+        if let Some(model) = effective_model(app)
+            && let Some(m) = ystudio_core::usage::by_model(&app.usage).into_iter().find(|m| m.model == model)
+            && let Some(per_app) = m.per_app()
+        {
+            ui.add(egui::Label::new(RichText::new(format!("≈ {per_app:.1} credits per app")).small().weak()).extend()).on_hover_text(format!(
+                "{model}: {per_app:.1} AI credits per app over {} app(s), {:.1} per run over {} run(s). See Runs for every model.",
+                m.apps,
+                m.per_run(),
+                m.runs
+            ));
         }
     });
     if save {

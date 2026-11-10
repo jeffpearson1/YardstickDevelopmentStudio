@@ -123,6 +123,28 @@ impl AgentTask {
         }
     }
 
+    /// `create`, `fix`, `review`, `update` or `freeform`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            AgentTask::Create { .. } => "create",
+            AgentTask::Fix { .. } => "fix",
+            AgentTask::Review { .. } => "review",
+            AgentTask::Update { .. } => "update",
+            AgentTask::Freeform { .. } => "freeform",
+        }
+    }
+
+    /// The recipe the task works on, if any.
+    pub fn recipe_id(&self) -> Option<String> {
+        match self {
+            AgentTask::Create { app, id_hint, .. } => {
+                Some(if id_hint.trim().is_empty() { crate::recipe::suggest_id(app) } else { id_hint.trim().to_string() })
+            }
+            AgentTask::Fix { id, .. } | AgentTask::Review { id } | AgentTask::Update { id, .. } => Some(id.clone()),
+            AgentTask::Freeform { .. } => None,
+        }
+    }
+
     /// Whether the agent may edit files for this task.
     pub fn writes(&self) -> bool {
         !matches!(self, AgentTask::Review { .. })
@@ -132,19 +154,35 @@ impl AgentTask {
 /// The line an agent ends with when a command it needed was not approved.
 pub const NEEDS_APPROVAL: &str = "STUDIO-NEEDS-APPROVAL:";
 
-/// What the user approved for a run, before it started. The agent CLI runs
-/// headless, so it cannot ask; anything it would ask about is denied unless
-/// approved here.
+/// How an agent run works, chosen by the user before it starts. The agent
+/// CLI runs headless, so it cannot ask; anything it would ask about is denied
+/// unless approved here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Approvals {
-    /// Download vendor files and unpack/inspect them with tools anywhere on
-    /// this computer (Copilot CLI's path checks are lifted for the run).
+pub struct AgentOptions {
+    /// Approved: download vendor files and unpack/inspect them with tools
+    /// anywhere on this computer (Copilot CLI's path checks are lifted).
     pub downloads: bool,
+    /// A coordinating agent splits the work across parallel subagents
+    /// (Copilot CLI's fleet mode; Claude Code's subagents).
+    pub multi_agent: bool,
+}
+
+/// The coordinator's instructions, when multi-agent mode is on.
+fn coordinator_prompt(options: AgentOptions) -> &'static str {
+    if options.multi_agent {
+        "Multi-agent mode is on: work as the coordinator. Split the work into independent parts that can run in \
+         parallel - for example the vendor's download source and versioning, the silent install and uninstall \
+         switches, detection, and the icon - and hand each to a subagent. Give every subagent these same rules and \
+         approvals. You stay responsible for the recipe file: merge the findings, write the recipe once, run the \
+         checks, and write the final report yourself.\n"
+    } else {
+        ""
+    }
 }
 
 /// The approvals section of the prompt: what the user granted for this run.
-fn approvals_prompt(ws: &Workspace, production_paths: &[PathBuf], approvals: Approvals) -> String {
-    if approvals.downloads {
+fn approvals_prompt(ws: &Workspace, production_paths: &[PathBuf], options: AgentOptions) -> String {
+    if options.downloads {
         let prod = if production_paths.is_empty() {
             String::new()
         } else {
@@ -267,11 +305,12 @@ pub fn task_prompt(task: &AgentTask) -> String {
     }
 }
 
-pub fn full_prompt(ws: &Workspace, production_paths: &[PathBuf], task: &AgentTask, approvals: Approvals) -> String {
+pub fn full_prompt(ws: &Workspace, production_paths: &[PathBuf], task: &AgentTask, options: AgentOptions) -> String {
     format!(
-        "{}\n{}\n---\n\n{}",
+        "{}\n{}{}\n---\n\n{}",
         guardrails(ws, production_paths),
-        approvals_prompt(ws, production_paths, approvals),
+        approvals_prompt(ws, production_paths, options),
+        coordinator_prompt(options),
         task_prompt(task)
     )
 }
@@ -311,25 +350,34 @@ pub fn build_command(
     model: &str,
     production_paths: &[PathBuf],
     task: &AgentTask,
-    approvals: Approvals,
+    options: AgentOptions,
 ) -> Result<ProcessSpec> {
     ws.ensure_writable("run a coding agent")?;
     if !ws.has_skill() {
         bail!("This Yardstick folder has no .claude\\skills\\yardstick-recipes\\SKILL.md; update it from GitHub first.");
     }
-    let prompt = full_prompt(ws, production_paths, task, approvals);
+    let prompt = full_prompt(ws, production_paths, task, options);
     let root = ws.root.to_string_lossy().into_owned();
     let mut spec = backend.spec(task.title(), &ws.root)?;
     match backend {
-        AgentBackend::CopilotCli => spec = spec.args(copilot_args(&prompt, &root, task.writes(), approvals)),
+        AgentBackend::CopilotCli => {
+            let usage = crate::usage::Pending::new(task.kind(), task.recipe_id(), backend.label(), options.multi_agent);
+            spec = spec.args(copilot_args(&prompt, &root, task.writes(), options));
+            spec = spec.arg("--usage-output-file").arg(usage.file.to_string_lossy());
+            spec.usage = Some(usage);
+        }
         AgentBackend::ClaudeCode => {
-            let allowed = if task.writes() {
-                "Bash Read Edit Write Glob Grep WebFetch WebSearch TodoWrite Skill"
+            let mut allowed = if task.writes() {
+                "Bash Read Edit Write Glob Grep WebFetch WebSearch TodoWrite Skill".to_string()
             } else {
-                "Bash Read Glob Grep WebFetch WebSearch Skill"
+                "Bash Read Glob Grep WebFetch WebSearch Skill".to_string()
             };
+            if options.multi_agent {
+                // Claude Code's subagents run through its Task tool.
+                allowed += " Task";
+            }
             let denied: Vec<String> = DENIED_COMMANDS.iter().map(|c| format!("Bash({c}:*)")).collect();
-            spec = spec.args(["-p", &prompt, "--add-dir", &root, "--permission-mode", "acceptEdits", "--allowedTools", allowed]);
+            spec = spec.args(["-p", &prompt, "--add-dir", &root, "--permission-mode", "acceptEdits", "--allowedTools", &allowed]);
             spec = spec.arg("--disallowedTools").arg(denied.join(" "));
         }
     }
@@ -367,7 +415,7 @@ pub fn extract_prompt(batch_dir: &Path) -> String {
 }
 
 /// Agent invocation for batch extraction: confined to the batch folder, no shell.
-pub fn build_extract_command(backend: AgentBackend, model: &str, batch_dir: &Path) -> Result<ProcessSpec> {
+pub fn build_extract_command(backend: AgentBackend, model: &str, batch_dir: &Path, options: AgentOptions) -> Result<ProcessSpec> {
     let prompt = extract_prompt(batch_dir);
     let dir = batch_dir.to_string_lossy().into_owned();
     let mut spec = backend.spec("Extract software from request list", batch_dir)?;
@@ -375,10 +423,17 @@ pub fn build_extract_command(backend: AgentBackend, model: &str, batch_dir: &Pat
         AgentBackend::CopilotCli => {
             spec = spec.args(["-p", &prompt, "--no-color", "--no-ask-user", "--stream", "on", "--add-dir", &dir]);
             spec = spec.args(["--allow-all-tools", "--allow-all-urls", "--deny-tool=shell"]);
+            if options.multi_agent {
+                spec = spec.arg("--fleet");
+            }
+            let usage = crate::usage::Pending::new("extract", None, backend.label(), options.multi_agent);
+            spec = spec.arg("--usage-output-file").arg(usage.file.to_string_lossy());
+            spec.usage = Some(usage);
         }
         AgentBackend::ClaudeCode => {
+            let tools = if options.multi_agent { "Read Write Glob Grep WebFetch WebSearch Task" } else { "Read Write Glob Grep WebFetch WebSearch" };
             spec = spec.args(["-p", &prompt, "--add-dir", &dir, "--permission-mode", "acceptEdits"]);
-            spec = spec.args(["--allowedTools", "Read Write Glob Grep WebFetch WebSearch", "--disallowedTools", "Bash Edit"]);
+            spec = spec.args(["--allowedTools", tools, "--disallowedTools", "Bash Edit"]);
         }
     }
     if !model.trim().is_empty() {
@@ -391,13 +446,17 @@ pub fn build_extract_command(backend: AgentBackend, model: &str, batch_dir: &Pat
 /// would ask about is denied: tools and URLs are allowed outright, and paths
 /// outside the workspace and temp folder only when downloads are approved.
 /// Deny rules beat every allow, so the denied commands stay denied.
-fn copilot_args(prompt: &str, root: &str, writes: bool, approvals: Approvals) -> Vec<String> {
+fn copilot_args(prompt: &str, root: &str, writes: bool, options: AgentOptions) -> Vec<String> {
     let mut args: Vec<String> = ["-p", prompt, "--no-color", "--no-ask-user", "--stream", "on", "--add-dir", root]
         .map(String::from)
         .to_vec();
     // Web access is needed to research vendors.
     args.extend(["--allow-all-tools".into(), "--allow-all-urls".into()]);
-    if approvals.downloads {
+    if options.multi_agent {
+        // A coordinator with parallel subagents.
+        args.push("--fleet".into());
+    }
+    if options.downloads {
         // Unpacking and inspecting installers uses tools outside the
         // workspace (7-Zip in Program Files, say), which the path check
         // would otherwise refuse with nobody there to approve it.
@@ -519,7 +578,7 @@ mod tests {
     fn prompt_carries_guardrails_and_task() {
         let (_d, ws) = dev_ws();
         let task = AgentTask::Create { app: "Obsidian".into(), id_hint: "obsidian".into(), vendor_url: "https://obsidian.md".into(), notes: String::new() };
-        let p = full_prompt(&ws, &[PathBuf::from(r"C:\Intune\Yardstick")], &task, Approvals::default());
+        let p = full_prompt(&ws, &[PathBuf::from(r"C:\Intune\Yardstick")], &task, AgentOptions::default());
         assert!(p.contains("SKILL.md"));
         assert!(p.contains(r"C:\Intune\Yardstick"));
         assert!(p.contains("-WhatIf -NoElevate -DiscardInstaller"));
@@ -548,21 +607,35 @@ mod tests {
         let task = AgentTask::Fix { id: "brave".into(), evidence: String::new(), notes: String::new() };
         let prod = [PathBuf::from(r"C:\Intune\Yardstick")];
 
-        let approved = full_prompt(&ws, &prod, &task, Approvals { downloads: true });
+        let approved = full_prompt(&ws, &prod, &task, AgentOptions { downloads: true, multi_agent: false });
         assert!(approved.contains("Approvals the user gave in the Studio before this run started"));
         assert!(approved.contains("do not report a blocker for lack of approval"));
         assert!(approved.contains(r"Artifacts\AgentDownloads"));
         assert!(approved.contains("Still not approved: running an installer") && approved.contains(r"`C:\Intune\Yardstick`"));
-        let args = copilot_args(&approved, "C:\\ws", true, Approvals { downloads: true });
+        let args = copilot_args(&approved, "C:\\ws", true, AgentOptions { downloads: true, multi_agent: false });
         assert!(args.contains(&"--allow-all-paths".to_string()));
         assert!(args.contains(&"--deny-tool=shell(git push)".to_string()));
 
-        let plain = full_prompt(&ws, &prod, &task, Approvals::default());
+        let plain = full_prompt(&ws, &prod, &task, AgentOptions::default());
         assert!(plain.contains("has not approved downloading") && plain.contains("STUDIO-NEEDS-APPROVAL: downloads"));
         assert!(!plain.contains("Approvals the user gave"));
-        let args = copilot_args(&plain, "C:\\ws", false, Approvals::default());
+        let args = copilot_args(&plain, "C:\\ws", false, AgentOptions::default());
         assert!(!args.contains(&"--allow-all-paths".to_string()));
         assert!(args.contains(&"--deny-tool=write".to_string()));
+    }
+
+    #[test]
+    fn multi_agent_runs_a_coordinator() {
+        let (_d, ws) = dev_ws();
+        let task = AgentTask::Create { app: "Obsidian".into(), id_hint: String::new(), vendor_url: String::new(), notes: String::new() };
+        let multi = AgentOptions { downloads: false, multi_agent: true };
+        let p = full_prompt(&ws, &[], &task, multi);
+        assert!(p.contains("work as the coordinator") && p.contains("hand each to a subagent"));
+        assert!(copilot_args(&p, "C:\\ws", true, multi).contains(&"--fleet".to_string()));
+        assert!(!full_prompt(&ws, &[], &task, AgentOptions::default()).contains("coordinator"));
+        assert!(!copilot_args(&p, "C:\\ws", true, AgentOptions::default()).contains(&"--fleet".to_string()));
+        assert_eq!((task.kind(), task.recipe_id().as_deref()), ("create", Some("obsidian")));
+        assert_eq!(AgentTask::Freeform { prompt: "x".into() }.recipe_id(), None);
     }
 
     #[test]
@@ -590,7 +663,7 @@ mod tests {
     fn production_workspace_refused() {
         let d = fake_workspace(Some("developmentOnly: true\n"));
         let ws = Workspace::open(d.path(), &[d.path().to_path_buf()], &[]).unwrap();
-        let err = build_command(&ws, AgentBackend::CopilotCli, "", &[], &AgentTask::Review { id: "x".into() }, Approvals::default()).unwrap_err();
+        let err = build_command(&ws, AgentBackend::CopilotCli, "", &[], &AgentTask::Review { id: "x".into() }, AgentOptions::default()).unwrap_err();
         assert!(err.to_string().contains("production"));
     }
 
