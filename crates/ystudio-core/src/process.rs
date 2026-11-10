@@ -268,6 +268,18 @@ pub struct Output {
     pub stderr: String,
 }
 
+/// Runs to completion and returns stdout as bytes, for binary output such
+/// as `git cat-file blob`. A non-zero exit is an error.
+pub fn run_bytes(spec: &ProcessSpec) -> Result<Vec<u8>> {
+    let mut cmd = spec.command();
+    cmd.stdin(Stdio::null());
+    let out = cmd.output().with_context(|| format!("starting {}", spec.program.display()))?;
+    if !out.status.success() {
+        anyhow::bail!("{}", decode(&out.stderr).trim());
+    }
+    Ok(out.stdout)
+}
+
 /// Runs to completion without treating a non-zero exit as an error, for
 /// commands that answer with their exit code (`git diff --quiet`).
 pub fn run_output(spec: &ProcessSpec) -> Result<Output> {

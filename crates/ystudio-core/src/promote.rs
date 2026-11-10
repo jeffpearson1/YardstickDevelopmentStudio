@@ -6,16 +6,131 @@
 //!
 //! Icons are not kept in git: promotion copies a recipe's icon to the shared
 //! icon folder (`SharedIcons` in preferences), which Yardstick syncs from.
+//!
+//! Each pull request carries the recipe's test evidence
+//! (`Tests/RecipeEvidence/<id>.json`), which Yardstick's required `Recipe
+//! evidence` check reads: it passes only when a live install test validated
+//! exactly the recipe contents being merged.
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow, bail};
+use serde::Serialize;
 
-use crate::process::{Output, ProcessSpec, run_output};
+use crate::process::{Output, ProcessSpec, run_bytes, run_output};
+use crate::results::RecipeResult;
+use crate::validation::{Completion, hash_bytes};
 use crate::workspace::{RecipeLocation, Workspace};
 
 /// Branches the Studio pushes live under this prefix.
 pub const BRANCH_PREFIX: &str = "studio/";
+
+/// Where Yardstick's `Recipe evidence` check looks for a recipe's evidence.
+pub const EVIDENCE_DIR: &str = "Tests/RecipeEvidence";
+
+/// What the Studio knows about a recipe's testing, committed with it as
+/// `Tests/RecipeEvidence/<id>.json` (schemaVersion 1; see Yardstick's
+/// `Docs/RecipeEvidence.md`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Evidence {
+    pub schema_version: u32,
+    pub recipe_id: String,
+    /// Repository-relative, forward slashes; filled in from the commit.
+    pub recipe_path: String,
+    /// The hash of the recipe as committed; filled in from the commit.
+    pub recipe_sha256: String,
+    pub validated: bool,
+    /// `Validated`, `ValidatedWithWarnings` or `NotValidated`.
+    pub verdict: String,
+    /// Why it is not validated; empty when it is.
+    pub reason: String,
+    /// When the install test ran, ISO 8601 UTC; empty when none is known.
+    pub tested_at: String,
+    pub studio_version: String,
+    pub install_experience: String,
+    pub installer: Installer,
+    pub phases: Vec<EvidencePhase>,
+    /// The hash the live test validated, to notice a clean filter rewriting the recipe.
+    #[serde(skip)]
+    tested_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Installer {
+    pub file_name: String,
+    pub version: String,
+    pub sha256: String,
+    pub signer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvidencePhase {
+    pub name: String,
+    pub status: String,
+    pub detail: String,
+}
+
+/// `t` as ISO 8601 UTC, e.g. `2026-11-09T10:00:00Z`.
+pub fn iso_utc(t: SystemTime) -> String {
+    format!("{}Z", crate::intake::utc_timestamp(t).replace(' ', "T"))
+}
+
+impl Evidence {
+    /// Evidence for `id`: whether it is complete, and the install test that
+    /// validated it (or the latest one) with when that ran.
+    pub fn new(id: &str, completion: &Completion, result: Option<&RecipeResult>, tested_at: Option<SystemTime>) -> Self {
+        let tested_at = tested_at.map(iso_utc).unwrap_or_default();
+        let (validated, verdict, reason, tested_sha256) = match completion {
+            Completion::Complete(r) => {
+                (true, if r.warnings { "ValidatedWithWarnings" } else { "Validated" }, String::new(), Some(r.sha256.clone()))
+            }
+            // Yardstick's check quotes the reason inside its own sentence, so no full stop.
+            Completion::Changed(r) => (false, "NotValidated", format!("a live install test passed on {}, but the recipe has changed since", r.tested), None),
+            Completion::NotValidated => {
+                let reason = match result {
+                    Some(r) => format!("no live install test of this recipe has passed; the latest install test was: {}", r.verdict().label()),
+                    None => "no install test of this recipe has been recorded".to_string(),
+                };
+                (false, "NotValidated", reason, None)
+            }
+        };
+        let text = |s: &Option<String>| s.clone().unwrap_or_default();
+        Evidence {
+            schema_version: 1,
+            recipe_id: id.to_string(),
+            recipe_path: String::new(),
+            recipe_sha256: String::new(),
+            validated,
+            verdict: verdict.to_string(),
+            reason,
+            tested_at,
+            studio_version: env!("CARGO_PKG_VERSION").to_string(),
+            install_experience: result.map(|r| text(&r.install_experience)).unwrap_or_default(),
+            installer: result
+                .map(|r| Installer { file_name: text(&r.file_name), version: text(&r.version), sha256: text(&r.sha256), signer: text(&r.signer) })
+                .unwrap_or_default(),
+            phases: result
+                .map(|r| r.phases.iter().map(|p| EvidencePhase { name: p.label().to_string(), status: p.status.clone(), detail: text(&p.detail) }).collect())
+                .unwrap_or_default(),
+            tested_sha256,
+        }
+    }
+
+    /// A sentence for the commit and the pull request.
+    pub fn summary(&self) -> String {
+        let when = if self.tested_at.is_empty() { String::new() } else { format!(" on {}", self.tested_at) };
+        if self.validated {
+            let warnings = if self.verdict == "ValidatedWithWarnings" { " with warnings" } else { "" };
+            let hash = if self.recipe_sha256.is_empty() { self.tested_sha256.clone().unwrap_or_default() } else { self.recipe_sha256.clone() };
+            format!("Validated: a live install test passed{warnings}{when} with exactly this recipe (SHA-256 {hash}).")
+        } else {
+            format!("Not validated: {}.", self.reason)
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
@@ -177,7 +292,7 @@ impl Drop for Worktree<'_> {
 /// icon to the shared folder, and opens a pull request with `gh` when it is
 /// given (falling back to GitHub's compare page). `evidence` goes in the
 /// commit and pull request bodies.
-pub fn open_pull_request(ws: &Workspace, plan: &Plan, repo: &Repo, gh: Option<&Path>, evidence: &str, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
+pub fn open_pull_request(ws: &Workspace, plan: &Plan, repo: &Repo, gh: Option<&Path>, evidence: &Evidence, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
     ws.ensure_writable("open a pull request from")?;
     let git_exe = crate::git::git_exe()?;
     let root = &ws.root;
@@ -196,11 +311,34 @@ pub fn open_pull_request(ws: &Workspace, plan: &Plan, repo: &Repo, gh: Option<&P
     std::fs::copy(&plan.source, &dest).with_context(|| format!("copying {} into the branch", plan.source.display()))?;
     let dest_s = plan.dest.to_string_lossy().replace('\\', "/");
     run(&git_exe, &dir, &["add", "--", &dest_s], log)?;
-    if run_output(&git(&git_exe, &dir, &["diff", "--cached", "--quiet"]))?.success {
+    if run_output(&git(&git_exe, &dir, &["diff", "--cached", "--quiet", "--", &dest_s]))?.success {
         bail!("{} is already identical on {}; there is nothing to promote.", plan.dest.display(), repo.base);
     }
+
+    // Hash what git commits: a clean filter (Yardstick's cleanSecrets) may
+    // rewrite the recipe, and the check hashes the committed version.
+    let blob = run_bytes(&git(&git_exe, &dir, &["cat-file", "blob", &format!(":{dest_s}")]))?;
+    let mut evidence = evidence.clone();
+    evidence.recipe_path = dest_s.clone();
+    evidence.recipe_sha256 = hash_bytes(&blob);
+    if evidence.tested_sha256.as_ref().is_some_and(|t| *t != evidence.recipe_sha256) {
+        log("Git's clean filter rewrote the recipe as it was committed; the evidence records the committed version.");
+    }
+    let evidence_rel = format!("{EVIDENCE_DIR}/{}.json", plan.id);
+    let evidence_path = dir.join(&evidence_rel);
+    std::fs::create_dir_all(evidence_path.parent().unwrap_or(&dir)).with_context(|| format!("creating {EVIDENCE_DIR}"))?;
+    std::fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)? + "\n").with_context(|| format!("writing {evidence_rel}"))?;
+    run(&git_exe, &dir, &["add", "--", &evidence_rel], log)?;
+    if !evidence.validated {
+        log(&format!("{}: not validated, so Yardstick's Recipe evidence check will fail until it is tested or the pull request is labelled evidence-waived.", plan.id));
+    }
+
     let title = format!("{} recipe: {}", if new { "Add" } else { "Update" }, plan.id);
-    let body = format!("{evidence}\n\nOpened by Yardstick Development Studio from Recipes/Development/{}.yaml.", plan.id);
+    let body = format!(
+        "{}\n\nEvidence: {evidence_rel}. Opened by Yardstick Development Studio from Recipes/Development/{}.yaml.",
+        evidence.summary(),
+        plan.id
+    );
     run(&git_exe, &dir, &["commit", "-m", &title, "-m", &body], log)?;
     run(&git_exe, &dir, &["push", "--force-with-lease", "origin", &format!("HEAD:refs/heads/{}", plan.branch)], log)?;
 
@@ -320,7 +458,11 @@ mod tests {
         };
         g(origin.path(), &["init", "--bare", "-b", "main"]);
         std::fs::write(root.join(".gitignore"), "/Recipes/Development/*\n/Icons/*\n/Local/\n").unwrap();
+        // Like Yardstick's cleanSecrets: recipes are rewritten as they are committed.
+        std::fs::write(root.join(".gitattributes"), "*.yaml filter=scrub\n").unwrap();
         g(root, &["init", "-b", "main"]);
+        g(root, &["config", "filter.scrub.clean", "sed -e s/secret.example/placeholder.example/"]);
+        g(root, &["config", "filter.scrub.smudge", "cat"]);
         g(root, &["-c", "user.name=t", "-c", "user.email=t@example.com", "add", "-A"]);
         g(root, &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-m", "base"]);
         g(root, &["remote", "add", "origin", &origin.path().to_string_lossy()]);
@@ -329,19 +471,48 @@ mod tests {
         g(root, &["config", "user.name", "Studio Test"]);
         g(root, &["config", "user.email", "studio@example.com"]);
 
-        std::fs::write(root.join(r"Recipes\Development\brave.yaml"), "id: brave\niconFile: brave.png\n").unwrap();
+        let dev_recipe = root.join(r"Recipes\Development\brave.yaml");
+        std::fs::write(&dev_recipe, "id: brave\niconFile: brave.png\nurl: https://secret.example/brave.msi\n").unwrap();
         std::fs::write(root.join(r"Icons\brave.png"), [7u8]).unwrap();
         std::fs::write(root.join(r"Local\preferences.yaml"), format!("developmentOnly: true\nSharedIcons: '{}'\n", share.path().display())).unwrap();
         let ws = Workspace::open(root, &[], &[]).unwrap();
         let p = plan(&ws, "brave").unwrap();
         let repo = Repo { remote_url: String::new(), web_url: "https://github.com/o/r".into(), base: "main".into() };
+
+        // A recipe that passed its live test, as the validation ledger records it.
+        let tested = crate::validation::recipe_hash(&dev_recipe).unwrap();
+        let record = crate::validation::Record { sha256: tested.clone(), warnings: false, tested: "20261109-100000".into(), summary_dir: None };
+        let result = RecipeResult {
+            id: "brave".into(),
+            version: Some("1.2.3".into()),
+            phases: crate::results::VALIDATION_PHASES.iter().map(|n| crate::results::Phase { name: Some(n.to_string()), status: "Pass".into(), ..Default::default() }).collect(),
+            ..Default::default()
+        };
+        let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_762_682_400);
+        let evidence = Evidence::new("brave", &Completion::Complete(record), Some(&result), Some(at));
         let mut lines = Vec::new();
-        let outcome = open_pull_request(&ws, &p, &repo, None, "Validated on 2026-11-09.", &mut |l| lines.push(l.to_string())).unwrap();
+        let outcome = open_pull_request(&ws, &p, &repo, None, &evidence, &mut |l| lines.push(l.to_string())).unwrap();
         assert_eq!(outcome, Outcome::Compare { url: "https://github.com/o/r/compare/main...studio/brave?expand=1".into() });
 
-        assert_eq!(g(origin.path(), &["show", "studio/brave:Recipes/brave.yaml"]).replace("\r\n", "\n"), "id: brave\niconFile: brave.png\n");
+        let committed = g(origin.path(), &["show", "studio/brave:Recipes/brave.yaml"]);
+        assert!(committed.contains("placeholder.example") && !committed.contains("secret.example"), "{committed}");
         let msg = g(origin.path(), &["log", "-1", "--format=%B", "studio/brave"]);
-        assert!(msg.starts_with("Add recipe: brave") && msg.contains("Validated on 2026-11-09."), "{msg}");
+        assert!(msg.starts_with("Add recipe: brave") && msg.contains("Validated: a live install test passed on 2025-11-09T10:00:00Z"), "{msg}");
+        assert!(msg.contains("Evidence: Tests/RecipeEvidence/brave.json"), "{msg}");
+
+        // The evidence describes the committed recipe, which the clean filter changed.
+        let json: serde_json::Value = serde_json::from_str(&g(origin.path(), &["show", "studio/brave:Tests/RecipeEvidence/brave.json"])).unwrap();
+        assert_eq!(json["schemaVersion"], 1);
+        assert_eq!(json["recipeId"], "brave");
+        assert_eq!(json["recipePath"], "Recipes/brave.yaml");
+        assert_eq!(json["validated"], true);
+        assert_eq!(json["verdict"], "Validated");
+        assert_eq!(json["testedAt"], "2025-11-09T10:00:00Z");
+        assert_eq!(json["installer"]["version"], "1.2.3");
+        assert_eq!(json["phases"].as_array().unwrap().len(), 8);
+        assert_eq!(json["recipeSha256"], hash_bytes(committed.as_bytes()));
+        assert_ne!(json["recipeSha256"], tested.as_str());
+        assert!(lines.iter().any(|l| l.contains("clean filter")), "{lines:#?}");
         assert_eq!(std::fs::read(share.path().join("brave.png")).unwrap(), [7u8]);
         // The user's checkout is untouched and the temporary branch is gone.
         assert_eq!(g(root, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(), "main");
@@ -350,13 +521,19 @@ mod tests {
 
         // Promoting again rebuilds the branch from main and updates it.
         std::fs::write(root.join(r"Recipes\Development\brave.yaml"), "id: brave\niconFile: brave.png\nversion: 2\n").unwrap();
-        open_pull_request(&ws, &p, &repo, None, "", &mut |_| {}).unwrap();
+        let changed = Evidence::new("brave", &Completion::NotValidated, None, None);
+        let mut lines = Vec::new();
+        open_pull_request(&ws, &p, &repo, None, &changed, &mut |l| lines.push(l.to_string())).unwrap();
         assert!(g(origin.path(), &["show", "studio/brave:Recipes/brave.yaml"]).contains("version: 2"));
+        let json: serde_json::Value = serde_json::from_str(&g(origin.path(), &["show", "studio/brave:Tests/RecipeEvidence/brave.json"])).unwrap();
+        assert_eq!((json["validated"].as_bool(), json["verdict"].as_str()), (Some(false), Some("NotValidated")));
+        assert_eq!(json["reason"], "no install test of this recipe has been recorded");
+        assert!(lines.iter().any(|l| l.contains("evidence-waived")), "{lines:#?}");
         assert_eq!(g(origin.path(), &["rev-list", "--count", "main..studio/brave"]).trim(), "1");
 
         // Once main has it, there is nothing to promote.
         g(origin.path(), &["update-ref", "refs/heads/main", "refs/heads/studio/brave"]);
-        let err = open_pull_request(&ws, &p, &repo, None, "", &mut |_| {}).unwrap_err();
+        let err = open_pull_request(&ws, &p, &repo, None, &changed, &mut |_| {}).unwrap_err();
         assert!(err.to_string().contains("already identical"), "{err:#}");
     }
 }

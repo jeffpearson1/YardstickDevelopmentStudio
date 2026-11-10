@@ -110,19 +110,47 @@ impl Ledger {
 /// SHA-256 of a recipe, ignoring a UTF-8 BOM and CRLF/LF differences so a git
 /// checkout's line endings do not change it.
 pub fn recipe_hash(path: &Path) -> Result<String> {
-    let text = crate::read_text(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(hash_text(&text))
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(hash_bytes(&bytes))
 }
 
 pub fn hash_text(text: &str) -> String {
-    let digest = Sha256::digest(text.replace("\r\n", "\n").as_bytes());
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    hash_bytes(text.as_bytes())
+}
+
+/// The recipe hash Yardstick's `Recipe evidence` check computes
+/// (`Get-RecipeContentHash`): SHA-256, as lowercase hex, of the bytes after
+/// dropping a leading UTF-8 BOM and replacing every CRLF with LF.
+pub fn hash_bytes(bytes: &[u8]) -> String {
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+            i += 1;
+            continue;
+        }
+        normalized.push(bytes[i]);
+        i += 1;
+    }
+    Sha256::digest(&normalized).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// The test vectors Yardstick's evidence check is tested against.
+    #[test]
+    fn matches_the_evidence_check_vectors() {
+        assert_eq!(hash_bytes(b"id: 7zip\n"), "dac9a5b6e5a249a1a674bd890731d93ada96e9fcb4b480a3659416695f52486b");
+        assert_eq!(hash_bytes(b"id: 7zip\r\n"), "dac9a5b6e5a249a1a674bd890731d93ada96e9fcb4b480a3659416695f52486b");
+        assert_eq!(hash_bytes(b"\xEF\xBB\xBFid: 7zip\r\ndisplayName: 7-Zip\r\n"), "bdd1fbad1c78330b232b808ca82235b077d59638a7ac4bec6cff4a734df27d06");
+        assert_eq!(hash_bytes(b"id: 7zip\ndisplayName: 7-Zip\n"), "bdd1fbad1c78330b232b808ca82235b077d59638a7ac4bec6cff4a734df27d06");
+        // A lone CR is content, not a line ending.
+        assert_ne!(hash_bytes(b"a\rb"), hash_bytes(b"a\nb"));
+    }
 
     #[test]
     fn line_endings_and_bom_do_not_change_the_hash() {

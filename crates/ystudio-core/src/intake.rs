@@ -1184,7 +1184,12 @@ impl Batch {
 
 /// UTC `YYYY-MM-DD HH:MM:SS`.
 pub fn timestamp() -> String {
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    utc_timestamp(std::time::SystemTime::now())
+}
+
+/// `t` in UTC as `YYYY-MM-DD HH:MM:SS`.
+pub fn utc_timestamp(t: std::time::SystemTime) -> String {
+    let secs = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let (days, rem) = (secs / 86_400, secs % 86_400);
     // Civil-from-days (Howard Hinnant).
     let z = days as i64 + 719_468;

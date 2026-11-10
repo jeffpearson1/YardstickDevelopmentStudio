@@ -8,8 +8,8 @@ use std::sync::mpsc::{Receiver, channel};
 
 use eframe::egui::{self, RichText, Ui};
 use ystudio_core::process::{ProcessSpec, RunningProcess, Stream};
-use ystudio_core::promote::{self, Outcome, Repo};
-use ystudio_core::results::{RecipeResult, VALIDATION_PHASES};
+use ystudio_core::promote::{self, Evidence, Outcome, Repo};
+use ystudio_core::results::{InstallRun, RecipeResult, VALIDATION_PHASES};
 use ystudio_core::validation::Completion;
 use ystudio_core::workspace::RecipeLocation;
 
@@ -52,21 +52,24 @@ fn repo(app: &mut StudioApp) -> Option<(Result<Repo, String>, Option<PathBuf>)> 
     app.promote.repo.as_ref().map(|(_, r, gh)| (r.clone(), gh.clone()))
 }
 
-/// What the commit and pull request say about testing.
-fn evidence(app: &StudioApp, id: &str) -> String {
-    match app.completion(id) {
-        Completion::Complete(r) => format!(
-            "Validated: a live install test passed{} on {} with exactly this recipe (SHA-256 {}).",
-            if r.warnings { " with warnings" } else { "" },
-            r.tested,
-            r.sha256
-        ),
-        Completion::Changed(r) => format!("Not validated: a live install test passed on {}, but the recipe has changed since.", r.tested),
-        Completion::NotValidated => match app.verdicts.get(id) {
-            Some((v, ts)) => format!("Not validated: the latest install test ({ts}) was: {}.", v.label()),
-            None => "Not validated: no install test has been recorded.".to_string(),
-        },
-    }
+/// The evidence committed with `id`, from the install test that validated it
+/// (else its latest one). `timed` reads when that test ran from the run
+/// folder, which touches the disk, so the dialogs leave it out.
+fn evidence(app: &StudioApp, id: &str, timed: bool) -> Evidence {
+    let completion = app.completion(id);
+    let result_in = |run: &InstallRun| run.summary.as_ref().and_then(|s| s.results.iter().find(|r| r.id == id)).is_some();
+    let validating = match completion {
+        Completion::Complete(r) | Completion::Changed(r) => r.summary_dir.as_ref(),
+        Completion::NotValidated => None,
+    };
+    let run = validating
+        .and_then(|dir| app.runs.iter().find(|run| ystudio_core::same_path(&run.dir, dir)))
+        .filter(|run| result_in(run))
+        .or_else(|| app.runs.iter().find(|run| result_in(run)));
+    let result = run.and_then(|run| run.summary.as_ref()?.results.iter().find(|r| r.id == id));
+    // The harness names run folders in local time; the folder's creation time is exact.
+    let at = run.filter(|_| timed).and_then(|run| std::fs::metadata(&run.dir).and_then(|m| m.created()).ok());
+    Evidence::new(id, completion, result, at)
 }
 
 pub fn show(app: &mut StudioApp, ui: &mut Ui) {
@@ -186,7 +189,7 @@ pub(crate) fn start(app: &mut StudioApp, ids: &[String]) {
     let mut work = Vec::new();
     for id in ids {
         match promote::plan(&ws, id) {
-            Ok(plan) => work.push((plan, evidence(app, id))),
+            Ok(plan) => work.push((plan, evidence(app, id, true))),
             Err(e) => app.error(format!("{id}: {e:#}")),
         }
     }
@@ -302,7 +305,7 @@ fn confirm_modal(app: &mut StudioApp, ctx: &egui::Context) {
                 for id in ids.iter().filter(|id| !app.completion(id).is_complete()) {
                     ui.add_space(8.0);
                     ui.label(RichText::new(id).strong().monospace());
-                    ui.label(RichText::new(evidence(app, id)).small());
+                    ui.label(RichText::new(evidence(app, id, false).summary()).small());
                     let latest = app.runs.iter().find_map(|run| {
                         run.summary.as_ref()?.results.iter().find(|r| r.id == *id).map(|result| (run, result))
                     });

@@ -1169,6 +1169,10 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         assert!(app.promote.selected.is_empty());
         let shipped = std::process::Command::new(&git_exe).args(["show", "studio/app:Recipes/app.yaml"]).current_dir(origin.path()).output().unwrap();
         assert!(String::from_utf8_lossy(&shipped.stdout).contains("id: app"));
+        // Never tested here, so the evidence says so and Yardstick's check will ask for a test or a waiver.
+        let evidence = std::process::Command::new(&git_exe).args(["show", "studio/app:Tests/RecipeEvidence/app.json"]).current_dir(origin.path()).output().unwrap();
+        let evidence: serde_json::Value = serde_json::from_slice(&evidence.stdout).unwrap();
+        assert_eq!((evidence["recipePath"].as_str(), evidence["validated"].as_bool()), (Some("Recipes/app.yaml"), Some(false)));
         render(&mut app, "publish-browser-prompt", 1400, 900);
     }
 

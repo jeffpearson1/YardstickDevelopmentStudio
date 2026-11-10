@@ -230,6 +230,12 @@ Enforcement:
   merged work. Icons go to the shared icon folder, not git. Recipes that are not *complete*
   (no passing live test of their current contents) show their recorded checks first, and
   the pull request says they are not validated. Nothing opens in the browser without asking.
+- **Merge gate.** Each pull request commits `Tests/RecipeEvidence/<id>.json`: the verdict,
+  the harness phases, when the test ran, and the SHA-256 of the recipe as git commits it
+  (BOM dropped, CRLF as LF; hashed from the staged blob, because Yardstick's `cleanSecrets`
+  clean filter can rewrite a recipe as it is committed). Yardstick's required `Recipe
+  evidence` check rejects a recipe whose evidence is missing, unvalidated or for other
+  contents, unless a maintainer labels the pull request `evidence-waived`.
 - **Agent guardrails.** Agents run in the development workspace only, and their file
   tools are confined to it (`--add-dir`, no `--allow-all-paths`). The shell tool may not
   run `Yardstick.ps1`, `Invoke-Yardstick`, `Publish-Yardstick.ps1` or `git push`. Review

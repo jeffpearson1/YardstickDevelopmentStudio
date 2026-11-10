@@ -126,3 +126,67 @@ fn development_only_setup_on_a_scratch_clone() {
     let reopened = Workspace::open(&root, &[], &[]).unwrap();
     assert!(reopened.development_only);
 }
+
+/// Publishes a recipe from a throwaway clone (to a local bare "origin" made
+/// from YSTUDIO_TEST_CLONE, never GitHub) and runs Yardstick's own
+/// `Test-RecipeEvidence.ps1` on the branch the Studio pushed.
+#[test]
+#[ignore]
+fn published_evidence_passes_yardsticks_recipe_evidence_check() {
+    use ystudio_core::promote::{self, Evidence, Repo};
+    use ystudio_core::results::{Phase, RecipeResult};
+    use ystudio_core::validation::{Completion, Record, recipe_hash};
+    let Some(src) = env_path("YSTUDIO_TEST_CLONE") else {
+        eprintln!("YSTUDIO_TEST_CLONE not set - skipping");
+        return;
+    };
+    let git_exe = ystudio_core::git::git_exe().unwrap();
+    let git = |cwd: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new(&git_exe).args(args).current_dir(cwd).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let (bare, work) = (tmp.path().join("origin.git"), tmp.path().join("work"));
+    git(tmp.path(), &["clone", "-q", "--bare", &src.to_string_lossy(), &bare.to_string_lossy()]);
+    git(tmp.path(), &["clone", "-q", &bare.to_string_lossy(), &work.to_string_lossy()]);
+    git(&work, &["config", "user.name", "Studio Test"]);
+    git(&work, &["config", "user.email", "studio@example.com"]);
+    std::fs::create_dir_all(work.join("Local")).unwrap();
+    std::fs::write(work.join(r"Local\preferences.yaml"), "developmentOnly: true\n").unwrap();
+    let dev = work.join(r"Recipes\Development\7zip.yaml");
+    std::fs::create_dir_all(dev.parent().unwrap()).unwrap();
+    let recipe = std::fs::read_to_string(work.join(r"Recipes\7zip.yaml")).unwrap();
+    std::fs::write(&dev, format!("{}\n# Published by the Studio's live evidence test.\n", recipe.trim_end())).unwrap();
+
+    let ws = Workspace::open(&work, &[], &[]).unwrap();
+    let plan = promote::plan(&ws, "7zip").unwrap();
+    let repo = Repo { remote_url: bare.to_string_lossy().into_owned(), web_url: "https://github.com/o/r".into(), base: "main".into() };
+    let phases = ["Schema", "Download", "PreDetect", "Install", "PostInstallDetect", "Uninstall", "PostUninstallDetect", "Residue"]
+        .map(|n| Phase { name: Some(n.into()), status: "Pass".into(), ..Default::default() })
+        .to_vec();
+    let result = RecipeResult { id: "7zip".into(), phases, ..Default::default() };
+    let record = Record { sha256: recipe_hash(&dev).unwrap(), warnings: false, tested: "now".into(), summary_dir: None };
+    let check = |label: &str| {
+        git(&work, &["fetch", "-q", "origin"]);
+        git(&work, &["checkout", "-q", "-B", label, "origin/studio/7zip"]);
+        let script = work.join(r"Tests\RecipeHarness\Test-RecipeEvidence.ps1");
+        let summary = tmp.path().join(format!("{label}.md"));
+        let pwsh = ystudio_core::setup::pwsh7(None).expect("PowerShell 7");
+        let spec = ProcessSpec::new("Test-RecipeEvidence", pwsh, &work).args([
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", &script.to_string_lossy(),
+            "-BaseRef", "origin/main", "-SummaryPath", &summary.to_string_lossy(),
+        ]);
+        let proc = run(spec, Duration::from_secs(300));
+        println!("{}", std::fs::read_to_string(&summary).unwrap_or_default());
+        git(&work, &["checkout", "-q", "main"]);
+        proc.succeeded()
+    };
+
+    let validated = Evidence::new("7zip", &Completion::Complete(record), Some(&result), Some(std::time::SystemTime::now()));
+    promote::open_pull_request(&ws, &plan, &repo, None, &validated, &mut |l| println!("{l}")).unwrap();
+    assert!(check("validated"), "the check rejected validated evidence");
+
+    let untested = Evidence::new("7zip", &Completion::NotValidated, None, None);
+    promote::open_pull_request(&ws, &plan, &repo, None, &untested, &mut |l| println!("{l}")).unwrap();
+    assert!(!check("untested"), "the check accepted unvalidated evidence");
+}
