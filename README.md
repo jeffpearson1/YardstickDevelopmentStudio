@@ -153,12 +153,20 @@ from about 1.8 fps to about 100 fps.
 
 ## First run
 
-1. Launch the Studio. The setup wizard opens: clone a development workspace (or open one;
-   `C:\Intune\Yardstick` stays read-only as *Production*), check the tools, and run
-   Yardstick's development-only setup. Settings are stored in
+1. Launch the Studio. The setup wizard opens. It checks the tools (PowerShell 7, Git, gh,
+   and an agent CLI): it installs a missing one with winget and signs gh, git and the agent
+   in through a console window. Then clone a development workspace (or open one;
+   `C:\Intune\Yardstick` stays read-only as *Production*), and run Yardstick's
+   development-only setup. A shared icon or overrides folder on a mapped drive is stored as
+   its network path, so elevated test runs can reach it. Settings are stored in
    `%APPDATA%\YardstickStudio\settings.json`, which also holds the production paths and
    trusted development paths.
-2. Run setup again at any time from **Settings**.
+2. Run setup again at any time from **Settings**. The Studio checks the tools and sign-ins
+   at every start. If something is missing or signed out, Home says so. After an update, the
+   wizard's Tools step opens if PowerShell 7, Git, gh or the chosen agent CLI is missing.
+   For troubleshooting, **Settings → Troubleshooting → Diagnostic logging** keeps every
+   job's full command line and output, the Studio's messages, and the agent CLI's own
+   debug log and session transcript in `%APPDATA%\YardstickStudio\logs` (14 days).
 3. From **Home**, start a **New recipe** (the agent writes, tests and repairs it), import
    requests, or open a recipe and *Copy to Development* to edit it on its **Design** tab.
 4. On the recipe's **Test** tab, run *safe checks*, then a live install test. A passing

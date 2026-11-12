@@ -117,6 +117,8 @@ pub enum JobKind {
     SetupStatus { result: PathBuf },
     /// The wizard's development-only `Install-Yardstick` run.
     Setup { result: PathBuf },
+    /// `winget install` of a missing tool, or `gh auth setup-git`.
+    InstallTool,
 }
 
 pub struct Job {
@@ -246,6 +248,8 @@ pub struct WsCache {
     pub groups: Vec<String>,
     pub has_skill: bool,
     pub documents: Vec<(String, PathBuf)>,
+    /// Production's software dropbox, when this workspace has none of its own.
+    pub production_dropbox: Option<PathBuf>,
 }
 
 pub enum Pending {
@@ -297,6 +301,10 @@ pub struct StudioApp {
     pub update: views::update::UpdateState,
     pub settings_ui: views::settings::SettingsState,
     pub setup: views::setup::SetupState,
+    pub tools: views::tools::ToolsState,
+    /// The UAC prompt was just answered: bring the window back to the front,
+    /// which the prompt and the hidden worker took the foreground from.
+    pub refocus: bool,
     pub workflow: crate::workflow::State,
     pub elevation: crate::elevation::State,
 }
@@ -354,7 +362,7 @@ impl StudioApp {
             library: Default::default(), bench: Default::default(), agent: Default::default(),
             batch: Default::default(), icons: Default::default(), runs_ui: Default::default(),
             docs: Default::default(), promote: Default::default(), update: Default::default(), workflow: Default::default(),
-            elevation: Default::default(),
+            elevation: Default::default(), tools: views::tools::ToolsState::fixed(), refocus: false,
         };
         app.refresh_recipes();
         app
@@ -420,6 +428,8 @@ impl StudioApp {
             update: Default::default(),
             workflow: Default::default(),
             elevation: Default::default(),
+            tools: Default::default(),
+            refocus: false,
         };
         theme::install_fonts(egui_ctx);
         app.apply_theme(egui_ctx);
@@ -435,6 +445,11 @@ impl StudioApp {
         }
         app.handle_args(std::env::args().skip(1).collect());
         views::setup::maybe_start(&mut app);
+        views::tools::start(&mut app);
+        if app.settings.diagnostic_logging {
+            ystudio_core::diagnostics::prune();
+            ystudio_core::diagnostics::note(&format!("Studio {} started.", env!("CARGO_PKG_VERSION")));
+        }
         if app.settings.auto_check_updates {
             views::update::start_check(&mut app, true);
         }
@@ -448,6 +463,8 @@ impl StudioApp {
         while let Some(a) = it.next() {
             match a.as_str() {
                 "--updated" => {
+                    // An update may need a newer tool: offer to install what is missing.
+                    self.tools.open_if_missing = true;
                     if let Some(code) = it.next() {
                         let log = it.next();
                         views::update::report_installed(self, &code, log.as_deref());
@@ -489,11 +506,19 @@ impl StudioApp {
     }
 
     pub fn notify(&mut self, text: impl Into<String>) {
-        self.status = Status { text: text.into(), error: false, at: Some(Instant::now()) };
+        let text = text.into();
+        if self.settings.diagnostic_logging {
+            ystudio_core::diagnostics::note(&text);
+        }
+        self.status = Status { text, error: false, at: Some(Instant::now()) };
     }
 
     pub fn error(&mut self, text: impl Into<String>) {
-        self.status = Status { text: text.into(), error: true, at: Some(Instant::now()) };
+        let text = text.into();
+        if self.settings.diagnostic_logging {
+            ystudio_core::diagnostics::note(&format!("ERROR {text}"));
+        }
+        self.status = Status { text, error: true, at: Some(Instant::now()) };
     }
 
     pub fn writable(&self) -> bool {
@@ -522,6 +547,8 @@ impl StudioApp {
                 self.notify(format!("Opened {} - {label}", path.display()));
                 self.refresh_git_status();
                 self.refresh_remote(false);
+                // Git's push check follows the workspace.
+                views::tools::start(self);
             }
             Err(e) => {
                 self.ws_error = Some(format!("{e:#}"));
@@ -552,11 +579,20 @@ impl StudioApp {
             return;
         };
         self.recipes = ws.list_recipes();
+        let production_dropbox = if ws.software_dropbox.is_none() {
+            self.settings
+                .primary_production()
+                .and_then(|p| Workspace::open(p, &self.settings.production_paths, &[]).ok())
+                .and_then(|prod| prod.software_dropbox)
+        } else {
+            None
+        };
         self.ws_cache = WsCache {
             icons: ws.list_icons(),
             groups: ws.recipe_groups().into_keys().collect(),
             has_skill: ws.has_skill(),
             documents: ws.documents(),
+            production_dropbox,
         };
         self.refresh_completion();
     }
@@ -600,7 +636,7 @@ impl StudioApp {
             .map(|w| git::status(&w.root).map_err(|e| format!("{e:#}")));
     }
 
-    fn job_running(&self, pred: impl Fn(&JobKind) -> bool) -> bool {
+    pub(crate) fn job_running(&self, pred: impl Fn(&JobKind) -> bool) -> bool {
         self.jobs.iter().any(|j| pred(&j.kind) && j.proc.is_running())
     }
 
@@ -874,6 +910,12 @@ impl StudioApp {
         let Some(idx) = self.jobs.iter().position(|j| j.id == id) else { return };
         self.jobs[idx].handled = true;
         self.record_usage(idx);
+        if self.settings.diagnostic_logging {
+            match ystudio_core::diagnostics::write_job(&self.jobs[idx].proc, self.jobs[idx].started_sys) {
+                Ok(path) => ystudio_core::diagnostics::note(&format!("{} finished; log {}", self.jobs[idx].proc.spec.label, path.display())),
+                Err(e) => ystudio_core::diagnostics::note(&format!("Could not write a job log: {e:#}")),
+            }
+        }
         let ok = self.jobs[idx].proc.succeeded();
         let cancelled = self.jobs[idx].proc.cancelled;
         let started = self.jobs[idx].started_sys;
@@ -945,18 +987,27 @@ impl StudioApp {
                     }
                 }
                 let n = self.agent.changes.iter().filter(|c| !matches!(c, Change::Removed(_))).count();
-                if ok {
-                    self.notify(format!("Agent finished: {n} file(s) changed."));
-                } else {
-                    self.error(format!("Agent exited with an error ({n} file(s) changed)."));
-                }
                 let needs_approval = ystudio_core::agent::needs_approval(&text);
-                if needs_approval {
-                    self.error(crate::workflow::NEEDS_APPROVAL_NOTE);
+                // What the agent said stopped it, shown as is: a generic
+                // "failed" hides blockers only the user can clear.
+                let blocker = if needs_approval {
+                    Some(crate::workflow::NEEDS_APPROVAL_NOTE.to_string())
+                } else {
+                    ystudio_core::agent::blocked_reason(&text).map(|r| format!("Blocked: {r}"))
+                };
+                match &blocker {
+                    Some(b) => self.error(format!("Agent stopped ({n} file(s) changed). {b}")),
+                    None if ok => self.notify(format!("Agent finished: {n} file(s) changed.")),
+                    None => self.error(format!("Agent exited with an error ({n} file(s) changed).")),
                 }
-                let blocked = needs_approval || ystudio_core::agent::blocked_reason(&text).is_some();
+                let blocked = blocker.is_some();
                 if let Some((batch_id, idx)) = &batch_item {
-                    views::batch::agent_finished(self, batch_id, *idx, ok && !blocked, verification.is_some());
+                    let outcome = match &blocker {
+                        Some(b) => Err(b.clone()),
+                        None if ok => Ok(()),
+                        None => Err("agent exited with an error".to_string()),
+                    };
+                    views::batch::agent_finished(self, batch_id, *idx, outcome, verification.is_some());
                 }
                 if let Some(verification) = verification {
                     let resume_batch = batch_item.is_some();
@@ -969,11 +1020,7 @@ impl StudioApp {
                             views::batch::check_finished(self, batch_id, *idx, ystudio_core::intake::BatchCheck {
                                 recipe: target.id,
                                 passed: false,
-                                note: if needs_approval {
-                                    crate::workflow::NEEDS_APPROVAL_NOTE.into()
-                                } else {
-                                    "Authoring agent failed or reported an environmental blocker.".into()
-                                },
+                                note: blocker.clone().unwrap_or_else(|| "The authoring agent exited with an error; see its log.".into()),
                                 timestamp: ystudio_core::intake::timestamp(), summary_dir: None, live: false,
                             });
                             views::batch::start_next(self);
@@ -1032,13 +1079,22 @@ impl StudioApp {
                     // Icon existence may have changed.
                     r.lint_rev = 0;
                 }
-                if ok {
+                // The sync never fails outright: an unreachable share or a bad
+                // overrides path is a warning, and must not read as success.
+                let warnings: Vec<&str> = text.lines().filter_map(|l| l.trim().strip_prefix("WARNING:")).map(str::trim).collect();
+                if let Some(first) = warnings.first() {
+                    self.console_job = Some(id);
+                    self.console_open = true;
+                    let more = if warnings.len() > 1 { format!(" (and {} more)", warnings.len() - 1) } else { String::new() };
+                    self.error(format!("Shared sync: {first}{more}"));
+                } else if ok {
                     let summary = text.lines().rev().find(|l| l.starts_with("Synced ")).map(str::to_string);
                     self.notify(summary.unwrap_or_else(|| "Synced shared icons and recipe overrides.".into()));
                 } else {
                     self.error("Shared icon/override sync failed - see the console.");
                 }
             }
+            JobKind::InstallTool => views::tools::install_finished(self, ok),
         }
     }
 
@@ -1409,6 +1465,10 @@ impl StudioApp {
         let ctx = ui.ctx().clone();
         self.poll_jobs();
         views::update::poll(self);
+        views::tools::poll(self, &ctx);
+        if std::mem::take(&mut self.refocus) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         self.shortcuts(&ctx);
         self.relint();
         if self.running_jobs() > 0 {
@@ -1429,7 +1489,9 @@ impl StudioApp {
             .frame(egui::Frame::new().fill(base).inner_margin(egui::Margin::symmetric(12, 4)))
             .show(ui, |ui| self.status_bar(ui));
         if self.console_open {
-            egui::Panel::bottom("console").resizable(true).default_size(240.0).min_size(100.0).show(ui, |ui| self.console(ui));
+            // Never so tall that the page above loses its content.
+            let max = (ui.available_height() - 400.0).max(100.0);
+            egui::Panel::bottom("console").resizable(true).default_size(240.0).size_range(100.0..=max).show(ui, |ui| self.console(ui));
         }
         let content = {
             let p = theme::palette();

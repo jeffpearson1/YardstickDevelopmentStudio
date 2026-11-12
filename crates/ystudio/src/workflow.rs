@@ -472,7 +472,9 @@ fn environmental(text: &str) -> bool {
     ["msi 1618", "exit code 1618", "exitcode: 1618", "another installation is already in progress",
         "access is denied", "requires elevation", "elevation was cancelled", "user canceled", "user cancelled",
         "intunewin32app module is not", "no licensed installer", "no installer found in",
-        "already installed", "already detected", "elevated worker ended", "refused by the elevated worker"].iter().any(|s| text.contains(s))
+        "already installed", "already detected", "elevated worker ended", "refused by the elevated worker",
+        // manualDownload media the user has to stage: no agent can fix that.
+        "no softwaredropbox path is configured", "nothing is staged in the software dropbox"].iter().any(|s| text.contains(s))
 }
 
 pub fn harness_finished(app: &mut StudioApp, step: Step, id: &str, ok: bool, started: SystemTime, text: String) {
@@ -687,6 +689,8 @@ mod tests {
     fn environmental_failures_do_not_trigger_recipe_repairs() {
         assert!(environmental("MSI exit code 1618"));
         assert!(environmental("App already installed; refusing without -Force"));
+        assert!(environmental("Recipe sets manualDownload but no SoftwareDropbox path is configured in preferences.yaml."));
+        assert!(environmental("Nothing is staged in the software dropbox for 'autodeskrevit' (folder 'Revit')."));
         assert!(!environmental("PostInstallDetect failed: wrong detection rule"));
     }
 
@@ -1003,6 +1007,40 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         }
     }
 
+    /// A short window with the console open: the request log must not cover
+    /// the header, and the table must stay between the two.
+    #[test]
+    fn requests_log_leaves_room_for_the_table_in_a_short_window() {
+        let (dir, mut app) = fake_app();
+        let mut batch = ystudio_core::intake::Batch::from_items("short", vec![ystudio_core::intake::BatchItem {
+            app: "App".into(), source: "#1".into(), include: true, existing_recipe: "app".into(), ..Default::default()
+        }]);
+        batch.id = dir.path().join("short-batch").to_string_lossy().into_owned();
+        assert!(crate::views::batch::open_made(&mut app, batch));
+        let spec = |n: u32| ystudio_core::process::ProcessSpec::new("log", "cmd", dir.path()).args(["/d", "/c", &format!("for /l %i in (1,1,{n}) do @echo line %i")]);
+        let log = app.start_job(spec(40), JobKind::GitFetch).unwrap();
+        let console = app.start_job(spec(10), JobKind::GitFetch).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while [log, console].iter().any(|j| app.job(*j).unwrap().proc.is_running()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            app.poll_for_tests();
+        }
+        app.batch.run_job = Some(log);
+        app.batch.show_log = true;
+        app.console_open = true;
+        app.console_job = Some(console);
+        render(&mut app, "requests-log-short", 1315, 697);
+        render(&mut app, "requests-log-minimum", 900, 600);
+        app.console_open = false;
+        render(&mut app, "requests-log-tall", 1400, 900);
+        // Licensed media with nowhere to stage it: warned before anything runs.
+        let recipe = dir.path().join(r"Recipes\Development\app.yaml");
+        let text = std::fs::read_to_string(&recipe).unwrap();
+        std::fs::write(&recipe, text + "manualDownload: true\n").unwrap();
+        app.refresh_recipes();
+        render(&mut app, "requests-no-dropbox", 1400, 900);
+    }
+
     #[test]
     fn batch_agent_and_consent_surfaces_render_at_normal_and_minimum_widths() {
         let (_dir, mut app) = fake_app();
@@ -1206,8 +1244,8 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         assert_eq!(crate::views::batch::task_for(&app, app.batch.batch.as_ref().unwrap(), 1), Some(review));
         // Both finish without checks: the fix wrote the recipe, the review only read it.
         app.agent.reported = vec!["app".into()];
-        crate::views::batch::agent_finished(&mut app, &batch_id, 0, true, false);
-        crate::views::batch::agent_finished(&mut app, &batch_id, 1, true, false);
+        crate::views::batch::agent_finished(&mut app, &batch_id, 0, Ok(()), false);
+        crate::views::batch::agent_finished(&mut app, &batch_id, 1, Ok(()), false);
         let saved = ystudio_core::intake::Batch::load(std::path::Path::new(&batch_id)).unwrap();
         assert!(saved.items.iter().all(|i| i.status == ystudio_core::intake::ItemStatus::Done));
         assert_eq!(saved.items[1].action, ystudio_core::intake::ItemAction::Review);
@@ -1313,7 +1351,30 @@ Copy-Item (Join-Path $PSScriptRoot 'result.fake.json') $ResultPath
         crate::views::setup::open(&mut app, crate::views::setup::Step::Workspace);
         render(&mut app, "setup-workspace", 1400, 900);
         app.setup.step = crate::views::setup::Step::Tools;
+        render(&mut app, "setup-tools-checking", 1400, 900);
+        use ystudio_core::agent::AgentBackend;
+        use ystudio_core::prereqs::{Report, SignIn, Tool};
+        app.tools.report = Some(Report {
+            paths: vec![
+                (Tool::PowerShell, Some(r"C:\Program Files\PowerShell\7\pwsh.exe".into())),
+                (Tool::Git, None),
+                (Tool::Gh, Some(r"C:\Program Files\GitHub CLI\gh.exe".into())),
+                (Tool::Agent(AgentBackend::CopilotCli), Some(r"C:\Users\me\AppData\Local\GitHubCopilotCLI\copilot.exe".into())),
+                (Tool::Agent(AgentBackend::ClaudeCode), None),
+            ],
+            sign_in: vec![
+                (Tool::Gh, SignIn::SignedOut("You are not logged into any GitHub hosts.".into())),
+                (Tool::Agent(AgentBackend::CopilotCli), SignIn::SignedIn { account: Some("octocat".into()) }),
+            ],
+            git_checked_push: false,
+            winget: Some("winget.exe".into()),
+        });
         render(&mut app, "setup-tools", 1400, 900);
+        app.settings.setup_done = true;
+        app.view = crate::app::View::Home;
+        render(&mut app, "home-tools-banner", 1400, 900);
+        app.view = crate::app::View::Setup;
+        app.tools.report.as_mut().unwrap().paths[1].1 = Some(r"C:\Program Files\Git\cmd\git.exe".into());
 
         // Entering the Yardstick step reads the status in the background.
         app.setup.step = crate::views::setup::Step::Yardstick;

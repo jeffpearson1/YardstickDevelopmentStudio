@@ -4,6 +4,7 @@
 //! state owned by these types and forwards user intent to them.
 
 pub mod agent;
+pub mod diagnostics;
 pub mod elevation;
 pub mod fields;
 pub mod git;
@@ -11,6 +12,7 @@ pub mod harness;
 pub mod icons;
 pub mod intake;
 pub mod lint;
+pub mod prereqs;
 pub mod process;
 pub mod promote;
 pub mod recipe;
@@ -31,7 +33,10 @@ pub const DEFAULT_PRODUCTION_PATH: &str = r"C:\Intune\Yardstick";
 pub fn normalize_path(path: &std::path::Path) -> String {
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut s = resolved.to_string_lossy().replace('/', "\\");
-    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+    // Canonical network paths are `\\?\UNC\server\share`.
+    if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
+        s = format!(r"\\{stripped}");
+    } else if let Some(stripped) = s.strip_prefix(r"\\?\") {
         s = stripped.to_string();
     }
     while s.ends_with('\\') && s.len() > 3 {
@@ -49,4 +54,16 @@ pub fn read_text(path: &std::path::Path) -> std::io::Result<String> {
     let bytes = std::fs::read(path)?;
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
     Ok(String::from_utf8_lossy(bytes).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    #[test]
+    fn network_paths_compare_with_their_canonical_form() {
+        assert_eq!(super::normalize_path(Path::new(r"\\?\UNC\Server\Share\Icons\")), r"\\server\share\icons");
+        assert!(super::same_path(Path::new(r"\\?\UNC\server\share\Icons"), Path::new(r"\\Server\Share\icons\")));
+        assert_eq!(super::normalize_path(Path::new(r"\\?\C:\Missing\Folder")), r"c:\missing\folder");
+    }
 }

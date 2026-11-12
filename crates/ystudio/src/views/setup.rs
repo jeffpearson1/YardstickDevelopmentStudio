@@ -1,4 +1,4 @@
-//! First-run setup: a development workspace, the tools the Studio needs, and
+//! First-run setup: the tools the Studio needs, a development workspace, and
 //! Yardstick's own development-only setup, answered in the GUI and applied by
 //! `Install-Yardstick.ps1 -NonInteractive` (see `ystudio_core::setup`).
 
@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use eframe::egui::{self, RichText, Ui};
 use ystudio_core::agent::AgentBackend;
-use ystudio_core::process::find_program;
+use ystudio_core::prereqs::Tool;
 use ystudio_core::setup::{self, Answers, SetupResult, Status};
 use ystudio_core::workspace::WorkspaceKind;
 
@@ -17,16 +17,16 @@ use crate::theme::{self, FluentText as _};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Step {
     #[default]
-    Workspace,
     Tools,
+    Workspace,
     Yardstick,
     Done,
 }
 
 impl Step {
     const ALL: [(Step, &'static str); 4] = [
-        (Step::Workspace, "Workspace"),
         (Step::Tools, "Tools"),
+        (Step::Workspace, "Workspace"),
         (Step::Yardstick, "Set up Yardstick"),
         (Step::Done, "Done"),
     ];
@@ -60,26 +60,7 @@ pub struct SetupState {
     set_policy: bool,
     shared_icons: String,
     shared_overrides: String,
-    /// The tool check, run once per visit to the Tools step.
-    tools: Option<Tools>,
-}
-
-struct Tools {
-    pwsh: Option<PathBuf>,
-    git: Option<PathBuf>,
-    gh: Option<PathBuf>,
-    agents: [Option<PathBuf>; AgentBackend::ALL.len()],
-}
-
-impl Tools {
-    fn probe(configured: Option<&std::path::Path>) -> Self {
-        Self {
-            pwsh: setup::pwsh7(configured),
-            git: find_program("git", &[]),
-            gh: find_program("gh", &[]),
-            agents: AgentBackend::ALL.map(|b| b.locate()),
-        }
-    }
+    software_dropbox: String,
 }
 
 fn result_path(kind: &str) -> PathBuf {
@@ -97,20 +78,22 @@ pub fn maybe_start(app: &mut StudioApp) {
         app.save_settings();
         return;
     }
-    open(app, Step::Workspace);
+    open(app, Step::Tools);
 }
 
 /// Shows the wizard at `step` (Settings and Home reopen it).
 pub fn open(app: &mut StudioApp, step: Step) {
     app.setup.step = step;
-    app.setup.tools = None;
     app.view = View::Setup;
+    if step == Step::Tools {
+        super::tools::recheck(app);
+    }
 }
 
 fn finish(app: &mut StudioApp, to: View) {
     app.settings.setup_done = true;
     app.save_settings();
-    app.setup.step = Step::Workspace;
+    app.setup.step = Step::default();
     app.view = to;
 }
 
@@ -155,13 +138,11 @@ fn nav_buttons(app: &mut StudioApp, ui: &mut Ui, back: Option<Step>, next: Optio
             && ui.button("Back").clicked()
         {
             app.setup.step = step;
-            app.setup.tools = None;
         }
         if let Some((step, enabled, why)) = next {
             let r = theme::primary(ui, enabled, "Next");
             if r.clicked() {
                 app.setup.step = step;
-                app.setup.tools = None;
             } else if !enabled {
                 r.on_disabled_hover_text(why);
             }
@@ -204,62 +185,20 @@ fn workspace_step(app: &mut StudioApp, ui: &mut Ui) {
         super::home::create_footer(app, ui);
     });
     let ready = app.writable();
-    nav_buttons(app, ui, None, Some((Step::Tools, ready, "Open or clone a development workspace first.")));
-}
-
-fn tool_row(ui: &mut Ui, name: &str, found: &Option<PathBuf>, required: bool, what: &str, help: Option<(&str, &str)>) {
-    ui.horizontal_wrapped(|ui| {
-        match found {
-            Some(p) => {
-                ui.colored_label(theme::green(), "\u{E73E}");
-                ui.label(RichText::new(name).semibold());
-                ui.label(RichText::new(p.display().to_string()).small().monospace().weak());
-            }
-            None => {
-                ui.colored_label(if required { theme::red() } else { theme::amber() }, "\u{E711}");
-                ui.label(RichText::new(name).semibold());
-                ui.label(RichText::new(if required { "required" } else { "optional" }).small().weak());
-                if let Some((label, url)) = help {
-                    ui.hyperlink_to(label, url);
-                }
-            }
-        }
-    });
-    ui.label(RichText::new(what).small().weak());
-    ui.add_space(4.0);
+    nav_buttons(app, ui, Some(Step::Tools), Some((Step::Yardstick, ready, "Open or clone a development workspace first.")));
 }
 
 fn tools_step(app: &mut StudioApp, ui: &mut Ui) {
-    let configured = app.settings.powershell_path.clone();
-    let tools = app.setup.tools.get_or_insert_with(|| Tools::probe(configured.as_deref()));
-    let (pwsh, git) = (tools.pwsh.is_some(), tools.git.is_some());
-    let any_agent = tools.agents.iter().any(Option::is_some);
-    theme::card(ui, |ui| {
-        theme::section_heading(ui, "Tools");
-        tool_row(ui, "PowerShell 7", &tools.pwsh, true, "Runs Yardstick's setup and the recipe harness.", Some(("Install: winget install --id Microsoft.PowerShell", "https://aka.ms/powershell")));
-        tool_row(ui, "Git", &tools.git, true, "Clones and updates the workspace, and publishes recipes as pull requests.", Some(("Get Git (or install it from Company Portal)", "https://git-scm.com/download/win")));
-        tool_row(ui, "GitHub CLI (gh)", &tools.gh, false, "Opens pull requests for you. Without it, the Studio offers GitHub's page instead.", Some(("Get gh", "https://cli.github.com")));
-        for (b, found) in AgentBackend::ALL.iter().zip(&tools.agents) {
-            let help = match b {
-                AgentBackend::CopilotCli => ("Get GitHub Copilot CLI", "https://github.com/github/copilot-cli"),
-                AgentBackend::ClaudeCode => ("Get Claude Code", "https://github.com/anthropics/claude-code"),
-            };
-            tool_row(ui, b.label(), found, false, "A coding agent that writes and repairs recipes. You need one of the two.", Some(help));
-        }
-    });
-    if !any_agent {
+    super::tools::card(app, ui);
+    let report = app.tools.report.as_ref();
+    let found = |t: Tool| report.is_some_and(|r| r.path(t).is_some());
+    let (pwsh, git) = (found(Tool::PowerShell), found(Tool::Git));
+    if report.is_some() && !AgentBackend::ALL.iter().any(|b| found(Tool::Agent(*b))) {
         ui.add_space(4.0);
         ui.colored_label(theme::amber(), "Without an agent CLI you can still design and test recipes by hand.");
     }
-    ui.add_space(6.0);
-    if ui.button("\u{E72C}  Re-check").on_hover_text("Looks again, including tools installed since the Studio started.").clicked() {
-        let _ = ystudio_core::process::refresh_path();
-        app.setup.tools = None;
-        app.agent.backends_found = None;
-        app.settings_ui.tools = None;
-    }
     let why = if !pwsh { "PowerShell 7 is required." } else { "Git is required." };
-    nav_buttons(app, ui, Some(Step::Workspace), Some((Step::Yardstick, pwsh && git, why)));
+    nav_buttons(app, ui, None, Some((Step::Workspace, pwsh && git, why)));
 }
 
 /// Pre-fills the answers from what is already in place.
@@ -270,6 +209,7 @@ fn prefill(st: &mut SetupState, status: &Status) {
     // The installer reports the overrides file; the folder is what people know.
     let overrides = &status.preferences.shared_recipe_overrides;
     st.shared_overrides = overrides.strip_suffix("\\recipeOverrides.yaml").unwrap_or(overrides).to_string();
+    st.software_dropbox = status.preferences.software_dropbox.clone();
 }
 
 fn yardstick_step(app: &mut StudioApp, ui: &mut Ui) {
@@ -290,7 +230,7 @@ fn yardstick_step(app: &mut StudioApp, ui: &mut Ui) {
                 Err(e) => app.error(format!("{e:#}")),
             }
         }
-        nav_buttons(app, ui, Some(Step::Tools), Some((Step::Done, true, "")));
+        nav_buttons(app, ui, Some(Step::Workspace), Some((Step::Done, true, "")));
         return;
     }
     let Some(pwsh) = setup::pwsh7(app.settings.powershell_path.as_deref()) else {
@@ -321,7 +261,7 @@ fn yardstick_step(app: &mut StudioApp, ui: &mut Ui) {
             if ui.button("Try again").clicked() {
                 app.setup.checked_root = None;
             }
-            nav_buttons(app, ui, Some(Step::Tools), None);
+            nav_buttons(app, ui, Some(Step::Workspace), None);
             return;
         }
         Check::Ready(_) => {}
@@ -329,6 +269,7 @@ fn yardstick_step(app: &mut StudioApp, ui: &mut Ui) {
     let Check::Ready(status) = &app.setup.check else { return };
     let status = status.clone();
     let running = matches!(app.setup.run, Run::Running(_));
+    let takes_dropbox = setup::supports_dropbox(&ws);
     let st = &mut app.setup;
 
     theme::card(ui, |ui| {
@@ -377,7 +318,11 @@ fn yardstick_step(app: &mut StudioApp, ui: &mut Ui) {
         ui.add_space(8.0);
         ui.label(RichText::new("Shared with your team").semibold());
         ui.label(RichText::new("Icons and site-specific recipe overrides kept in a shared folder. Leave blank to keep them on this computer.").small().weak());
-        for (label, text) in [("Icon folder", &mut st.shared_icons), ("Recipe overrides folder", &mut st.shared_overrides)] {
+        let mut fields = vec![("Icon folder", &mut st.shared_icons), ("Recipe overrides folder", &mut st.shared_overrides)];
+        if takes_dropbox {
+            fields.push(("Software dropbox", &mut st.software_dropbox));
+        }
+        for (label, text) in fields {
             ui.horizontal(|ui| {
                 ui.allocate_ui_with_layout(egui::vec2(170.0, 22.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.set_width(170.0);
@@ -387,11 +332,20 @@ fn yardstick_step(app: &mut StudioApp, ui: &mut Ui) {
                 if ui.add_enabled(!running, egui::Button::new("Browse…")).clicked()
                     && let Some(p) = rfd::FileDialog::new().pick_folder()
                 {
-                    *text = p.display().to_string();
+                    // A mapped drive letter becomes its network path, which elevated runs can reach.
+                    *text = setup::network_path(&p.display().to_string());
                 }
             });
         }
         let mut notes = Vec::new();
+        if takes_dropbox {
+            notes.push("The software dropbox holds licensed media for recipes with manualDownload: true; without one they cannot be tested.".to_string());
+        } else {
+            notes.push(format!(
+                "This installer cannot set the software dropbox (licensed media for manualDownload recipes). Set SoftwareDropbox in {} by hand.",
+                status.preferences.path
+            ));
+        }
         if status.unwritable_paths.count > 0 {
             notes.push(format!(
                 "Windows will ask once for administrator rights, to give you back {} item(s) an elevated session created (e.g. {}).",
@@ -456,7 +410,7 @@ fn yardstick_step(app: &mut StudioApp, ui: &mut Ui) {
             }
         }
     }
-    nav_buttons(app, ui, Some(Step::Tools), Some((Step::Done, next && !running, "Run setup first.")));
+    nav_buttons(app, ui, Some(Step::Workspace), Some((Step::Done, next && !running, "Run setup first.")));
 }
 
 /// Runs the development-only setup with the wizard's answers.
@@ -472,6 +426,7 @@ pub(crate) fn run_setup(app: &mut StudioApp) {
         set_execution_policy: st.set_policy,
         shared_icons: Some(st.shared_icons.trim().to_string()),
         shared_recipe_overrides: Some(st.shared_overrides.trim().to_string()),
+        software_dropbox: setup::supports_dropbox(&ws).then(|| st.software_dropbox.trim().to_string()),
     };
     let path = result_path("result");
     let _ = std::fs::remove_file(&path);
@@ -530,6 +485,12 @@ pub fn status_finished(app: &mut StudioApp, ok: bool, result: &std::path::Path) 
         match setup::read_status(result) {
             Ok(status) => {
                 prefill(&mut app.setup, &status);
+                // A new development clone usually wants production's dropbox.
+                if app.setup.software_dropbox.is_empty()
+                    && let Some(p) = &app.ws_cache.production_dropbox
+                {
+                    app.setup.software_dropbox = p.display().to_string();
+                }
                 Check::Ready(Box::new(status))
             }
             Err(e) => Check::Failed(format!("{e:#}")),

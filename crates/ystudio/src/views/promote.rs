@@ -96,6 +96,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                     Some(_) => ui.label(RichText::new("gh is installed: pull requests are opened for you.").small().weak()),
                     None => ui.label(RichText::new("gh is not installed: the Studio pushes each branch and offers GitHub's page to open the pull request.").small().weak()),
                 };
+                super::tools::publish_sign_in(app, ui);
             }
             Some((Err(e), _)) => {
                 ui.colored_label(theme::red(), format!("\u{E711}  {e}"));

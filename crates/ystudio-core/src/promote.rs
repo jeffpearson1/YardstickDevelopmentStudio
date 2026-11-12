@@ -352,10 +352,12 @@ pub fn open_pull_request(ws: &Workspace, plan: &Plan, repo: &Repo, gh: Option<&P
     let slug = repo.web_url.trim_start_matches("https://");
     let slug = slug.strip_prefix("github.com/").unwrap_or(slug);
     log(&format!("> gh pr create --repo {slug} --base {} --head {}", repo.base, plan.branch));
-    let spec = ProcessSpec::new("gh", gh, root)
-        .args(["pr", "create", "--repo", slug, "--base", &repo.base, "--head", &plan.branch, "--title", &title, "--body", &body])
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("NO_COLOR", "1");
+    let spec = crate::prereqs::with_user_env(
+        ProcessSpec::new("gh", gh, root)
+            .args(["pr", "create", "--repo", slug, "--base", &repo.base, "--head", &plan.branch, "--title", &title, "--body", &body])
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("NO_COLOR", "1"),
+    );
     let out = run_output(&spec)?;
     if out.success
         && let Some(url) = pull_url(&out.stdout)

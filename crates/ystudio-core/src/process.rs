@@ -304,10 +304,15 @@ pub fn spawn_hidden(spec: &ProcessSpec) -> Result<()> {
 
 /// Launches a process in its own console window and does not track it.
 pub fn launch_detached(spec: &ProcessSpec) -> Result<()> {
+    spawn_console(spec).map(drop)
+}
+
+/// Launches a process in its own console window, for someone to interact
+/// with; the caller can watch for it to close.
+pub fn spawn_console(spec: &ProcessSpec) -> Result<std::process::Child> {
     let mut spec = spec.clone();
     spec.new_console = true;
-    spec.command().spawn().with_context(|| format!("starting {}", spec.program.display()))?;
-    Ok(())
+    spec.command().spawn().with_context(|| format!("starting {}", spec.program.display()))
 }
 
 fn pump<R: Read + Send + 'static>(

@@ -57,6 +57,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         theme::page_title(ui, "Yardstick Development Studio");
         ui.label(RichText::new("Design, test and agentically author Yardstick recipes - without ever touching production.").weak());
         ui.add_space(20.0);
+        super::tools::banner(app, ui);
         if app.ws.is_some() {
             launcher(app, ui);
             ui.add_space(theme::CARD_GAP);

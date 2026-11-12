@@ -44,6 +44,9 @@ pub struct Settings {
     pub agent_downloads: bool,
     /// Agents run as a coordinator with parallel subagents.
     pub agent_multi: bool,
+    /// Keep full job output, the Studio's messages and the agent CLIs' own
+    /// logs in `%APPDATA%\YardstickStudio\logs` (see `diagnostics`).
+    pub diagnostic_logging: bool,
 }
 
 impl Default for Settings {
@@ -67,6 +70,7 @@ impl Default for Settings {
             setup_done: false,
             agent_downloads: false,
             agent_multi: false,
+            diagnostic_logging: false,
         }
     }
 }

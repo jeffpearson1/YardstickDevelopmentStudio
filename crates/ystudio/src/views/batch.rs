@@ -22,7 +22,7 @@ pub struct BatchState {
     pub run_job: Option<u64>,
     pub queue: VecDeque<usize>,
     hide_other: bool,
-    show_log: bool,
+    pub(crate) show_log: bool,
     verification: Option<crate::workflow::Options>,
     /// Text being pasted as a new request list; `Some` while the window is open.
     pub paste: Option<String>,
@@ -363,8 +363,10 @@ fn with_batch(app: &mut StudioApp, batch_id: &str, f: impl FnOnce(&mut Batch)) {
     }
 }
 
-/// Called by the app when an agent run for a batch item ends.
-pub fn agent_finished(app: &mut StudioApp, batch_id: &str, idx: usize, ok: bool, verifying: bool) {
+/// Called by the app when an agent run for a batch item ends: `Err` says why
+/// it failed or what blocked it.
+pub fn agent_finished(app: &mut StudioApp, batch_id: &str, idx: usize, outcome: Result<(), String>, verifying: bool) {
+    let ok = outcome.is_ok();
     let mut ids = app.agent.reported.clone();
     for c in &app.agent.changes {
         let p = c.path();
@@ -382,7 +384,10 @@ pub fn agent_finished(app: &mut StudioApp, batch_id: &str, idx: usize, ok: bool,
         if let Some(it) = b.items.get_mut(idx) {
             it.status = if !ok { ItemStatus::Failed } else if verifying { ItemStatus::Running } else { ItemStatus::Done };
             it.recipes = ids;
-            it.status_note = format!("{}; {changed} file(s) changed", if ok { "agent finished" } else { "agent exited with an error" });
+            it.status_note = match &outcome {
+                Ok(()) => format!("agent finished; {changed} file(s) changed"),
+                Err(why) => format!("{why} ({changed} file(s) changed)"),
+            };
         }
     });
     if app.batch.run_job.is_some_and(|j| app.job(j).is_some_and(|j| !j.proc.is_running())) {
@@ -505,19 +510,27 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     if app.batch.selected.is_some() {
         egui::Panel::right("batch-detail").resizable(true).default_size(380.0).show(ui, |ui| detail(app, ui));
     }
+    items_header(app, ui);
     let show_log = app.batch.show_log;
     let log_job = if app.workflow.busy() { app.workflow.last_job } else { app.batch.run_job.or(app.batch.extract_job) };
     // The console already shows this job; a second copy only takes space.
     let in_console = app.console_open && app.console_job.is_some() && app.console_job == log_job;
-    if show_log && !in_console && let Some(id) = log_job {
-        egui::Panel::bottom("batch-log").resizable(true).default_size(220.0).show(ui, |ui| {
+    // Below the header, and only when the table keeps room for its rows; the
+    // Jobs console shows the same output in a short window.
+    let room = ui.available_height() - TABLE_MIN_HEIGHT;
+    if show_log && !in_console && room >= LOG_MIN_HEIGHT && let Some(id) = log_job {
+        egui::Panel::bottom("batch-log").resizable(true).default_size(220.0).size_range(LOG_MIN_HEIGHT..=room).show(ui, |ui| {
             if let Some(job) = app.job_mut(id) {
                 job_log(ui, &mut job.proc, "batch");
             }
         });
     }
-    items_table(app, ui);
+    items_rows(app, ui);
 }
+
+/// Room kept for the table's header and a few rows.
+const TABLE_MIN_HEIGHT: f32 = 140.0;
+const LOG_MIN_HEIGHT: f32 = 90.0;
 
 fn toolbar(app: &mut StudioApp, ui: &mut Ui) {
     let busy = app.batch.busy(app);
@@ -590,7 +603,7 @@ fn start_page(app: &mut StudioApp, ui: &mut Ui) {
     }
 }
 
-fn items_table(app: &mut StudioApp, ui: &mut Ui) {
+fn items_header(app: &mut StudioApp, ui: &mut Ui) {
     let busy = app.batch.busy(app);
     let can_agent = app.writable() && app.ws_cache.has_skill;
     let can_test = app.writable();
@@ -599,7 +612,6 @@ fn items_table(app: &mut StudioApp, ui: &mut Ui) {
     let queued = app.batch.queue.len();
     let backend = app.settings.agent_backend.label();
     let b = app.batch.batch.as_ref().unwrap();
-    let total = b.items.len();
     let software = b.items.iter().filter(|i| i.request != RequestKind::NotSoftware).count();
     let included = b.items.iter().filter(|i| i.include && i.request != RequestKind::NotSoftware).count();
     let pending = b.items.iter().filter(|i| i.include && i.request != RequestKind::NotSoftware && i.status != ItemStatus::Done).count();
@@ -687,6 +699,11 @@ fn items_table(app: &mut StudioApp, ui: &mut Ui) {
         super::settings::downloads_checkbox(app, ui);
         crate::workflow::configure(&mut app.workflow.options, ui, true);
     });
+    let ids: Vec<String> = app.batch.batch.as_ref().unwrap().items.iter()
+        .filter(|i| i.include && i.request != RequestKind::NotSoftware)
+        .flat_map(|i| if i.recipes.is_empty() { vec![i.recipe_id()] } else { i.recipes.clone() })
+        .collect();
+    super::dropbox_banner(app, ui, &ids);
     crate::workflow::progress(app, ui);
     if extract {
         start_extract(app);
@@ -724,7 +741,11 @@ fn items_table(app: &mut StudioApp, ui: &mut Ui) {
         }
     }
 
-    // Rows.
+}
+
+fn items_rows(app: &mut StudioApp, ui: &mut Ui) {
+    let busy = app.batch.busy(app);
+    let total = app.batch.batch.as_ref().unwrap().items.len();
     let hide = app.batch.hide_other;
     let rows: Vec<(usize, BatchItem, (String, egui::Color32), bool)> = app
         .batch

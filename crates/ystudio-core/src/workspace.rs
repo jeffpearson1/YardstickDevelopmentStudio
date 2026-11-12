@@ -106,12 +106,14 @@ pub struct RecipeMeta {
     /// The `url` field: usually the vendor's download page.
     pub url: String,
     pub base: String,
+    /// `manualDownload: true`: the media is staged in the software dropbox.
+    pub manual_download: bool,
 }
 
 impl RecipeMeta {
     pub fn parse(text: &str) -> Self {
         static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-        let re = RE.get_or_init(|| Regex::new(r"(?m)^(displayName|publisher|iconFile|url|base):[ \t]*(.*?)[ \t]*\r?$").unwrap());
+        let re = RE.get_or_init(|| Regex::new(r"(?m)^(displayName|publisher|iconFile|url|base|manualDownload):[ \t]*(.*?)[ \t]*\r?$").unwrap());
         let mut m = RecipeMeta::default();
         for c in re.captures_iter(text) {
             let raw = c[2].trim();
@@ -120,6 +122,10 @@ impl RecipeMeta {
             } else {
                 raw.split(" #").next().unwrap_or(raw).trim().to_string()
             };
+            if &c[1] == "manualDownload" {
+                m.manual_download |= value.eq_ignore_ascii_case("true");
+                continue;
+            }
             let slot = match &c[1] {
                 "displayName" => &mut m.display_name,
                 "publisher" => &mut m.publisher,
@@ -160,6 +166,9 @@ pub struct Workspace {
     /// `SharedIcons` in preferences: the team's icon folder. Promotion copies
     /// icons there; they are not kept in git.
     pub shared_icons: Option<PathBuf>,
+    /// `SoftwareDropbox` in preferences: where licensed media for
+    /// `manualDownload` recipes is staged. Without it those recipes cannot be tested.
+    pub software_dropbox: Option<PathBuf>,
 }
 
 /// Parses the flat `@{ Key = 'value' }` hashtable in `Yardstick.Project.psd1`.
@@ -190,16 +199,20 @@ impl Workspace {
         let development_only = flag("developmentOnly");
         let sync_shared_content = flag("syncSharedContent");
         // Explorer's "Copy as path" adds quotes; Yardstick strips one pair too.
-        let shared_icons = prefs
-            .as_ref()
-            .and_then(|p| p.get("SharedIcons"))
-            .and_then(serde_yaml::Value::as_str)
-            .map(|s| s.trim().trim_matches(['"', '\'']).trim())
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from);
+        let path = |key: &str| {
+            prefs
+                .as_ref()
+                .and_then(|p| p.get(key))
+                .and_then(serde_yaml::Value::as_str)
+                .map(|s| s.trim().trim_matches(['"', '\'']).trim())
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        };
+        let shared_icons = path("SharedIcons");
+        let software_dropbox = path("SoftwareDropbox");
 
         let kind = classify(root, prefs.is_some(), development_only, production_paths, trusted_dev_paths);
-        Ok(Workspace { root: root.to_path_buf(), layout, kind, development_only, sync_shared_content, shared_icons })
+        Ok(Workspace { root: root.to_path_buf(), layout, kind, development_only, sync_shared_content, shared_icons, software_dropbox })
     }
 
     pub fn is_writable(&self) -> bool {
@@ -481,6 +494,18 @@ mod tests {
         let d = fake_workspace(Some("developmentOnly: true\n"));
         let ws = Workspace::open(d.path(), &[], &[]).unwrap();
         assert_eq!(ws.kind, WorkspaceKind::Development);
+        assert_eq!(ws.software_dropbox, None);
+    }
+
+    #[test]
+    fn reads_the_software_dropbox_and_manual_download() {
+        let d = fake_workspace(Some("developmentOnly: true\nSoftwareDropbox: '\"\\\\server\\Dropbox\"'\n"));
+        let ws = Workspace::open(d.path(), &[], &[]).unwrap();
+        assert_eq!(ws.software_dropbox.as_deref(), Some(Path::new(r"\\server\Dropbox")));
+        let empty = fake_workspace(Some("developmentOnly: true\nSoftwareDropbox:\n"));
+        assert_eq!(Workspace::open(empty.path(), &[], &[]).unwrap().software_dropbox, None);
+        assert!(RecipeMeta::parse("id: x\nmanualDownload: true\n").manual_download);
+        assert!(!RecipeMeta::parse("id: x\nmanualDownload: false # staged later\n").manual_download);
     }
 
     #[test]
