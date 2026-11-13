@@ -208,7 +208,9 @@ fn prefill(st: &mut SetupState, status: &Status) {
     st.shared_icons = status.preferences.shared_icons.clone();
     // The installer reports the overrides file; the folder is what people know.
     let overrides = &status.preferences.shared_recipe_overrides;
-    st.shared_overrides = overrides.strip_suffix("\\recipeOverrides.yaml").unwrap_or(overrides).to_string();
+    let file = "\\recipeoverrides.yaml";
+    let folder = overrides.len().checked_sub(file.len()).filter(|&at| overrides.is_char_boundary(at) && overrides[at..].eq_ignore_ascii_case(file));
+    st.shared_overrides = folder.map_or(overrides.as_str(), |at| &overrides[..at]).to_string();
     st.software_dropbox = status.preferences.software_dropbox.clone();
 }
 
@@ -328,7 +330,9 @@ fn yardstick_step(app: &mut StudioApp, ui: &mut Ui) {
                     ui.set_width(170.0);
                     ui.label(label);
                 });
-                ui.add_enabled(!running, egui::TextEdit::singleline(text).hint_text(r"e.g. \\server\share\Intune").desired_width(380.0));
+                // Fill the row, leaving room for Browse…: UNC paths are long.
+                let width = (ui.available_width() - 90.0).max(240.0);
+                ui.add_enabled(!running, egui::TextEdit::singleline(text).hint_text(r"e.g. \\server\share\Intune").desired_width(width));
                 if ui.add_enabled(!running, egui::Button::new("Browse…")).clicked()
                     && let Some(p) = rfd::FileDialog::new().pick_folder()
                 {
