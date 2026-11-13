@@ -73,3 +73,14 @@ Describe 'Assert-StudioApproval' {
         { Assert-StudioApproval -StudioInput $in -WorkItem $t.WorkItem -GateFile $gate } | Should -Throw '*changed after it was approved*'
     }
 }
+
+Describe 'the scripts' {
+    It 'all parse' {
+        $problems = Get-ChildItem (Join-Path (Get-PluginRoot) 'scripts') -Include *.ps1, *.psm1 -Recurse | ForEach-Object {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors)
+            foreach ($e in $errors) { "$($_.Name):$($e.Extent.StartLineNumber): $($e.Message)" }
+        }
+        @($problems) | Should -BeNullOrEmpty
+    }
+}

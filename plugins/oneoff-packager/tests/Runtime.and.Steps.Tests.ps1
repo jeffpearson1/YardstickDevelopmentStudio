@@ -84,6 +84,15 @@ Describe 'the step protocol' {
         $r.Result.artifacts[0].sha256 | Should -Be (Hash (Join-Path $t.WorkItem 'parsed-ticket.json'))
     }
 
+    It 'reads the request of an SCCM migration from its export' {
+        New-Item -ItemType Directory -Path (Join-Path $t.WorkItem 'intake') | Out-Null
+        Set-Content -LiteralPath (Join-Path $t.WorkItem 'intake\export.md') -Value '# Migrate Zoom 6.1 from Configuration Manager to Intune. Content: \\server\share\Zoom.'
+        $r = Invoke-TestStep -Item $t -Script 'Step-ParseTicket.ps1'
+        $r.ExitCode | Should -Be 0 -Because $r.Output
+        (Get-Content (Join-Path $t.WorkItem 'ticket.md') -Raw) | Should -Match 'Migrate Zoom 6.1'
+        Test-Path (Join-Path $t.WorkItem 'parsed-ticket.json') | Should -BeTrue
+    }
+
     It 'needs the plugin settings before it touches the tenant' {
         $r = Invoke-TestStep -Item $t -Script 'Step-Inventory.ps1'
         $r.ExitCode | Should -Be 1

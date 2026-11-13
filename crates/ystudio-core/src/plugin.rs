@@ -634,7 +634,7 @@ impl Manifest {
                     if !self.requires.plugins.iter().any(|r| &r.id == plugin) {
                         p(format!("action {} hands off to '{plugin}', which is not in requires.plugins", a.id));
                     }
-                    if files.iter().any(|f| !safe_relative(f)) {
+                    if files.iter().any(|f| !safe_relative(f.strip_suffix('?').unwrap_or(f))) {
                         p(format!("action {} file paths must be relative", a.id));
                     }
                 }
@@ -1727,36 +1727,63 @@ fn glob_regex(glob: &str) -> String {
     re
 }
 
-/// Starts a work item in another plugin from files of this one, copying
-/// `files` (files or folders, relative to `from`) into its `intake` folder.
+/// Starts a work item in another plugin from files of this one, putting
+/// `files` (files or folders, relative to `from`) in its `intake` folder. A
+/// name ending in `?` is optional: it is skipped when it isn't there. Folders
+/// are hard-linked where the volume allows, so a large payload costs no time
+/// or space, and copied otherwise.
 #[allow(clippy::too_many_arguments)]
 pub fn hand_off(target: &Manifest, target_root: &Path, from: &Path, files: &[String], title: &str, reference: &str, origin: Origin, now: SystemTime) -> Result<WorkItem> {
+    let mut wanted = Vec::new();
     for f in files {
-        if !safe_relative(f) || !from.join(f).exists() {
-            bail!("{f} is missing from {}.", from.display());
+        let (name, optional) = match f.strip_suffix('?') {
+            Some(n) => (n, true),
+            None => (f.as_str(), false),
+        };
+        if !safe_relative(name) {
+            bail!("{name} is not a path inside {}.", from.display());
+        }
+        if from.join(name).exists() {
+            wanted.push(name);
+        } else if !optional {
+            bail!("{name} is missing from {}.", from.display());
         }
     }
     let item = WorkItem::create(target_root, &target.page.folder, title, reference, origin, now)?;
     let intake = item.dir.join("intake");
-    for f in files {
-        let src = from.join(f);
-        let dest = intake.join(f);
-        if src.is_dir() {
-            walk_files(&src, &src, &mut |rel, path| {
-                let to = dest.join(rel);
-                if let Some(parent) = to.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+    let result = (|| -> Result<()> {
+        for name in wanted {
+            let src = from.join(name);
+            let dest = intake.join(name);
+            if src.is_dir() {
+                let mut found = Vec::new();
+                walk_files(&src, &src, &mut |rel, path| found.push((rel.to_string(), path.to_path_buf())));
+                for (rel, path) in found {
+                    let to = dest.join(&rel);
+                    if let Some(parent) = to.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    link_or_copy(&path, &to).with_context(|| format!("copying {name}/{rel}"))?;
                 }
-                let _ = std::fs::copy(path, to);
-            });
-        } else {
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
+            } else {
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(&src, &dest).with_context(|| format!("copying {name}"))?;
             }
-            std::fs::copy(&src, &dest).with_context(|| format!("copying {f}"))?;
         }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        // Don't leave a half-filled work item behind.
+        let _ = std::fs::remove_dir_all(&item.dir);
+        return Err(e);
     }
     Ok(item)
+}
+
+fn link_or_copy(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(from, to).or_else(|_| std::fs::copy(from, to).map(|_| ()))
 }
 
 /// `20261113-201500` (UTC) plus milliseconds, for names that sort by time.
@@ -2238,10 +2265,15 @@ mod tests {
 
         let target = Manifest::parse(&fixture_manifest()).unwrap();
         let origin = Origin { kind: "handoff".into(), from_plugin: "sccm-migration".into(), key: "ScopeId_1/Application_2".into() };
-        let item = hand_off(&target, &d.path().join("work"), &from, &["export.md".into(), "source".into()], "Spectragryph 1.2", "", origin, SystemTime::now()).unwrap();
+        let item = hand_off(&target, &d.path().join("work"), &from, &["export.md".into(), "source".into(), "icon.png?".into(), "source-manifest.json?".into()], "Spectragryph 1.2", "", origin, SystemTime::now()).unwrap();
         assert!(item.dir.join("intake/export.md").is_file() && item.dir.join("intake/source/setup.msi").is_file());
+        assert!(!item.dir.join("intake/icon.png").exists(), "an optional file that is not there is skipped");
+        assert_eq!(std::fs::read_to_string(item.dir.join("intake/source/setup.msi")).unwrap(), "source/setup.msi");
         assert_eq!(WorkItem::open(&item.dir).unwrap().meta.origin.from_plugin, "sccm-migration");
+        let before = std::fs::read_dir(d.path().join("work")).unwrap().count();
         assert!(hand_off(&target, &d.path().join("work"), &from, &["missing.md".into()], "x", "", Origin::default(), SystemTime::now()).is_err());
+        assert!(hand_off(&target, &d.path().join("work"), &from, &["../escape.md?".into()], "x", "", Origin::default(), SystemTime::now()).is_err());
+        assert_eq!(std::fs::read_dir(d.path().join("work")).unwrap().count(), before, "a refused handoff leaves nothing behind");
     }
 
     #[test]

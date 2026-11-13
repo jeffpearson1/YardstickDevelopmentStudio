@@ -16,6 +16,10 @@ Prefer an official vendor download with a stable unattended installer and a veri
 
 You may only look at downloaded files with the tools your approvals allow (see the approvals section of your prompt). Without the download approval, work from the vendor's documentation and finish with `STUDIO-NEEDS-APPROVAL: downloads` if you need the file itself.
 
+### If the ticket came from SCCM
+
+The copied content in `intake\source\` is the payload and `intake\source-manifest.json` has each file's SHA-256, signature and version. Check the files you rely on against it. Write the recipe so its download step takes that exact file and refuses any other (see `WritingRecipes.md` for how a recipe takes a local or `manualDownload` payload); if the harness cannot read it from the ticket folder, set `blocked-awaiting-installer` and say precisely which file has to be staged in `<SoftwareDropbox>\<recipe-id>\`. `intake\intune-mapping.json` suggests commands and detection; verify each against the installer and note what you changed and why. If the vendor also publishes this version for download, say so, because a recipe that fetches it may be the better long-term route.
+
 ## 3. Write the recipe
 
 Write `recipes\<id>.yaml` in the format `WritingRecipes.md` describes. In particular:

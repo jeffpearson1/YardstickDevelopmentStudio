@@ -10,6 +10,10 @@ First read `.studio\agent\references\workflow.md`, section 1.
 - Do not substitute similarly named software. Where two products share a name, record both readings in `ambiguities`.
 - Targets such as asset tags (`NC-1234567`), device names or user names are **not** group names. Record them under `targets`. Only a real Entra group object ID belongs in `requestedGroupId`, and only if the ticket names one.
 
+## If the ticket came from SCCM
+
+When `intake\sccm-export.json` exists the request is one application: write exactly one product. Take the name, publisher and version from the export; there are no links (leave `links` empty) and the deployment collections are not `targets` for Intune. Put the application's name and manufacturer in `searchPatterns` so the Intune inventory finds a copy that was migrated before.
+
 ## The file
 
 ```json

@@ -360,6 +360,17 @@ name the plugin and version the release does. A plugin may name another reposito
 startup* is on) and on demand. A core test packs the sample plugin with the script and installs the
 result, so the packer and the Studio's validator cannot drift apart.
 
+Shipped plugins. **One-Off Packager** is a `workitems` plugin: a ticket folder with the
+pipeline in `plugin.yaml`; its scripts share `StudioPlugin.psm1` (the input/result protocol and
+approval check) and `OneOffPackager.psm1` (inventory, packaging, change set and the resumable live
+change, with every tenant, group and path coming in as a setting or from the work item).
+**SCCM App Migration** is a `catalog` plugin: a connection check, a search whose rows fill the table,
+and per-row steps (export, copy content) and handoffs (`handoff.workitem` to the One-Off Packager,
+`handoff.recipe` into the New recipe dialog). A handoff's `files` may end in `?` for "if present", and
+folders are hard-linked where possible. The SCCM scripts only ever `SELECT`: a test fails the build if
+one calls a cmdlet that could change the site. Each plugin is a self-contained package, so
+`StudioPlugin.psm1` is duplicated, and a test checks the copies are identical.
+
 Plugin safety, in addition to the model above:
 
 - **Trust.** Installing or updating shows the publisher, the package SHA-256 and every

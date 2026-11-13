@@ -832,9 +832,12 @@ fn row_action(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, root: &Path, row: &Valu
         }
         ActionKind::HandoffWorkItem { plugin: target, files, title } => {
             let target_ctx = context(app, target);
+            let missing = app.plugins.registry.missing_requirements(&c.plugin);
             let why = match (&target_ctx, folder) {
                 (None, _) => Some(format!("Install the {target} plugin first.")),
                 (Some(t), _) if t.root.is_none() => Some(format!("Set up {} in Settings first.", t.plugin.manifest.name)),
+                (Some(t), _) if t.plugin.ensure_runnable().is_err() => t.plugin.ensure_runnable().err().map(|e| format!("{e:#}")),
+                _ if !missing.is_empty() => Some(format!("This plugin {}.", missing.join(", "))),
                 (_, None) => Some("Run the step that prepares this item first.".into()),
                 _ => None,
             };
@@ -843,24 +846,9 @@ fn row_action(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, root: &Path, row: &Valu
             if let Some(why) = why {
                 resp.on_disabled_hover_text(why);
             } else if resp.clicked()
-                && let (Some(t), Some(from)) = (target_ctx, folder)
+                && let Some(from) = folder
             {
-                let name = row.get("name").or_else(|| row.get("title")).map(cell).unwrap_or_else(|| key.to_string());
-                let title = if title.is_empty() { name } else { title.replace("{name}", &name) };
-                let origin = Origin { kind: "handoff".into(), from_plugin: id.clone(), key: key.to_string() };
-                let target_root = t.root.clone().unwrap_or_default();
-                match plugin::hand_off(&t.plugin.manifest, &target_root, from, files, &title, "", origin, SystemTime::now()) {
-                    Ok(item) => {
-                        let page = app.plugins.page(target);
-                        page.refresh_items(&target_root);
-                        page.selected = Some(item.dir.clone());
-                        if let Some(v) = app.plugins.view_of(target) {
-                            app.view = v;
-                        }
-                        app.notify(format!("Started {} in {}.", item.meta.title, t.plugin.manifest.name));
-                    }
-                    Err(e) => app.error(format!("{e:#}")),
-                }
+                start_handoff(app, &id, target, files, title, row, key, from);
             }
         }
         ActionKind::HandoffRecipe { notes_file } => {
@@ -1352,6 +1340,76 @@ pub(crate) mod tests {
         assert!(!item.satisfied(&m.step("build").unwrap().after), "nothing is built before the install test");
     }
 
+    /// Installs the repository's plugins and gives them settings under `dir`.
+    fn install_repo_plugins(app: &mut StudioApp, dir: &Path) -> (PathBuf, PathBuf) {
+        let plugins = dir.join("plugins");
+        for name in ["oneoff-packager", "sccm-migration"] {
+            let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(r"..\..\plugins").join(name);
+            let pkg = plugin::Package::from_bytes(&plugin::zip_dir(&src).unwrap()).unwrap();
+            plugin::install(&pkg, &plugins, super::super::update::CURRENT_VERSION, "test", false).unwrap();
+        }
+        app.plugins = crate::plugins::Host::load(&plugins);
+        let (oneoff, sccm) = (dir.join("oneoff"), dir.join("sccm"));
+        let prefs = app.settings.plugins.entry("oneoff-packager".into()).or_default();
+        prefs.values.insert("workRoot".into(), oneoff.to_string_lossy().into());
+        let prefs = app.settings.plugins.entry("sccm-migration".into()).or_default();
+        for (k, v) in [("workRoot", sccm.to_string_lossy().into_owned()), ("smsProvider", "cm1.example.edu".into()), ("siteCode", "ABC".into())] {
+            prefs.values.insert(k.into(), v);
+        }
+        (oneoff, sccm)
+    }
+
+    #[test]
+    fn an_sccm_application_is_handed_to_the_oneoff_packager() {
+        let (dir, mut app) = fake_app();
+        if !PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(r"..\..\plugins\sccm-migration\plugin.yaml").is_file() {
+            return;
+        }
+        let (oneoff, sccm) = install_repo_plugins(&mut app, dir.path());
+        let sccm_tab = app.plugins.view_of("sccm-migration").unwrap();
+        let oneoff_tab = app.plugins.view_of("oneoff-packager").unwrap();
+        assert_ne!(sccm_tab, oneoff_tab);
+
+        // An application already exported, with its content copied.
+        let folder = sccm.join("spectragryph-1-0-7");
+        std::fs::create_dir_all(folder.join("source")).unwrap();
+        std::fs::write(folder.join("export.md"), "# Migrate Spectragryph 1.0.7 from Configuration Manager to Intune\n\n- Install: `\"setup.exe\" /VERYSILENT`\n- Detection in Intune: **mapped** (registry)\n").unwrap();
+        std::fs::write(folder.join("sccm-export.json"), r#"{"application":{"name":"Spectragryph 1.0.7"},"deploymentTypes":[{"title":"Silent Install","technology":"Script","installCommand":"setup.exe /S"}]}"#).unwrap();
+        std::fs::write(folder.join("intune-mapping.json"), r#"{"deploymentTypes":[{"title":"Silent Install for Spectragryph","technology":"Script","context":"System","detection":"registry","status":"mapped"}]}"#).unwrap();
+        std::fs::write(folder.join("source-manifest.json"), r#"{"fileCount":1}"#).unwrap();
+        std::fs::write(folder.join(r"source\setup.exe"), "installer").unwrap();
+
+        let page = app.plugins.page("sccm-migration");
+        page.rows = vec![
+            serde_json::json!({"key":"ScopeId_X/Application_1/8","name":"Spectragryph 1.0.7","version":"1.0.7","manufacturer":"Dr. Friedrich Menges","state":"active","deployed":true,"folder":"spectragryph-1-0-7"}),
+            serde_json::json!({"key":"ScopeId_X/Application_2/3","name":"Zoom Workplace","version":"6.1","manufacturer":"Zoom","state":"active","deployed":true}),
+            serde_json::json!({"key":"ScopeId_X/Application_3/1","name":"Adobe Reader","version":"24.1","manufacturer":"Adobe","state":"retired","deployed":false}),
+        ];
+        page.selected_row = Some(0);
+        page.probed = true;
+        page.probe = Some(StepResult { status: plugin::ResultStatus::Ok, summary: "Connected to cm1.example.edu over Dcom: site ABC \"Main site\", version 5.00.9132.".into(), ..Default::default() });
+        app.view = sccm_tab;
+        render(&mut app, "sccm-catalog", 1400, 900);
+
+        // The handoff starts a ticket in the One-Off Packager with the export and the content.
+        let m = app.plugins.get("sccm-migration").unwrap().manifest.clone();
+        let Some(plugin::ActionDef { kind: ActionKind::HandoffWorkItem { plugin: target, files, title }, .. }) = m.actions.iter().find(|a| a.id == "to-oneoff").cloned() else { panic!("no to-oneoff action") };
+        let row = serde_json::json!({"key":"ScopeId_X/Application_1/8","name":"Spectragryph 1.0.7"});
+        assert!(start_handoff(&mut app, "sccm-migration", &target, &files, &title, &row, "ScopeId_X/Application_1/8", &folder));
+        assert_eq!(app.view, oneoff_tab, "the One-Off Packager's tab opens");
+        let items = WorkItem::list(&oneoff);
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.meta.title, "SCCM migration: Spectragryph 1.0.7");
+        assert_eq!((item.meta.origin.kind.as_str(), item.meta.origin.from_plugin.as_str()), ("handoff", "sccm-migration"));
+        for f in ["export.md", "sccm-export.json", "intune-mapping.json", "source-manifest.json", r"source\setup.exe"] {
+            assert!(item.dir.join("intake").join(f).is_file(), "{f} was handed over");
+        }
+        assert!(!item.dir.join(r"intake\icon.png").exists(), "no icon was exported, and that is fine");
+        assert_eq!(app.plugins.page("oneoff-packager").selected.as_deref(), Some(item.dir.as_path()));
+        render(&mut app, "sccm-handoff-oneoff", 1500, 900);
+    }
+
     #[test]
     fn catalog_page_renders_rows_and_actions() {
         let (dir, mut app) = fake_app();
@@ -1492,6 +1550,36 @@ mod small_window_tests {
             for (w, h) in [(700u32, 450u32), (900, 600), (1100, 500), (MIN_LAYOUT.x as u32, MIN_LAYOUT.y as u32)] {
                 render(&mut app, &format!("small-{name}-{w}x{h}"), w, h);
             }
+        }
+    }
+}
+
+/// Starts a work item in another plugin from an exported folder, and goes to its tab.
+#[allow(clippy::too_many_arguments)]
+fn start_handoff(app: &mut StudioApp, from_id: &str, target: &str, files: &[String], title: &str, row: &Value, key: &str, from: &Path) -> bool {
+    let Some(t) = context(app, target) else { return false };
+    let Some(target_root) = t.root.clone() else { return false };
+    let name = row.get("name").or_else(|| row.get("title")).map(cell).unwrap_or_else(|| key.to_string());
+    let title = if title.is_empty() { name } else { title.replace("{name}", &name) };
+    let origin = Origin { kind: "handoff".into(), from_plugin: from_id.to_string(), key: key.to_string() };
+    if let Err(e) = std::fs::create_dir_all(&target_root) {
+        app.error(format!("Could not create {}: {e}", target_root.display()));
+        return false;
+    }
+    match plugin::hand_off(&t.plugin.manifest, &target_root, from, files, &title, "", origin, SystemTime::now()) {
+        Ok(item) => {
+            let page = app.plugins.page(target);
+            page.refresh_items(&target_root);
+            page.selected = Some(item.dir.clone());
+            if let Some(v) = app.plugins.view_of(target) {
+                app.view = v;
+            }
+            app.notify(format!("Started {} in {}.", item.meta.title, t.plugin.manifest.name));
+            true
+        }
+        Err(e) => {
+            app.error(format!("{e:#}"));
+            false
         }
     }
 }

@@ -68,9 +68,13 @@ releases, and **Update…** appears beside an installed plugin when a newer rele
 update shows a trust prompt first; the downloaded zip must match the SHA-256 GitHub publishes for it and
 must hold the plugin and version the release names.
 
-This repository ships the **One-Off Packager** (`plugins\oneoff-packager`, see its README): an agent triages a
-ticket and drafts the recipe, and a pipeline of separate steps tests, packages and uploads it, with your approval
-before anything is installed or changed in Intune.
+This repository ships two plugins, each with its own README:
+
+- **One-Off Packager** (`plugins\oneoff-packager`): an agent triages a ticket and drafts the recipe, and a pipeline of
+  separate steps tests, packages and uploads it, with your approval before anything is installed or changed in Intune.
+- **SCCM App Migration** (`plugins\sccm-migration`): browses a Configuration Manager site's applications (read-only,
+  over CIM), works out what an Intune app would need, copies the content, and hands the application to the One-Off
+  Packager or to the New recipe dialog.
 
 To package and test the plugins in this repository (`plugins\<id>\`):
 
