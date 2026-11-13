@@ -36,10 +36,10 @@ pub const WORK_ROOT_KEY: &str = "workRoot";
 const INSTALL_RECORD: &str = ".installed.json";
 const STAGING: &str = ".staging";
 const PREVIOUS: &str = ".previous";
-const LOCK_FILE: &str = ".studio-lock";
+pub(crate) const LOCK_FILE: &str = ".studio-lock";
 /// Studio-owned scratch inside a work item: step inputs/results, agent copies.
 pub const STUDIO_DIR: &str = ".studio";
-const APPROVALS_DIR: &str = "approvals";
+pub(crate) const APPROVALS_DIR: &str = "approvals";
 const ALLOWED_EXTENSIONS: &[&str] = &["yaml", "yml", "ps1", "psm1", "psd1", "md", "json", "txt", "png", "ico", "svg", "xml"];
 
 /// `%APPDATA%\YardstickStudio\plugins`.

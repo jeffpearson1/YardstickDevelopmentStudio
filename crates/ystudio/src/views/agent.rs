@@ -108,7 +108,7 @@ impl AgentState {
                 if self.freeform.trim().is_empty() {
                     return Err("Write a prompt.");
                 }
-                AgentTask::Freeform { prompt: self.freeform.clone() }
+                AgentTask::Freeform { prompt: self.freeform.clone(), recipe: Some(self.target_id.trim().to_string()).filter(|id| !id.is_empty()) }
             }
         })
     }

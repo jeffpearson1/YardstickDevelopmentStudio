@@ -140,6 +140,7 @@ pub fn busy(app: &StudioApp) -> bool {
         || app.jobs.iter().any(|j| j.proc.is_running()
             && matches!(j.kind, JobKind::Agent { .. } | JobKind::BatchExtract { .. }
                 | JobKind::Harness { .. } | JobKind::WorkflowHarness { .. } | JobKind::WorkflowRepair { .. }
+                | JobKind::PluginAgent { .. }
                 | JobKind::PluginStep { risk: ystudio_core::plugin::Risk::LocalInstall, .. }))
         || !app.bench.queue.is_empty() || app.bench.live_modal
 }

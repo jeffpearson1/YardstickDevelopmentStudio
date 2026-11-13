@@ -16,6 +16,7 @@ use ystudio_core::plugin::{
     self, ActionKind, Gate, Health, Installed, Lock, Origin, PageKind, PanelKind, Risk, Scope, Stage, StepDef, StepRequest, StepResult, StepState,
     StudioContext, WorkItem,
 };
+use ystudio_core::agent::{self, Change, Evidence, PluginAgentContext, Snapshot};
 use ystudio_core::workspace::WorkspaceKind;
 
 use crate::app::{JobKind, StudioApp, View};
@@ -54,6 +55,8 @@ pub struct PageState {
     pub selected_row: Option<usize>,
     /// Folders row actions made, by row key.
     row_folders: HashMap<String, PathBuf>,
+    /// What the latest agent run changed, by work item.
+    agent_changes: HashMap<PathBuf, Vec<Change>>,
 }
 
 #[derive(Default)]
@@ -123,16 +126,16 @@ fn studio_context(app: &StudioApp) -> StudioContext {
     }
 }
 
-/// The running plugin job in `dir`, if any.
+/// The running plugin step or agent task in `dir`, if any, by job and id.
 fn job_in(app: &StudioApp, dir: &Path) -> Option<(u64, String)> {
     app.jobs.iter().find_map(|j| match &j.kind {
-        JobKind::PluginStep { dir: d, step, .. } if j.proc.is_running() && d == dir => Some((j.id, step.clone())),
+        JobKind::PluginStep { dir: d, step: id, .. } | JobKind::PluginAgent { dir: d, task: id, .. } if j.proc.is_running() && d == dir => Some((j.id, id.clone())),
         _ => None,
     })
 }
 
 pub fn plugin_busy(app: &StudioApp, id: &str) -> bool {
-    app.jobs.iter().any(|j| j.proc.is_running() && matches!(&j.kind, JobKind::PluginStep { plugin, .. } if plugin == id))
+    app.jobs.iter().any(|j| j.proc.is_running() && matches!(&j.kind, JobKind::PluginStep { plugin, .. } | JobKind::PluginAgent { plugin, .. } if plugin == id))
 }
 
 /// Starts a step. Hash-gated steps need a granted approval; `confirmed`
@@ -460,38 +463,29 @@ fn item_detail(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem) {
         });
     }
     theme::section_heading(ui, "Pipeline");
+    if m.agent.as_ref().is_some_and(|a| !a.tasks.is_empty()) {
+        egui::CollapsingHeader::new("Agent options").id_salt(("plugin-agent-options", &id)).default_open(false).show(ui, |ui| {
+            ui.add_enabled_ui(!crate::workflow::busy(app), |ui| {
+                super::settings::agent_picker(app, ui, &format!("plugin-{id}"));
+                super::settings::downloads_checkbox(app, ui);
+            });
+        });
+    }
     let busy_elsewhere = crate::workflow::busy(app);
     for stage in m.pipeline() {
         let rec = item.step(stage.id());
         let state = if running.as_ref().is_some_and(|(_, s)| s == stage.id()) { StepState::Running } else { rec.state };
         theme::card(ui, |ui| {
-            ui.horizontal(|ui| {
-                state_badge(ui, state);
-                ui.label(RichText::new(stage.label()).semibold());
-                match stage {
-                    Stage::Task(_) => {
-                        theme::badge(ui, "Agent", theme::blue());
-                    }
-                    Stage::Step(s) => {
-                        theme::badge(ui, s.risk.label(), risk_color(s.risk));
-                        match &s.gate {
-                            Gate::Hash { file, .. } => {
-                                ui.label("\u{E72E}").on_hover_text(format!("Runs only after you approve exactly this {file}"));
-                            }
-                            Gate::Confirm => {
-                                ui.label("\u{E8FB}").on_hover_text("Asks you to confirm first");
-                            }
-                            Gate::None => {}
-                        }
-                    }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| match stage {
-                    Stage::Task(_) => {
-                        ui.add_enabled(false, egui::Button::new("\u{E99A}  Run agent")).on_disabled_hover_text("Plugin agent tasks aren't available in this build yet.");
-                    }
-                    Stage::Step(s) => step_button(app, ui, c, item, s, state, running.is_some(), busy_elsewhere),
+            // Wide enough, the button sits at the right of the heading; otherwise under it.
+            if ui.available_width() > 520.0 {
+                ui.horizontal(|ui| {
+                    stage_heading(ui, stage, state);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| stage_button(app, ui, c, item, stage, state, running.is_some(), busy_elsewhere));
                 });
-            });
+            } else {
+                ui.horizontal_wrapped(|ui| stage_heading(ui, stage, state));
+                ui.horizontal(|ui| stage_button(app, ui, c, item, stage, state, running.is_some(), busy_elsewhere));
+            }
             if !stage.description().is_empty() {
                 ui.label(RichText::new(stage.description()).weak());
             }
@@ -519,6 +513,26 @@ fn item_detail(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem) {
         });
         ui.add_space(6.0);
     }
+    if let Some(changes) = app.plugins.page(&id).agent_changes.get(&item.dir).filter(|c| !c.is_empty()).cloned() {
+        egui::CollapsingHeader::new(format!("The agent changed {} file(s)", changes.len())).id_salt(("plugin-agent-changes", &id)).default_open(true).show(ui, |ui| {
+            for change in &changes {
+                let (mark, color) = match change {
+                    Change::Added(_) => ("+", theme::green()),
+                    Change::Modified(_) => ("~", theme::amber()),
+                    Change::Removed(_) => ("-", theme::red()),
+                };
+                let rel = change.path().strip_prefix(&item.dir).unwrap_or(change.path()).display().to_string();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(mark).monospace().color(color));
+                    if matches!(change, Change::Removed(_)) {
+                        ui.label(rel);
+                    } else if ui.link(rel).clicked() {
+                        super::open_external(change.path());
+                    }
+                });
+            }
+        });
+    }
     if let Some((job, step)) = running {
         ui.horizontal(|ui| {
             ui.spinner();
@@ -531,6 +545,57 @@ fn item_detail(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem) {
     }
     ui.add_space(8.0);
     panels(app, ui, &id, c, &item.dir);
+}
+
+/// A pipeline row's state, name, risk and gate.
+fn stage_heading(ui: &mut Ui, stage: Stage<'_>, state: StepState) {
+    state_badge(ui, state);
+    ui.label(RichText::new(stage.label()).semibold());
+    match stage {
+        Stage::Task(_) => {
+            theme::badge(ui, "Agent", theme::blue());
+        }
+        Stage::Step(s) => {
+            theme::badge(ui, s.risk.label(), risk_color(s.risk));
+            match &s.gate {
+                Gate::Hash { file, .. } => {
+                    ui.label("\u{E72E}").on_hover_text(format!("Runs only after you approve exactly this {file}"));
+                }
+                Gate::Confirm => {
+                    ui.label("\u{E8FB}").on_hover_text("Asks you to confirm first");
+                }
+                Gate::None => {}
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_button(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem, stage: Stage<'_>, state: StepState, item_busy: bool, busy_elsewhere: bool) {
+    match stage {
+        Stage::Task(t) => {
+            let unmet: Vec<String> = t.after.iter().filter(|a| !item.satisfied(std::slice::from_ref(a))).map(|a| stage_label(c, a)).collect();
+            let why = if let Err(e) = c.plugin.ensure_runnable() {
+                Some(format!("{e:#}"))
+            } else if item_busy {
+                Some("Something else is running in this work item.".into())
+            } else if busy_elsewhere || !app.batch.queue.is_empty() {
+                Some("Another agent or test is running.".into())
+            } else if !unmet.is_empty() {
+                Some(format!("Run {} first.", unmet.join(" and ")))
+            } else {
+                None
+            };
+            let text = if state == StepState::NotRun { "\u{E99A}  Run agent" } else { "\u{E72C}  Run agent again" };
+            let resp = ui.add_enabled(why.is_none(), egui::Button::new(text));
+            if let Some(why) = why {
+                resp.on_disabled_hover_text(why);
+            } else if resp.on_hover_text(format!("Runs {} with this task. It may only change files in this work item.", app.settings.agent_backend.label())).clicked() {
+                run_agent(app, &c.plugin.manifest.id, &item.dir, &t.id);
+            }
+        }
+        Stage::Step(s) => step_button(app, ui, c, item, s, state, item_busy, busy_elsewhere),
+    }
 }
 
 /// The Run button of a pipeline step, disabled with the reason when it can't run.
@@ -798,8 +863,25 @@ fn row_action(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, root: &Path, row: &Valu
                 }
             }
         }
-        ActionKind::HandoffRecipe { .. } => {
-            ui.add_enabled(false, egui::Button::new(&action.label)).on_disabled_hover_text("Recipe handoffs aren't available in this build yet.");
+        ActionKind::HandoffRecipe { notes_file } => {
+            let why = if !app.writable() {
+                Some("Open a writable development workspace first.".to_string())
+            } else if !app.ws_cache.has_skill {
+                Some("This workspace has no yardstick-recipes skill; pull the latest Yardstick.".to_string())
+            } else if folder.is_none() {
+                Some("Run the step that prepares this item first.".to_string())
+            } else {
+                None
+            };
+            let resp = ui.add_enabled(why.is_none(), egui::Button::new(&action.label));
+            let resp = if action.description.is_empty() { resp } else { resp.on_hover_text(&action.description) };
+            if let Some(why) = why {
+                resp.on_disabled_hover_text(why);
+            } else if resp.clicked()
+                && let Some(from) = folder
+            {
+                recipe_handoff(app, row, key, &from.join(notes_file));
+            }
         }
     }
 }
@@ -1191,6 +1273,7 @@ mod tests {
         app.view = View::Plugin(0);
         render(&mut app, "plugin-workitems", 1315, 697);
         render(&mut app, "plugin-workitems-small", 900, 600);
+        render(&mut app, "plugin-workitems-min", crate::app::MIN_LAYOUT.x as u32, crate::app::MIN_LAYOUT.y as u32);
 
         std::fs::write(item.dir.join("change.json"), r#"{"apps":["mplus"]}"#).unwrap();
         std::fs::write(item.dir.join("change.md"), "## Change\n\nUpload **Mplus 8.11** and assign it to the Testing group.").unwrap();
@@ -1235,6 +1318,87 @@ mod tests {
         assert_eq!(app.plugins.page("sample-catalog").selected_row, Some(0));
     }
 
+    /// Runs `script` (cmd syntax) as a stand-in for a plugin agent in `dir`,
+    /// the way `run_agent` registers one, and waits for the result to be recorded.
+    fn fake_agent(app: &mut StudioApp, dir: &Path, script: &str) -> plugin::StepRecord {
+        let lock = Lock::acquire(dir, "test agent").unwrap();
+        let spec = ystudio_core::process::ProcessSpec::new("agent", "cmd", dir).args(["/d", "/c", script]);
+        let kind = JobKind::PluginAgent { plugin: "sample-plugin".into(), dir: dir.to_path_buf(), task: "triage".into(), before: Snapshot::of_dir(dir) };
+        let job = app.start_job(spec, kind).unwrap();
+        app.plugins.locks.insert(job, lock);
+        assert!(crate::workflow::busy(app), "a plugin agent keeps other agents and tests waiting");
+        assert!(plugin_busy(app, "sample-plugin") && job_in(app, dir).is_some_and(|(_, id)| id == "triage"));
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        while app.jobs.iter().any(|j| j.proc.is_running()) && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            app.poll_for_tests();
+        }
+        app.poll_for_tests();
+        assert!(Lock::holder(dir).is_none() && app.plugins.locks.is_empty(), "the lock is released");
+        WorkItem::open(dir).unwrap().step("triage")
+    }
+
+    #[test]
+    fn agent_results_are_recorded_with_what_stopped_them() {
+        let (dir, mut app) = fake_app();
+        let root = install_sample(&mut app, dir.path(), "sample-plugin", |m| m);
+        let item = WorkItem::create(&root, "{date}-{ref}-{slug}", "Agent", "", Origin::default(), SystemTime::now()).unwrap();
+
+        // It wrote what the task expects (notes.md).
+        let rec = fake_agent(&mut app, &item.dir, "echo # Notes> notes.md");
+        assert_eq!((rec.state, rec.summary.as_str()), (StepState::Ok, "Finished: 1 file(s) changed."));
+        let changes = &app.plugins.page("sample-plugin").agent_changes[&item.dir];
+        assert_eq!(changes, &[Change::Added(item.dir.join("notes.md"))]);
+        let _ = std::fs::remove_file(item.dir.join("notes.md"));
+
+        // Done, but the expected file is missing: a warning, not a pass.
+        let rec = fake_agent(&mut app, &item.dir, "echo nothing useful");
+        assert_eq!(rec.state, StepState::Warn);
+        assert!(rec.summary.contains("did not write notes.md"), "{}", rec.summary);
+
+        // The agent says it is blocked: shown as is, as the Studio does for recipes.
+        let rec = fake_agent(&mut app, &item.dir, "echo STUDIO-BLOCKED: no installer was supplied");
+        assert_eq!(rec.state, StepState::Blocked);
+        assert!(rec.summary.contains("Blocked: no installer was supplied"), "{}", rec.summary);
+
+        // A denied download asks the user to approve downloads.
+        let rec = fake_agent(&mut app, &item.dir, "echo STUDIO-NEEDS-APPROVAL: downloads");
+        assert_eq!(rec.state, StepState::Blocked);
+        assert!(rec.summary.contains("Allow the agent to download"), "{}", rec.summary);
+
+        // An error exit is a failure.
+        let rec = fake_agent(&mut app, &item.dir, "echo boom & exit /b 3");
+        assert_eq!(rec.state, StepState::Fail);
+    }
+
+    #[test]
+    fn agent_runs_wait_for_other_work() {
+        let (dir, mut app) = fake_app();
+        let root = install_sample(&mut app, dir.path(), "sample-plugin", |m| m);
+        let item = WorkItem::create(&root, "{date}-{ref}-{slug}", "Busy", "", Origin::default(), SystemTime::now()).unwrap();
+        // A running recipe-agent or test holds everything else back.
+        let spec = ystudio_core::process::ProcessSpec::new("long", "cmd", dir.path()).args(["/d", "/c", "ping -n 20 127.0.0.1 > nul"]);
+        let job = app.start_job(spec, JobKind::Agent { before: Snapshot::default(), batch_item: None, verification: None }).unwrap();
+        assert!(!run_agent(&mut app, "sample-plugin", &item.dir, "triage"));
+        assert!(app.status.error && app.status.text.contains("Finish the running agent"), "{}", app.status.text);
+        assert!(Lock::holder(&item.dir).is_none(), "a refused run leaves no lock");
+        app.job_mut(job).unwrap().proc.cancel();
+    }
+
+    #[test]
+    fn recipe_handoff_fills_the_new_recipe_dialog() {
+        let (dir, mut app) = fake_app();
+        let notes = dir.path().join("export.md");
+        std::fs::write(&notes, "## Spectragryph\n\nSilent switch: /S\n").unwrap();
+        let row = serde_json::json!({"key": "ScopeId_1/Application_2", "name": "Spectragryph optical spectroscopy", "manufacturer": "Dr. F. Menges"});
+        recipe_handoff(&mut app, &row, "ScopeId_1/Application_2", &notes);
+        assert_eq!(app.view, View::Recipes);
+        assert!(app.library.new_open);
+        assert_eq!((app.library.new_display.as_str(), app.library.new_publisher.as_str()), ("Spectragryph optical spectroscopy", "Dr. F. Menges"));
+        assert!(app.library.new_notes.contains("Silent switch: /S"));
+        assert!(ystudio_core::recipe::is_valid_id(&app.library.new_id), "{}", app.library.new_id);
+    }
+
     #[test]
     fn steps_run_as_jobs_and_record_results() {
         let (dir, mut app) = fake_app();
@@ -1259,4 +1423,160 @@ mod tests {
         assert!(!run_step(&mut app, "sample-plugin", &item.dir, "confirmed", Map::new(), false, Purpose::Item));
         assert!(Lock::holder(&item.dir).is_none(), "a refused step leaves no lock");
     }
+}
+
+#[cfg(test)]
+mod small_window_tests {
+    use super::*;
+    use crate::app::MIN_LAYOUT;
+    use crate::workflow::tests::{fake_app, render};
+
+    /// Below the minimum layout size the whole window scrolls over a layout of
+    /// that size; the pages never get squeezed into the smaller window.
+    #[test]
+    fn small_windows_scroll_instead_of_overlapping() {
+        let (_dir, mut app) = fake_app();
+        for (name, view) in [("home", View::Home), ("recipes", View::Recipes), ("batch", View::Batch), ("history", View::Runs), ("publish", View::Promote), ("settings", View::Settings)] {
+            app.view = view;
+            for (w, h) in [(700u32, 450u32), (900, 600), (1100, 500), (MIN_LAYOUT.x as u32, MIN_LAYOUT.y as u32)] {
+                render(&mut app, &format!("small-{name}-{w}x{h}"), w, h);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- agent
+
+/// Runs an agent task on a work item: the agent works in its folder only,
+/// with the plugin's instructions, and the result is recorded when it ends.
+pub fn run_agent(app: &mut StudioApp, id: &str, dir: &Path, task_id: &str) -> bool {
+    let Some(c) = context(app, id) else { return false };
+    let (Some(root), Ok(_)) = (c.root.clone(), &c.settings) else {
+        app.error(format!("{} needs its settings first.", c.plugin.manifest.name));
+        return false;
+    };
+    let Some(task) = c.plugin.manifest.task(task_id).cloned() else { return false };
+    if crate::workflow::busy(app) || !app.batch.queue.is_empty() {
+        app.error("Finish the running agent or test first.");
+        return false;
+    }
+    if !plugin::is_within(dir, &root) {
+        app.error(format!("{} is outside the plugin's work folder.", dir.display()));
+        return false;
+    }
+    let Ok(item) = WorkItem::open(dir) else { return false };
+    let evidence: Vec<Evidence> = task
+        .evidence_from
+        .iter()
+        .filter_map(|sid| {
+            let rec = item.meta.steps.get(sid).filter(|r| r.state != StepState::NotRun)?;
+            let state = match rec.state {
+                StepState::Ok => "passed",
+                StepState::Warn => "passed with warnings",
+                StepState::Fail => "failed",
+                StepState::Blocked => "blocked",
+                StepState::Running | StepState::NotRun => "not finished",
+            };
+            Some(Evidence { step: stage_label(&c, sid), state: state.into(), summary: rec.summary.clone(), result: rec.result.clone() })
+        })
+        .collect();
+    let lock = match Lock::acquire(dir, &format!("{} · {}", c.plugin.manifest.name, task.label)) {
+        Ok(l) => l,
+        Err(e) => {
+            app.error(format!("{e:#}"));
+            return false;
+        }
+    };
+    let ctx = PluginAgentContext { plugin: &c.plugin, task: &task, dir, title: &item.meta.title, evidence: &evidence };
+    let spec = match agent::build_plugin_command(app.settings.agent_backend, &app.settings.agent_model, &app.settings.production_paths, &ctx, super::settings::agent_options(app)) {
+        Ok(s) => s,
+        Err(e) => {
+            app.error(format!("{e:#}"));
+            return false;
+        }
+    };
+    let kind = JobKind::PluginAgent { plugin: id.to_string(), dir: dir.to_path_buf(), task: task.id.clone(), before: Snapshot::of_dir(dir) };
+    let Some(job) = app.start_job(spec, kind) else { return false };
+    app.plugins.locks.insert(job, lock);
+    app.plugins.page(id).agent_changes.remove(dir);
+    if let Ok(mut item) = WorkItem::open(dir) {
+        let rec = item.meta.steps.entry(task.id.clone()).or_default();
+        rec.state = StepState::Running;
+        rec.started = ystudio_core::intake::timestamp();
+        rec.finished.clear();
+        let _ = item.save();
+        app.plugins.page(id).refresh_items(&root);
+    }
+    true
+}
+
+/// Records a finished agent task: what it changed, what stopped it, and
+/// whether it wrote what the task expects.
+pub fn agent_finished(app: &mut StudioApp, job: u64, id: &str, dir: &Path, task_id: &str, before: Snapshot) {
+    app.plugins.locks.remove(&job);
+    let (ok, cancelled, text) = app.job(job).map(|j| (j.proc.succeeded(), j.proc.cancelled, j.proc.text())).unwrap_or((false, false, String::new()));
+    let Some(c) = context(app, id) else { return };
+    let mut changes = before.diff(&Snapshot::of_dir(dir));
+    changes.sort_by(|a, b| a.path().cmp(b.path()));
+    let n = changes.iter().filter(|c| !matches!(c, Change::Removed(_))).count();
+    let missing: Vec<String> = c
+        .plugin
+        .manifest
+        .task(task_id)
+        .map(|t| t.outputs.iter().filter(|o| plugin::safe_relative(o) && !dir.join(o).exists()).cloned().collect())
+        .unwrap_or_default();
+    let blocker = if agent::needs_approval(&text) {
+        Some(crate::workflow::NEEDS_APPROVAL_NOTE.to_string())
+    } else {
+        agent::blocked_reason(&text).map(|r| format!("Blocked: {r}"))
+    };
+    let (state, summary) = if cancelled {
+        (StepState::Fail, "Cancelled.".to_string())
+    } else if let Some(b) = blocker {
+        (StepState::Blocked, format!("{b} ({n} file(s) changed)"))
+    } else if !ok {
+        (StepState::Fail, format!("The agent exited with an error ({n} file(s) changed). See its log."))
+    } else if !missing.is_empty() {
+        (StepState::Warn, format!("Finished ({n} file(s) changed) but did not write {}.", missing.join(", ")))
+    } else {
+        (StepState::Ok, format!("Finished: {n} file(s) changed."))
+    };
+    if let Ok(mut item) = WorkItem::open(dir) {
+        let rec = item.meta.steps.entry(task_id.to_string()).or_default();
+        rec.state = state;
+        rec.finished = ystudio_core::intake::timestamp();
+        rec.summary = summary.clone();
+        let _ = item.save();
+    }
+    let page = app.plugins.page(id);
+    page.agent_changes.insert(dir.to_path_buf(), changes);
+    page.panels = None;
+    if let Some(root) = &c.root {
+        page.refresh_items(root);
+    }
+    let label = stage_label(&c, task_id);
+    let msg = format!("{} · {label}: {summary}", c.plugin.manifest.name);
+    if matches!(state, StepState::Ok | StepState::Warn) {
+        app.notify(msg);
+    } else {
+        app.error(msg);
+    }
+}
+
+/// Fills the New recipe dialog from a catalog row and its export notes, so
+/// the user reviews it before the recipe agent runs.
+fn recipe_handoff(app: &mut StudioApp, row: &Value, key: &str, notes_file: &Path) {
+    let field = |names: &[&str]| names.iter().find_map(|n| row.get(*n).map(cell)).unwrap_or_default();
+    let name = Some(field(&["name", "title"])).filter(|n| !n.is_empty()).unwrap_or_else(|| key.to_string());
+    let notes: String = ystudio_core::read_text(notes_file).unwrap_or_default().chars().take(6000).collect();
+    let lib = &mut app.library;
+    lib.new_display = name.clone();
+    lib.new_publisher = field(&["publisher", "manufacturer"]);
+    lib.new_vendor.clear();
+    lib.new_id = ystudio_core::recipe::suggest_id(&name);
+    lib.new_id_touched = false;
+    lib.new_notes = notes.trim().to_string();
+    lib.new_open = true;
+    app.view = View::Recipes;
+    app.notify(format!("Review {name} and press 'Write it with the agent' to start the recipe."));
 }
