@@ -36,6 +36,8 @@ yardstick-studio.exe
     ├─ setup.rs          Install-Yardstick -Status / -DevelopmentOnly -NonInteractive commands and their JSON results
     ├─ git.rs            git clone/fetch/pull (ff-only) and ahead/behind status; finds git after a PATH refresh
     ├─ update.rs         self-update: latest GitHub release, SHA-256-verified MSI download, install-and-relaunch helper
+    ├─ plugin.rs         plugins: plugin.yaml manifest + validation, zip install/update/uninstall with integrity
+    │                    records, work items, hash-bound approvals, step runs (pwsh -File with input/result JSON)
     ├─ results.rs        parses _install-tests/<ts>/summary.json into verdicts and phases
     ├─ agent.rs          prompt (guardrails + task), CLI command and model list for Copilot CLI / Claude Code
     ├─ intake.rs         request-list readers, quick-scan extraction, recipe matching, Batch persistence

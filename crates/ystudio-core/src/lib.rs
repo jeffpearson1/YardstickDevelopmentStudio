@@ -12,6 +12,7 @@ pub mod harness;
 pub mod icons;
 pub mod intake;
 pub mod lint;
+pub mod plugin;
 pub mod prereqs;
 pub mod process;
 pub mod promote;

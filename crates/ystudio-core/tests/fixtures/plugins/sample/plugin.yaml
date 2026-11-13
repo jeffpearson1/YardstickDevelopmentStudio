@@ -1,0 +1,69 @@
+schema: 1
+id: sample-plugin
+name: Sample Plugin
+version: 1.0.0
+publisher: Yardstick contributors
+description: A tiny plugin the Studio's tests install and run.
+icon: E8F1
+studio: { minVersion: 0.6.0, hostApi: 1 }
+source: { github: jeffpearson1/YardstickDevelopmentStudio, tagPrefix: plugin-sample-plugin-v }
+requires:
+  plugins:
+    - id: other-plugin
+      minVersion: 1.0.0
+  modules:
+    - { name: powershell-yaml, min: 0.4.12 }
+settings:
+  - key: workRoot
+    label: Work folder
+    type: folder
+    required: true
+  - key: yardstickDevPath
+    label: YardstickDev folder
+    type: folder
+    default: "{workspace}"
+  - key: tenantId
+    label: Tenant ID
+    type: guid
+  - key: verbose
+    type: bool
+    default: "true"
+page:
+  type: workitems
+  noun: Ticket
+  intake: [text, files]
+  panels:
+    - { type: markdown, title: Notes, file: notes.md }
+    - { type: files, title: Evidence, globs: ["*.txt"] }
+agent:
+  instructions: agent/INSTRUCTIONS.md
+  deniedCommands: [Connect-MgGraph]
+  tasks:
+    - id: triage
+      label: Triage
+      prompt: agent/tasks/triage.md
+      outputs: [notes.md]
+steps:
+  - id: echo
+    label: Echo
+    script: scripts/Echo.ps1
+    params: { message: hello }
+    risk: local-write
+    after: [triage]
+  - id: confirmed
+    label: Confirmed echo
+    script: scripts/Echo.ps1
+    risk: local-write
+    gate: confirm
+  - id: approve
+    label: Approved change
+    script: scripts/Echo.ps1
+    risk: tenant-write
+    gate: { kind: hash, file: change.json, summary: change.md }
+    after: [echo]
+actions:
+  - id: send
+    label: Send to the other plugin
+    kind: handoff.workitem
+    plugin: other-plugin
+    files: [notes.md]

@@ -1,5 +1,6 @@
 //! Studio settings, stored as JSON in `%APPDATA%\YardstickStudio\settings.json`.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -47,6 +48,27 @@ pub struct Settings {
     /// Keep full job output, the Studio's messages and the agent CLIs' own
     /// logs in `%APPDATA%\YardstickStudio\logs` (see `diagnostics`).
     pub diagnostic_logging: bool,
+    /// Per installed plugin, by id. Kept when a plugin is uninstalled.
+    pub plugins: BTreeMap<String, PluginPrefs>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PluginPrefs {
+    /// Shows the plugin's tab.
+    pub enabled: bool,
+    /// Values for the manifest's settings, by key.
+    pub values: BTreeMap<String, String>,
+    /// The package SHA-256 the user agreed to on the trust prompt.
+    pub trusted_sha256: String,
+    /// Where it was installed from: a zip path or release URL.
+    pub source: String,
+}
+
+impl Default for PluginPrefs {
+    fn default() -> Self {
+        Self { enabled: true, values: BTreeMap::new(), trusted_sha256: String::new(), source: String::new() }
+    }
 }
 
 impl Default for Settings {
@@ -71,6 +93,7 @@ impl Default for Settings {
             agent_downloads: false,
             agent_multi: false,
             diagnostic_logging: false,
+            plugins: BTreeMap::new(),
         }
     }
 }
@@ -140,5 +163,15 @@ mod tests {
         assert_eq!(s.repo_url, crate::DEFAULT_REPO_URL);
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(Settings::load_from(&path), Settings::default());
+    }
+
+    #[test]
+    fn plugin_prefs_default_to_enabled() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("s.json");
+        std::fs::write(&path, r#"{"plugins": {"oneoff-packager": {"values": {"workRoot": "C:\\Work"}}}}"#).unwrap();
+        let p = &Settings::load_from(&path).plugins["oneoff-packager"];
+        assert!(p.enabled);
+        assert_eq!(p.values["workRoot"], r"C:\Work");
     }
 }
