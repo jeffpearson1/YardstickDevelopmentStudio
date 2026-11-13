@@ -120,12 +120,14 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         ui.add_space(theme::CARD_GAP);
         theme::card(ui, |ui| {
             theme::section_heading(ui, "Setup");
-            ui.label("Walks through the workspace, the tools and Yardstick's development-only setup again.");
+            ui.label("Walks through the tools, the workspace and Yardstick's development-only setup again.");
             ui.add_space(6.0);
             if ui.button("\u{E768}  Run setup again…").clicked() {
-                super::setup::open(app, super::setup::Step::Workspace);
+                super::setup::open(app, super::setup::Step::Tools);
             }
         });
+        ui.add_space(theme::CARD_GAP);
+        troubleshooting_card(app, ui);
         ui.add_space(8.0);
     });
 }
@@ -235,10 +237,37 @@ fn environment(app: &mut StudioApp, ui: &mut Ui) {
         if let Err(e) = ystudio_core::process::refresh_path() {
             app.error(format!("Could not reload PATH: {e:#}"));
         }
-        app.settings_ui.tools = None;
-        app.agent.backends_found = None;
+        super::tools::recheck(app);
         app.refresh_git_status();
     }
+}
+
+fn troubleshooting_card(app: &mut StudioApp, ui: &mut Ui) {
+    theme::card(ui, |ui| {
+        theme::section_heading(ui, "Troubleshooting");
+        let dir = ystudio_core::diagnostics::log_dir();
+        if ui
+            .checkbox(&mut app.settings.diagnostic_logging, "Diagnostic logging")
+            .on_hover_text(
+                "Keeps each job's full command line and output, the Studio's messages and the tool checks, plus the agent \
+                 CLI's own debug log and a transcript of each agent session (what it tried, and what was allowed or denied). \
+                 Logs older than two weeks are removed. Turn it off when you are done: transcripts are large.",
+            )
+            .changed()
+        {
+            app.save_settings();
+            if app.settings.diagnostic_logging {
+                ystudio_core::diagnostics::note(&format!("Diagnostic logging on (Studio {}).", env!("CARGO_PKG_VERSION")));
+            }
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(dir.display().to_string()).small().monospace().weak());
+            if ui.small_button("\u{E838}  Open log folder").clicked() {
+                let _ = std::fs::create_dir_all(&dir);
+                super::open_in_explorer(&dir);
+            }
+        });
+    });
 }
 
 fn appearance_card(app: &mut StudioApp, ui: &mut Ui) {
@@ -277,7 +306,11 @@ fn appearance_card(app: &mut StudioApp, ui: &mut Ui) {
 
 /// How agent runs work: what the user approved, and multi-agent mode.
 pub fn agent_options(app: &StudioApp) -> ystudio_core::agent::AgentOptions {
-    ystudio_core::agent::AgentOptions { downloads: app.settings.agent_downloads, multi_agent: app.settings.agent_multi }
+    ystudio_core::agent::AgentOptions {
+        downloads: app.settings.agent_downloads,
+        multi_agent: app.settings.agent_multi,
+        diagnostics: app.settings.diagnostic_logging,
+    }
 }
 
 /// The model runs use: the chosen one, or what the CLI's default resolved

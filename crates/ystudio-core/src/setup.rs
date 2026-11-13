@@ -63,6 +63,8 @@ pub struct Preferences {
     pub shared_icons: String,
     pub shared_recipe_overrides: String,
     pub sync_shared_content: bool,
+    /// Reported by installers that take `-SoftwareDropbox`.
+    pub software_dropbox: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -119,6 +121,9 @@ pub struct Answers {
     /// `None` keeps the stored value; `Some("")` clears it.
     pub shared_icons: Option<String>,
     pub shared_recipe_overrides: Option<String>,
+    /// Where licensed media for manualDownload recipes is staged; only for
+    /// installers that take `-SoftwareDropbox` ([`supports_dropbox`]).
+    pub software_dropbox: Option<String>,
 }
 
 /// Whether this clone's installer understands the wizard's parameters
@@ -126,6 +131,12 @@ pub struct Answers {
 pub fn supported(ws: &Workspace) -> bool {
     crate::read_text(&ws.root.join("Install-Yardstick.ps1"))
         .is_ok_and(|t| t.contains("$InstallOptionalModule") && t.contains("[switch]$Status") && t.contains("$ResultPath"))
+}
+
+/// Whether this clone's installer takes `-SoftwareDropbox`, which
+/// development-only setups otherwise never ask for.
+pub fn supports_dropbox(ws: &Workspace) -> bool {
+    crate::read_text(&ws.root.join("Install-Yardstick.ps1")).is_ok_and(|t| t.contains("$SoftwareDropbox"))
 }
 
 /// PowerShell 7, which the installer requires: the configured PowerShell when
@@ -159,10 +170,13 @@ pub fn setup_spec(ws: &Workspace, pwsh: &Path, answers: &Answers, result: &Path)
     }
     let mut args: Vec<String> = vec!["-DevelopmentOnly".into(), "-NonInteractive".into()];
     if let Some(icons) = &answers.shared_icons {
-        args.extend(["-SharedIcons".into(), icons.trim().to_string()]);
+        args.extend(["-SharedIcons".into(), network_path(icons)]);
     }
     if let Some(overrides) = &answers.shared_recipe_overrides {
-        args.extend(["-SharedRecipeOverrides".into(), overrides.trim().to_string()]);
+        args.extend(["-SharedRecipeOverrides".into(), overrides_file(&network_path(overrides))]);
+    }
+    if let Some(dropbox) = &answers.software_dropbox {
+        args.extend(["-SoftwareDropbox".into(), network_path(dropbox)]);
     }
     if !answers.modules.is_empty() {
         // Under `pwsh -File`, a list must be one comma-separated argument.
@@ -174,6 +188,55 @@ pub fn setup_spec(ws: &Workspace, pwsh: &Path, answers: &Answers, result: &Path)
     args.extend(["-ResultPath".into(), result.to_string_lossy().into_owned()]);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     Ok(spec("Set up Yardstick (development-only)", ws, pwsh, &args))
+}
+
+/// The installer takes the overrides *file*, and only recognises a folder
+/// that is reachable right now: a folder not created yet, or offline, would
+/// be stored as the file and every sync would then fail. So name the file.
+pub fn overrides_file(value: &str) -> String {
+    let v = value.trim().trim_matches(['"', '\'']).trim();
+    let lower = v.to_ascii_lowercase();
+    if v.is_empty() || lower.ends_with(".yaml") || lower.ends_with(".yml") {
+        v.to_string()
+    } else {
+        format!(r"{}\recipeOverrides.yaml", v.trim_end_matches(['\\', '/']))
+    }
+}
+
+/// `Z:\Intune\Icons` as `\\server\share\Intune\Icons` when Z: is a mapped
+/// network drive: elevated processes and scheduled tasks do not see the
+/// user's drive mappings. Anything else comes back trimmed and unchanged.
+pub fn network_path(value: &str) -> String {
+    let v = value.trim().trim_matches(['"', '\'']).trim();
+    let bytes = v.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+        && let Some(remote) = mapped_drive(&v[..2])
+    {
+        return format!("{}{}", remote.trim_end_matches('\\'), &v[2..]);
+    }
+    v.to_string()
+}
+
+/// The network path behind drive `letter` (`Z:`), if it is a mapped drive.
+#[cfg(windows)]
+fn mapped_drive(letter: &str) -> Option<String> {
+    use windows_sys::Win32::Foundation::NO_ERROR;
+    use windows_sys::Win32::NetworkManagement::WNet::WNetGetConnectionW;
+    let local: Vec<u16> = letter.encode_utf16().chain(Some(0)).collect();
+    let mut buf = vec![0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: `local` is NUL-terminated and `len` is the buffer's length in characters.
+    let rc = unsafe { WNetGetConnectionW(local.as_ptr(), buf.as_mut_ptr(), &mut len) };
+    if rc != NO_ERROR {
+        return None;
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..end])).filter(|s| s.starts_with(r"\\"))
+}
+
+#[cfg(not(windows))]
+fn mapped_drive(_: &str) -> Option<String> {
+    None
 }
 
 pub fn read_status(path: &Path) -> Result<Status> {
@@ -248,6 +311,7 @@ mod tests {
             set_execution_policy: true,
             shared_icons: Some(String::new()),
             shared_recipe_overrides: None,
+            software_dropbox: None,
         };
         let s = setup_spec(&ws, Path::new("pwsh"), &answers, Path::new(r"C:\t\r.json")).unwrap();
         let tail: Vec<&str> = s.args.iter().skip(5).map(String::as_str).collect();
@@ -265,11 +329,35 @@ mod tests {
     }
 
     #[test]
+    fn shared_overrides_always_name_the_file() {
+        assert_eq!(overrides_file(r"\\server\share\Yardstick"), r"\\server\share\Yardstick\recipeOverrides.yaml");
+        assert_eq!(overrides_file(r"  \\server\share\Yardstick\ "), r"\\server\share\Yardstick\recipeOverrides.yaml");
+        assert_eq!(overrides_file(r#""\\server\my share\Team.YML""#), r"\\server\my share\Team.YML");
+        assert_eq!(overrides_file(""), "");
+        assert_eq!(network_path(r#" "\\server\share\Icons" "#), r"\\server\share\Icons");
+        // Not a mapped drive (or not a drive at all): unchanged.
+        assert_eq!(network_path(r"C:\Intune\Icons"), r"C:\Intune\Icons");
+        assert_eq!(network_path("Icons"), "Icons");
+
+        let d = fake_workspace(None);
+        let ws = Workspace::open(d.path(), &[], &[]).unwrap();
+        let answers = Answers { shared_icons: Some(r"\\s\x\Icons".into()), shared_recipe_overrides: Some(r"\\s\x\Not Yet Created".into()), ..Default::default() };
+        let s = setup_spec(&ws, Path::new("pwsh"), &answers, Path::new("r.json")).unwrap();
+        let tail: Vec<&str> = s.args.iter().skip(7).take(4).map(String::as_str).collect();
+        assert_eq!(tail, ["-SharedIcons", r"\\s\x\Icons", "-SharedRecipeOverrides", r"\\s\x\Not Yet Created\recipeOverrides.yaml"]);
+    }
+
+    #[test]
     fn detects_installers_that_support_the_wizard() {
         let d = fake_workspace(None);
         let ws = Workspace::open(d.path(), &[], &[]).unwrap();
         assert!(!supported(&ws));
         std::fs::write(d.path().join("Install-Yardstick.ps1"), "param([string[]]$InstallOptionalModule, [switch]$Status, [string]$ResultPath)").unwrap();
-        assert!(supported(&ws));
+        assert!(supported(&ws) && !supports_dropbox(&ws));
+        std::fs::write(d.path().join("Install-Yardstick.ps1"), "param([string[]]$InstallOptionalModule, [switch]$Status, [string]$ResultPath, [string]$SoftwareDropbox)").unwrap();
+        assert!(supports_dropbox(&ws));
+        let answers = Answers { software_dropbox: Some(" Q:/x ".into()), ..Default::default() };
+        let s = setup_spec(&ws, Path::new("pwsh"), &answers, Path::new("r.json")).unwrap();
+        assert!(s.args.windows(2).any(|w| w == ["-SoftwareDropbox", "Q:/x"]));
     }
 }

@@ -61,8 +61,14 @@ pub fn waiting(app: &StudioApp) -> bool {
 pub fn poll(app: &mut StudioApp) {
     let next = match &mut app.elevation {
         State::Waiting { rx, .. } => match rx.try_recv() {
-            Ok(Ok(session)) => Some(State::Ready { session, since: Instant::now(), tests: 0 }),
-            Ok(Err(e)) => Some(State::Unavailable(e.to_string())),
+            Ok(Ok(session)) => {
+                app.refocus = true;
+                Some(State::Ready { session, since: Instant::now(), tests: 0 })
+            }
+            Ok(Err(e)) => {
+                app.refocus = true;
+                Some(State::Unavailable(e.to_string()))
+            }
             Err(TryRecvError::Disconnected) => Some(State::Unavailable("The elevation request ended without an answer.".into())),
             Err(TryRecvError::Empty) => None,
         },

@@ -11,6 +11,7 @@ pub mod runs;
 pub mod settings;
 pub mod setup;
 pub mod testbench;
+pub mod tools;
 pub mod update;
 pub mod usage;
 
@@ -254,6 +255,51 @@ pub fn git_bar(app: &mut StudioApp, ui: &mut Ui) {
     if sync {
         app.start_shared_sync(true);
     }
+}
+
+/// Recipes among `ids` with `manualDownload: true` cannot be tested without a
+/// software dropbox: say so before an agent or a test run finds out the hard way.
+pub fn dropbox_banner(app: &mut StudioApp, ui: &mut Ui, ids: &[String]) {
+    let Some(ws) = app.ws.as_ref().filter(|w| w.is_writable() && w.software_dropbox.is_none()) else { return };
+    let manual: Vec<&str> = ids
+        .iter()
+        .filter_map(|id| app.recipes.iter().find(|r| r.id.eq_ignore_ascii_case(id) && r.meta.manual_download))
+        .map(|r| r.id.as_str())
+        .collect();
+    if manual.is_empty() {
+        return;
+    }
+    let prefs = ws.layout.preferences.clone();
+    let production = app.ws_cache.production_dropbox.clone();
+    let mut copy = None;
+    theme::banner(ui, theme::amber(), |ui| {
+        ui.label(RichText::new("No software dropbox in this workspace").semibold().color(theme::amber()));
+        ui.label(format!(
+            "{} use{} manualDownload, so the media comes from the software dropbox, but SoftwareDropbox is not set in {}. \
+             Tests stop before the download step and agents can only report that.",
+            manual.join(", "),
+            if manual.len() == 1 { "s" } else { "" },
+            prefs.display()
+        ));
+        if let Some(p) = &production {
+            ui.label(RichText::new(format!("Production uses {}.", p.display())).small());
+        }
+        ui.horizontal(|ui| {
+            if ui.button("\u{E8E5}  Open preferences.yaml").clicked() {
+                open_in_explorer(&prefs);
+            }
+            if let Some(p) = &production
+                && ui.button("\u{E8C8}  Copy production's path").clicked()
+            {
+                copy = Some(format!("SoftwareDropbox: '{}'", p.display()));
+            }
+        });
+    });
+    if let Some(text) = copy {
+        ui.ctx().copy_text(text);
+        app.notify("Copied. Paste it over the SoftwareDropbox line in preferences.yaml, save, then Refresh.");
+    }
+    ui.add_space(6.0);
 }
 
 pub fn open_in_explorer(path: &std::path::Path) {

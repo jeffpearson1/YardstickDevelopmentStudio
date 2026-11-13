@@ -244,6 +244,9 @@ pub fn serve(base: &str, studio_pid: u32) -> Result<()> {
     if !crate::same_path(&peer, &std::env::current_exe()?) {
         bail!("The pipe belongs to '{}', not the Studio.", peer.display());
     }
+    // Windows hands the foreground to this hidden process once UAC is
+    // approved; pass it back so the Studio can come to the front again.
+    sys::allow_foreground(studio_pid);
     let mut replies = File::from(replies);
     let (tx, rx) = channel();
     std::thread::spawn(move || {
@@ -360,7 +363,7 @@ mod sys {
         WaitForSingleObject,
     };
     use windows_sys::Win32::UI::Shell::{SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SW_HIDE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, GetForegroundWindow, SW_HIDE};
 
     use super::{LaunchError, Worker};
 
@@ -510,6 +513,11 @@ mod sys {
         // SAFETY: no preconditions.
         unsafe { GetForegroundWindow() as isize }
     }
+
+    pub fn allow_foreground(pid: u32) {
+        // SAFETY: no preconditions; it fails harmlessly without the right to give.
+        unsafe { AllowSetForegroundWindow(pid) };
+    }
 }
 
 #[cfg(not(windows))]
@@ -541,6 +549,7 @@ mod sys {
     pub fn foreground_window() -> isize {
         0
     }
+    pub fn allow_foreground(_: u32) {}
 }
 
 #[cfg(all(test, windows))]

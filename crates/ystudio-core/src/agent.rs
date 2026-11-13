@@ -165,6 +165,9 @@ pub struct AgentOptions {
     /// A coordinating agent splits the work across parallel subagents
     /// (Copilot CLI's fleet mode; Claude Code's subagents).
     pub multi_agent: bool,
+    /// The CLI writes its debug log and session transcript to the diagnostic
+    /// log folder (see `diagnostics`).
+    pub diagnostics: bool,
 }
 
 /// The coordinator's instructions, when multi-agent mode is on.
@@ -307,12 +310,25 @@ pub fn task_prompt(task: &AgentTask) -> String {
 
 pub fn full_prompt(ws: &Workspace, production_paths: &[PathBuf], task: &AgentTask, options: AgentOptions) -> String {
     format!(
-        "{}\n{}{}\n---\n\n{}",
+        "{}\n{}{}{}\n---\n\n{}",
         guardrails(ws, production_paths),
         approvals_prompt(ws, production_paths, options),
         coordinator_prompt(options),
+        dropbox_prompt(ws),
         task_prompt(task)
     )
+}
+
+/// Without a software dropbox, a manualDownload recipe's harness runs stop
+/// before the download step; say so up front rather than after the tests.
+fn dropbox_prompt(ws: &Workspace) -> &'static str {
+    if ws.software_dropbox.is_some() {
+        return "";
+    }
+    "\nThis workspace has no SoftwareDropbox in Local\\preferences.yaml. If the recipe needs (or already uses) \
+     `manualDownload: true`, write or fix it and run the schema check only: the dry run and install tests stop before \
+     the download step without a dropbox. Then report `STUDIO-BLOCKED: manualDownload media needs a SoftwareDropbox` \
+     with what has to be staged and where it comes from.\n"
 }
 
 /// Whether the agent stopped because a command needed an approval this run
@@ -384,6 +400,9 @@ pub fn build_command(
     if !model.trim().is_empty() {
         spec = spec.args(["--model", model.trim()]);
     }
+    if options.diagnostics {
+        spec = spec.args(crate::diagnostics::agent_args(backend, &task.title()));
+    }
     Ok(spec)
 }
 
@@ -438,6 +457,9 @@ pub fn build_extract_command(backend: AgentBackend, model: &str, batch_dir: &Pat
     }
     if !model.trim().is_empty() {
         spec = spec.args(["--model", model.trim()]);
+    }
+    if options.diagnostics {
+        spec = spec.args(crate::diagnostics::agent_args(backend, "Extract software from request list"));
     }
     Ok(spec)
 }
@@ -607,12 +629,12 @@ mod tests {
         let task = AgentTask::Fix { id: "brave".into(), evidence: String::new(), notes: String::new() };
         let prod = [PathBuf::from(r"C:\Intune\Yardstick")];
 
-        let approved = full_prompt(&ws, &prod, &task, AgentOptions { downloads: true, multi_agent: false });
+        let approved = full_prompt(&ws, &prod, &task, AgentOptions { downloads: true, ..Default::default() });
         assert!(approved.contains("Approvals the user gave in the Studio before this run started"));
         assert!(approved.contains("do not report a blocker for lack of approval"));
         assert!(approved.contains(r"Artifacts\AgentDownloads"));
         assert!(approved.contains("Still not approved: running an installer") && approved.contains(r"`C:\Intune\Yardstick`"));
-        let args = copilot_args(&approved, "C:\\ws", true, AgentOptions { downloads: true, multi_agent: false });
+        let args = copilot_args(&approved, "C:\\ws", true, AgentOptions { downloads: true, ..Default::default() });
         assert!(args.contains(&"--allow-all-paths".to_string()));
         assert!(args.contains(&"--deny-tool=shell(git push)".to_string()));
 
@@ -628,7 +650,7 @@ mod tests {
     fn multi_agent_runs_a_coordinator() {
         let (_d, ws) = dev_ws();
         let task = AgentTask::Create { app: "Obsidian".into(), id_hint: String::new(), vendor_url: String::new(), notes: String::new() };
-        let multi = AgentOptions { downloads: false, multi_agent: true };
+        let multi = AgentOptions { multi_agent: true, ..Default::default() };
         let p = full_prompt(&ws, &[], &task, multi);
         assert!(p.contains("work as the coordinator") && p.contains("hand each to a subagent"));
         assert!(copilot_args(&p, "C:\\ws", true, multi).contains(&"--fleet".to_string()));
