@@ -68,6 +68,10 @@ releases, and **Update…** appears beside an installed plugin when a newer rele
 update shows a trust prompt first; the downloaded zip must match the SHA-256 GitHub publishes for it and
 must hold the plugin and version the release names.
 
+This repository ships the **One-Off Packager** (`plugins\oneoff-packager`, see its README): an agent triages a
+ticket and drafts the recipe, and a pipeline of separate steps tests, packages and uploads it, with your approval
+before anything is installed or changed in Intune.
+
 To package and test the plugins in this repository (`plugins\<id>\`):
 
 ```powershell

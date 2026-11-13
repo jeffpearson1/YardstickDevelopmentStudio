@@ -1301,6 +1301,57 @@ pub(crate) mod tests {
         render(&mut app, "plugin-trust", 1315, 900);
     }
 
+    /// The repository's One-Off Packager, installed and showing a ticket part-way through.
+    #[test]
+    fn the_oneoff_packager_page_renders_a_ticket_in_progress() {
+        let (dir, mut app) = fake_app();
+        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(r"..\..\plugins\oneoff-packager");
+        if !src.join("plugin.yaml").is_file() {
+            return;
+        }
+        let pkg = plugin::Package::from_bytes(&plugin::zip_dir(&src).unwrap()).unwrap();
+        let plugins = dir.path().join("plugins");
+        plugin::install(&pkg, &plugins, super::super::update::CURRENT_VERSION, "test", false).unwrap();
+        app.plugins = crate::plugins::Host::load(&plugins);
+        let root = dir.path().join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        let prefs = app.settings.plugins.entry("oneoff-packager".into()).or_default();
+        prefs.values.insert("workRoot".into(), root.to_string_lossy().into());
+        prefs.values.insert("tenantId".into(), "11111111-1111-1111-1111-111111111111".into());
+
+        let mut item = WorkItem::create(&root, "{date}-{ref}-{slug}", "FastStone Image Viewer and inPhoto Capture", "TASK1430821", Origin { kind: "text".into(), ..Default::default() }, SystemTime::now()).unwrap();
+        std::fs::write(item.dir.join("ticket.md"), "Please add FastStone Image Viewer 8.5 and inPhoto Capture PS to Company Portal for the photography lab.").unwrap();
+        std::fs::write(item.dir.join("products.json"), r#"{"products":[
+            {"id":"faststoneimageviewer","name":"FastStone Image Viewer","version":"8.5","status":"locally-validated","notes":"Vendor installer, unsigned"},
+            {"id":"inphotocaptureps","name":"inPhoto Capture PS","version":"4.18.42","status":"needs-research","notes":"Vendor link in the ticket"}]}"#).unwrap();
+        std::fs::write(item.dir.join("research-and-status.md"), "# Research\n\nBoth installers come from the vendors' own sites.\n\n- FastStone: `/S` silent switch confirmed in the vendor FAQ.").unwrap();
+        for (id, state, summary) in [
+            ("parse-ticket", StepState::Ok, "2 link(s), 0 Dropbox, 1 asset tag(s)."),
+            ("triage", StepState::Ok, "Finished: 1 file(s) changed."),
+            ("runtime", StepState::Ok, "Created the runtime and proved its DELETE guard. YardstickDev commit 2a28d70a."),
+            ("inventory", StepState::Ok, "Scanned 412 apps in Contoso: 0 possible existing app(s)."),
+            ("research", StepState::Ok, "Finished: 4 file(s) changed."),
+            ("prepare-test", StepState::Warn, "Prepare test run 20261113-101500-001: faststoneimageviewer: WhatIf."),
+        ] {
+            let rec = item.meta.steps.entry(id.into()).or_default();
+            rec.state = state;
+            rec.summary = summary.into();
+            rec.finished = "2026-11-13 10:15:00".into();
+        }
+        item.save().unwrap();
+        app.plugins.page("oneoff-packager").selected = Some(item.dir.clone());
+        app.view = View::Plugin(0);
+        render(&mut app, "oneoff-packager-ticket", 1500, 1500);
+
+        // The pipeline is in the order the page lists it, and a step is ready only after what it needs.
+        let m = &app.plugins.get("oneoff-packager").unwrap().manifest;
+        let order: Vec<&str> = m.pipeline().iter().map(|s| s.id()).collect();
+        assert_eq!(order, ["parse-ticket", "triage", "runtime", "inventory", "research", "prepare-test", "repair", "full-test-request", "full-test", "build", "prepare-live", "live-change"]);
+        let item = WorkItem::open(&item.dir).unwrap();
+        assert!(item.satisfied(&m.step("full-test-request").unwrap().after), "Prepare finished with warnings, so the request can be written");
+        assert!(!item.satisfied(&m.step("build").unwrap().after), "nothing is built before the install test");
+    }
+
     #[test]
     fn catalog_page_renders_rows_and_actions() {
         let (dir, mut app) = fake_app();

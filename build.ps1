@@ -25,6 +25,13 @@ if ($Task -eq 'plugins') {
     exit $LASTEXITCODE
 }
 if ($Task -eq 'plugin-test') {
+    # The plugins' scripts and tests are PowerShell 7; run them there even from Windows PowerShell.
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
+        if (-not $pwsh) { throw 'The plugin tests need PowerShell 7 (pwsh).' }
+        & $pwsh.Source -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -Task plugin-test
+        exit $LASTEXITCODE
+    }
     if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version.Major -ge 5 })) {
         throw 'Pester 5 or later is needed: Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser'
     }

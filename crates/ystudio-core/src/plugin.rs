@@ -2173,6 +2173,36 @@ mod tests {
         assert_eq!(installed.health, Health::Ok);
     }
 
+    /// Every plugin in the repository packs with the real script and installs.
+    #[test]
+    fn repo_plugins_pack_and_install() {
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let plugins = repo.join("plugins");
+        let dirs: Vec<PathBuf> = std::fs::read_dir(&plugins).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.join(MANIFEST).is_file()).collect();
+        if dirs.is_empty() {
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let spec = ProcessSpec::new("pack", crate::harness::powershell_exe(None), d.path())
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(plugins.join("Build-Plugins.ps1").to_string_lossy())
+            .arg("-OutputDirectory")
+            .arg(d.path().join("out").to_string_lossy());
+        crate::process::run_capture(&spec).unwrap();
+        for dir in dirs {
+            let m = Manifest::load(&dir).unwrap();
+            let zip = d.path().join("out").join(format!("{}-{}.zip", m.id, m.version));
+            let pkg = Package::open(&zip).unwrap_or_else(|e| panic!("{}: {e:#}", zip.display()));
+            let installed = install(&pkg, &d.path().join("installed"), env!("CARGO_PKG_VERSION"), "test", false).unwrap();
+            assert_eq!(installed.health, Health::Ok, "{}", m.id);
+            assert!(!pkg.file_names().any(|n| n.starts_with("tests/")), "{}: tests are not packaged", m.id);
+            // Every script a step runs is in the package, and so are the agent's files.
+            for step in &m.steps {
+                assert!(installed.path(&step.script).is_file(), "{}: {}", m.id, step.script);
+            }
+        }
+    }
+
     #[test]
     #[ignore = "network"]
     fn live_catalog_is_well_formed() {
