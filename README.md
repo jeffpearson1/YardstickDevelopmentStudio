@@ -33,6 +33,7 @@ production pulls them once they are merged.
 | **Publish** | Each selected development recipe becomes a pull request: the Studio cuts a `studio/<id>` branch from the upstream default branch in a temporary worktree (your checkout is untouched), commits the recipe to its shipped path together with its test evidence (`Tests/RecipeEvidence/<id>.json`, which Yardstick's required **Recipe evidence** check reads: it passes only when a live install test validated exactly the committed recipe), pushes it, and opens the pull request with `gh` when it is installed, or offers GitHub's compare page. It asks before opening anything in the browser. The recipe's icon is copied to the shared icon folder (`SharedIcons`), not into git. Production pulls merged changes itself. Recipes without a passing live test of their current contents get a dialog listing the recorded checks before you can *Open anyway*; their evidence says they are not validated, so the check fails until they are tested or a maintainer labels the pull request `evidence-waived`. |
 | **Setup** | The first-run wizard: pick or clone a development workspace, check the tools (PowerShell 7, git, gh, an agent CLI) with links to install what is missing, then Yardstick's development-only setup. It reads what is already in place with `Install-Yardstick.ps1 -Status`, pre-fills the answers (optional PowerShell modules, allowing scripts for your account, shared icon and recipe override folders), and applies them with a non-interactive `Install-Yardstick.ps1 -DevelopmentOnly` run, showing each step's result. It opens on first run, after cloning, from Home's *Set up this clone…*, and from Settings. Needs a Yardstick clone that includes jeffpearson1/Yardstick#36; older clones fall back to running the installer in a console. |
 | **Agent options** | Wherever the agent picker appears (Settings, a recipe's Agent tab, Recipe Builder) it offers **Multi-agent (coordinator)**: a coordinating agent splits the work across parallel subagents and writes the recipe itself (Copilot CLI `--fleet`; Claude Code's subagents), at a higher credit cost. **Allow the agent to download and inspect installers** is the user's explicit approval for headless runs: it lifts Copilot CLI's path checks for the run and tells the agent the approval was given, while installing software and touching production stay off limits. Each Copilot CLI run's AI credits appear in its log and the console's job list, per app in the Recipe Builder table, and as a per-app average next to the model. |
+| **Plugins** | Each installed plugin adds its own tab after Publish. A plugin is a zip of a `plugin.yaml` manifest, PowerShell steps and agent instructions, installed from a file or from the Studio's GitHub releases under *Settings → Plugins*, which also checks for updates (at startup and on demand). Installing shows the publisher, the package's SHA-256 and what every step can do; steps that install software or change the tenant run only after you approve the exact file they act on. A plugin's tab lists its work items with a pipeline of steps and agent tasks, or searches an outside system and acts on the chosen row. See [Plugins](#plugins). |
 | **Settings** | Updates, production and trusted development folders, the agent CLI and model (models are read from the CLI), PowerShell, the tool check (pwsh, git, gh, agent CLIs; *Re-check* reloads `PATH`), and appearance. Changes save as you make them. |
 | **Help** | The skill and its reference docs, rendered as Markdown. |
 
@@ -58,6 +59,32 @@ See [docs/DESIGN.md](docs/DESIGN.md) for the architecture and the safety model.
   looks in their usual install folders and re-reads `PATH`, so one installed while it is
   open is found.
 - Optional: the GitHub CLI (`gh`), to open pull requests directly from Publish.
+
+## Plugins
+
+Plugins live in `%APPDATA%\YardstickStudio\plugins\<id>\` and are managed in *Settings → Plugins*:
+**Install from file…** takes a plugin zip, **Install…** next to *Available* downloads one from the Studio's
+releases, and **Update…** appears beside an installed plugin when a newer release exists. Every install and
+update shows a trust prompt first; the downloaded zip must match the SHA-256 GitHub publishes for it and
+must hold the plugin and version the release names.
+
+To package and test the plugins in this repository (`plugins\<id>\`):
+
+```powershell
+.\build.ps1 -Task plugins        # target\plugins\<id>-<version>.zip and .sha256
+.\build.ps1 -Task plugin-test    # Pester 5 tests under plugins\*\tests
+```
+
+To publish one, bump `version` in its `plugin.yaml` in its own commit, build, then tag and release it.
+The tag is `plugin-<id>-v<version>` and the release carries `<id>-<version>.zip`; use `--latest=false` so the
+Studio's own update check, which reads the latest release and expects an MSI, is not thrown off:
+
+```powershell
+gh release create plugin-<id>-v<version> target\plugins\<id>-<version>.zip --latest=false --title "<name> <version>" --notes "..."
+```
+
+Build releases with one PowerShell: zlib output differs between Windows PowerShell 5.1 and PowerShell 7, so the
+same folder gives the same bytes only on the same host.
 
 ## Build and run
 

@@ -1235,13 +1235,13 @@ fn prompt_modal(app: &mut StudioApp, ctx: &egui::Context, c: &Ctx) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::workflow::tests::{fake_app, render};
 
     /// Installs the core crate's sample plugin, made to fit this Studio, and
     /// points its work folder into `dir`. `edit` adjusts the manifest.
-    fn install_sample(app: &mut StudioApp, dir: &Path, id: &str, edit: impl Fn(String) -> String) -> PathBuf {
+    pub(crate) fn install_sample(app: &mut StudioApp, dir: &Path, id: &str, edit: impl Fn(String) -> String) -> PathBuf {
         let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(r"..\ystudio-core\tests\fixtures\plugins\sample");
         let copy = dir.join("src").join(id);
         for rel in ["plugin.yaml", r"scripts\Echo.ps1", r"agent\INSTRUCTIONS.md", r"agent\tasks\triage.md"] {

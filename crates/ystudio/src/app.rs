@@ -487,6 +487,7 @@ impl StudioApp {
         }
         if app.settings.auto_check_updates {
             views::update::start_check(&mut app, true);
+            views::plugins::start_check(&mut app, true);
         }
         app
     }
@@ -1527,6 +1528,7 @@ impl StudioApp {
         let ctx = ui.ctx().clone();
         self.poll_jobs();
         views::update::poll(self);
+        views::plugins::poll(self);
         views::tools::poll(self, &ctx);
         if std::mem::take(&mut self.refocus) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);

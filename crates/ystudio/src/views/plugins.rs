@@ -1,10 +1,15 @@
 //! Plugins in Settings: what is installed, install from a package with a
 //! trust prompt, turn tabs on or off, each plugin's settings, uninstall.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::mpsc::{Receiver, channel};
 
 use eframe::egui::{self, RichText, Ui};
-use ystudio_core::plugin::{self, Gate, Health, Package, SettingKind};
+use ystudio_core::plugin::{self, Checked, Gate, Health, Package, SettingKind};
+use ystudio_core::update::{self, Release};
 
 use crate::app::{StudioApp, View};
 use crate::theme::{self, FluentText as _};
@@ -18,6 +23,110 @@ pub struct ManagerState {
     /// The plugin whose settings are expanded.
     pub open_settings: Option<String>,
     confirm_uninstall: Option<String>,
+    rx: Option<Receiver<Msg>>,
+    /// The newest release of each plugin the last check found.
+    pub latest: BTreeMap<String, Release>,
+    /// A check has finished at least once this session.
+    checked: bool,
+    checking: bool,
+    /// A startup check: stay quiet unless an update turned up.
+    quiet: bool,
+    /// The plugin being downloaded, and the bytes so far.
+    downloading: Option<(String, Arc<AtomicU64>)>,
+    error: Option<String>,
+}
+
+enum Msg {
+    Checked(Checked),
+    Downloaded(String, Release, Box<anyhow::Result<(Package, PathBuf)>>),
+}
+
+impl ManagerState {
+    /// The release that would update an installed plugin, if there is one.
+    pub fn update_for(&self, id: &str, installed: &str) -> Option<&Release> {
+        self.latest.get(id).filter(|r| update::is_newer(&r.version, installed))
+    }
+
+    /// Releases of plugins that are not installed.
+    fn available<'a>(&'a self, installed: &'a [plugin::Installed]) -> impl Iterator<Item = (&'a String, &'a Release)> {
+        self.latest.iter().filter(move |(id, _)| !installed.iter().any(|p| &p.manifest.id == *id))
+    }
+}
+
+/// Looks for new plugin releases in the background: the Studio's own and each
+/// installed plugin's source.
+pub fn start_check(app: &mut StudioApp, quiet: bool) {
+    if app.plugins_ui.checking {
+        return;
+    }
+    let installed: Vec<(String, Option<plugin::Source>)> = app.plugins.registry.plugins.iter().map(|p| (p.manifest.id.clone(), p.manifest.source.clone())).collect();
+    let (tx, rx) = channel();
+    let waker = app.waker.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(Msg::Checked(plugin::check_catalog(&installed)));
+        waker();
+    });
+    let st = &mut app.plugins_ui;
+    st.rx = Some(rx);
+    st.checking = true;
+    st.quiet = quiet;
+    st.error = None;
+}
+
+/// Downloads a release, checks it, and opens the trust prompt for it.
+fn start_download(app: &mut StudioApp, id: &str, release: Release) {
+    if app.plugins_ui.downloading.is_some() {
+        return;
+    }
+    let (tx, rx) = channel();
+    let progress = Arc::new(AtomicU64::new(0));
+    let (id_owned, rel, p, waker) = (id.to_string(), release, progress.clone(), app.waker.clone());
+    std::thread::spawn(move || {
+        let result = plugin::download_package(&id_owned, &rel, &update::download_dir().join("plugins"), &p);
+        let _ = tx.send(Msg::Downloaded(id_owned, rel, Box::new(result)));
+        waker();
+    });
+    let st = &mut app.plugins_ui;
+    st.rx = Some(rx);
+    st.downloading = Some((id.to_string(), progress));
+    st.error = None;
+}
+
+/// Drains finished checks and downloads. Called every frame.
+pub fn poll(app: &mut StudioApp) {
+    let Some(msg) = app.plugins_ui.rx.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
+    app.plugins_ui.rx = None;
+    match msg {
+        Msg::Checked(checked) => {
+            let quiet = std::mem::take(&mut app.plugins_ui.quiet);
+            app.plugins_ui.checking = false;
+            app.plugins_ui.checked = true;
+            app.plugins_ui.latest = checked.latest;
+            let updates: Vec<String> =
+                app.plugins.registry.plugins.iter().filter(|p| app.plugins_ui.update_for(&p.manifest.id, &p.manifest.version).is_some()).map(|p| p.manifest.name.clone()).collect();
+            if !updates.is_empty() {
+                app.notify(format!("Plugin update available: {} - see Settings > Plugins.", updates.join(", ")));
+            } else if !checked.errors.is_empty() && !quiet {
+                app.error(checked.errors.join(" "));
+            }
+            if !checked.errors.is_empty() {
+                app.plugins_ui.error = Some(checked.errors.join(" "));
+            }
+        }
+        Msg::Downloaded(id, release, result) => {
+            app.plugins_ui.downloading = None;
+            match *result {
+                Ok((pkg, _file)) => {
+                    let source = if release.html_url.is_empty() { release.asset_url.clone() } else { release.html_url.clone() };
+                    app.plugins_ui.trust = Some(Trust { pkg, source, ack: false, error: None });
+                }
+                Err(e) => {
+                    app.plugins_ui.error = Some(format!("{id}: {e:#}"));
+                    app.error(format!("Could not download {id}: {e:#}"));
+                }
+            }
+        }
+    }
 }
 
 struct Trust {
@@ -51,8 +160,18 @@ pub fn card(app: &mut StudioApp, ui: &mut Ui) {
             });
             ui.add_space(6.0);
         }
+        available_list(app, ui, &plugins);
         ui.add_space(4.0);
         ui.horizontal(|ui| {
+            let checking = app.plugins_ui.checking;
+            if ui.add_enabled(!checking, egui::Button::new("\u{E72C}  Check for updates")).clicked() {
+                start_check(app, false);
+            }
+            if checking {
+                ui.spinner();
+            } else if app.plugins_ui.checked && app.plugins_ui.error.is_none() && !app.plugins_ui.latest.is_empty() {
+                ui.label(RichText::new("Checked").weak());
+            }
             if ui.button("\u{E8B5}  Install from file…").clicked()
                 && let Some(zip) = rfd::FileDialog::new().add_filter("Plugin package", &["zip"]).pick_file()
             {
@@ -63,7 +182,38 @@ pub fn card(app: &mut StudioApp, ui: &mut Ui) {
                 super::open_in_explorer(&app.plugins.dir);
             }
         });
+        if let Some(e) = &app.plugins_ui.error {
+            ui.label(RichText::new(e).small().color(theme::amber()));
+        }
     });
+}
+
+/// Plugins the Studio's releases offer that are not installed yet.
+fn available_list(app: &mut StudioApp, ui: &mut Ui, installed: &[plugin::Installed]) {
+    let offers: Vec<(String, Release)> = app.plugins_ui.available(installed).map(|(id, r)| (id.clone(), r.clone())).collect();
+    if offers.is_empty() {
+        return;
+    }
+    ui.add_space(6.0);
+    ui.label(RichText::new("Available").semibold());
+    for (id, release) in offers {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&id).semibold());
+            ui.label(RichText::new(&release.version).weak());
+            let first = release.notes.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
+            if !first.is_empty() {
+                ui.label(RichText::new(first.chars().take(90).collect::<String>()).weak());
+            }
+            let busy = app.plugins_ui.downloading.is_some();
+            let resp = ui.add_enabled(!busy, egui::Button::new("Install…"));
+            if resp.clicked() {
+                start_download(app, &id, release.clone());
+            }
+            if app.plugins_ui.downloading.as_ref().is_some_and(|(d, _)| *d == id) {
+                ui.spinner();
+            }
+        });
+    }
 }
 
 /// Reads a package and shows the trust prompt for it.
@@ -95,6 +245,16 @@ fn plugin_row(app: &mut StudioApp, ui: &mut Ui, p: &plugin::Installed) {
         }
         for missing in app.plugins.registry.missing_requirements(p) {
             theme::badge(ui, missing, theme::amber());
+        }
+        if let Some(release) = app.plugins_ui.update_for(&id, &m.version).cloned() {
+            theme::badge(ui, format!("Update {}", release.version), theme::blue()).on_hover_text(release.notes.chars().take(400).collect::<String>());
+            let busy = app.plugins_ui.downloading.is_some();
+            if ui.add_enabled(!busy, egui::Button::new("Update…")).clicked() {
+                start_download(app, &id, release);
+            }
+            if app.plugins_ui.downloading.as_ref().is_some_and(|(d, _)| *d == id) {
+                ui.spinner();
+            }
         }
         let values = app.settings.plugins.get(&id).map(|p| p.values.clone()).unwrap_or_default();
         if plugin::resolve_settings(m, &values, dev_workspace(app).as_deref()).is_err() {
@@ -320,4 +480,81 @@ fn trust_modal(app: &mut StudioApp, ctx: &egui::Context) {
         }
     }
     app.plugins_ui.trust = Some(t);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::views::plugin_page::tests::install_sample;
+    use crate::workflow::tests::{fake_app, render};
+
+    fn release(version: &str) -> Release {
+        Release {
+            version: version.into(),
+            notes: "Adds a Products table.\nMore detail.".into(),
+            html_url: format!("https://github.com/o/r/releases/tag/plugin-sample-plugin-v{version}"),
+            asset_name: format!("sample-plugin-{version}.zip"),
+            asset_url: "https://example.invalid/sample.zip".into(),
+            size: 1,
+            sha256: Some("a".repeat(64)),
+        }
+    }
+
+    fn send(app: &mut StudioApp, msg: Msg) {
+        let (tx, rx) = channel();
+        app.plugins_ui.rx = Some(rx);
+        tx.send(msg).unwrap();
+        poll(app);
+    }
+
+    #[test]
+    fn checks_show_updates_and_installable_plugins() {
+        let (dir, mut app) = fake_app();
+        install_sample(&mut app, dir.path(), "sample-plugin", |m| m);
+        app.plugins_ui.checking = true;
+        let latest = BTreeMap::from([("sample-plugin".to_string(), release("1.1.0")), ("oneoff-packager".to_string(), release("1.0.0"))]);
+        send(&mut app, Msg::Checked(Checked { latest, errors: Vec::new() }));
+        assert!(!app.plugins_ui.checking && app.plugins_ui.checked);
+        assert_eq!(app.plugins_ui.update_for("sample-plugin", "1.0.0").map(|r| r.version.as_str()), Some("1.1.0"));
+        assert!(app.plugins_ui.update_for("sample-plugin", "1.1.0").is_none(), "already current");
+        assert!(app.plugins_ui.update_for("oneoff-packager", "1.0.0").is_none(), "not installed, so offered rather than updated");
+        assert!(app.status.text.contains("Plugin update available: Sample Plugin"), "{}", app.status.text);
+        let installed = app.plugins.registry.plugins.clone();
+        assert_eq!(app.plugins_ui.available(&installed).map(|(id, _)| id.as_str()).collect::<Vec<_>>(), ["oneoff-packager"]);
+
+        app.view = View::Settings;
+        render(&mut app, "plugin-updates", 1315, 1900);
+    }
+
+    #[test]
+    fn startup_checks_stay_quiet_about_problems() {
+        let (_dir, mut app) = fake_app();
+        app.plugins_ui.quiet = true;
+        send(&mut app, Msg::Checked(Checked { latest: BTreeMap::new(), errors: vec!["Checking o/r: offline".into()] }));
+        assert!(!app.status.error, "a quiet check does not interrupt");
+        assert!(app.plugins_ui.error.as_deref().is_some_and(|e| e.contains("offline")), "but Settings can show it");
+
+        app.plugins_ui.quiet = false;
+        send(&mut app, Msg::Checked(Checked { latest: BTreeMap::new(), errors: vec!["Checking o/r: offline".into()] }));
+        assert!(app.status.error && app.status.text.contains("offline"));
+    }
+
+    #[test]
+    fn a_downloaded_package_goes_to_the_trust_prompt() {
+        let (dir, mut app) = fake_app();
+        install_sample(&mut app, dir.path(), "sample-plugin", |m| m);
+        let root = app.plugins.get("sample-plugin").unwrap().root.clone();
+        let pkg = Package::from_bytes(&plugin::zip_dir(&root).unwrap()).unwrap();
+        app.plugins_ui.downloading = Some(("sample-plugin".into(), Arc::new(AtomicU64::new(0))));
+        send(&mut app, Msg::Downloaded("sample-plugin".into(), release("1.1.0"), Box::new(Ok((pkg, dir.path().join("x.zip"))))));
+        assert!(app.plugins_ui.downloading.is_none());
+        let trust = app.plugins_ui.trust.as_ref().expect("the trust prompt opens");
+        assert!(trust.source.ends_with("plugin-sample-plugin-v1.1.0") && !trust.ack, "nothing is installed until the user trusts it");
+        render(&mut app, "plugin-update-trust", 1315, 900);
+
+        // A failed download is reported and installs nothing.
+        app.plugins_ui.trust = None;
+        send(&mut app, Msg::Downloaded("sample-plugin".into(), release("1.1.0"), Box::new(Err(anyhow::anyhow!("failed verification")))));
+        assert!(app.plugins_ui.trust.is_none() && app.status.error && app.status.text.contains("failed verification"));
+    }
 }

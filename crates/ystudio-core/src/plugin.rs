@@ -1080,6 +1080,74 @@ pub fn latest_release(id: &str, source: &Source) -> Result<Option<Release>> {
     Ok(parse_releases(&body, id, source)?.into_iter().next())
 }
 
+/// Where the Studio's own plugins are released: tags `plugin-<id>-v<version>`
+/// in this repository, each with an asset `<id>-<version>.zip`.
+pub const FIRST_PARTY_REPO: &str = "jeffpearson1/YardstickDevelopmentStudio";
+
+pub fn first_party_source(id: &str) -> Source {
+    Source { github: FIRST_PARTY_REPO.to_string(), tag_prefix: format!("plugin-{id}-v") }
+}
+
+/// The newest release of every first-party plugin in a GitHub release list.
+pub fn parse_catalog(json: &str) -> Result<BTreeMap<String, Release>> {
+    static TAG: OnceLock<Regex> = OnceLock::new();
+    let tag = TAG.get_or_init(|| Regex::new(r"^plugin-([a-z][a-z0-9-]{2,40})-v\d+\.\d+\.\d+$").unwrap());
+    let v: Value = serde_json::from_str(json).context("parsing the release list")?;
+    let ids: BTreeSet<String> = v.as_array().into_iter().flatten().filter_map(|r| r["tag_name"].as_str()).filter_map(|t| tag.captures(t)).map(|c| c[1].to_string()).collect();
+    let mut out = BTreeMap::new();
+    for id in ids {
+        if let Some(latest) = parse_releases(json, &id, &first_party_source(&id))?.into_iter().next() {
+            out.insert(id, latest);
+        }
+    }
+    Ok(out)
+}
+
+/// What the plugin releases say: the newest of each plugin, and what went wrong.
+#[derive(Debug, Default)]
+pub struct Checked {
+    pub latest: BTreeMap<String, Release>,
+    pub errors: Vec<String>,
+}
+
+/// Looks up the first-party catalog and every installed plugin's own source
+/// (when it is elsewhere). Network.
+pub fn check_catalog(installed: &[(String, Option<Source>)]) -> Checked {
+    let mut out = Checked::default();
+    match crate::update::get_text(&format!("https://api.github.com/repos/{FIRST_PARTY_REPO}/releases?per_page=100")).and_then(|b| parse_catalog(&b)) {
+        Ok(found) => out.latest = found,
+        Err(e) => out.errors.push(format!("Checking {FIRST_PARTY_REPO}: {e:#}")),
+    }
+    for (id, source) in installed {
+        let Some(source) = source.as_ref().filter(|s| !s.github.eq_ignore_ascii_case(FIRST_PARTY_REPO)) else { continue };
+        match latest_release(id, source) {
+            Ok(Some(r)) => {
+                out.latest.insert(id.clone(), r);
+            }
+            Ok(None) => {}
+            Err(e) => out.errors.push(format!("Checking {}: {e:#}", source.github)),
+        }
+    }
+    out
+}
+
+/// Downloads a release's zip with its SHA-256 checked, and confirms it holds
+/// the plugin and version the release says it does.
+pub fn download_package(id: &str, release: &Release, dir: &Path, progress: &std::sync::atomic::AtomicU64) -> Result<(Package, PathBuf)> {
+    let file = crate::update::download_verified(release, "zip", dir, progress)?;
+    let pkg = Package::open(&file)?;
+    check_matches(&pkg, id, release)?;
+    Ok((pkg, file))
+}
+
+fn check_matches(pkg: &Package, id: &str, release: &Release) -> Result<()> {
+    let m = &pkg.manifest;
+    if m.id != id || m.version != release.version {
+        bail!("The download is {} {}, not {id} {}. Nothing was installed.", m.id, m.version, release.version);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- work items
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2023,6 +2091,93 @@ mod tests {
         assert_eq!(r.iter().map(|r| r.version.as_str()).collect::<Vec<_>>(), ["1.2.0", "1.0.0"]);
         assert_eq!(r[1].sha256.as_deref(), Some("0754b845c19d10aa20c7322a9ce68d4cb01bc30e7962d43c389b16aa007df5bb"));
         assert_eq!(releases_api(&src), "https://api.github.com/repos/o/r/releases?per_page=50");
+    }
+
+    #[test]
+    fn catalog_lists_the_newest_first_party_plugins() {
+        let asset = |name: &str| format!(r#"{{"name":"{name}","browser_download_url":"https://x/{name}","size":9,"digest":"sha256:{}"}}"#, "a".repeat(64));
+        let release = |tag: &str, zip: &str| format!(r#"{{"tag_name":"{tag}","html_url":"https://github.com/o/r/releases/tag/{tag}","assets":[{}]}}"#, asset(zip));
+        let json = format!(
+            "[{}]",
+            [
+                r#"{"tag_name":"v0.6.0","assets":[{"name":"YardstickDevelopmentStudio-0.6.0-x64.msi","browser_download_url":"u"}]}"#.to_string(),
+                release("plugin-oneoff-packager-v1.0.1", "oneoff-packager-1.0.1.zip"),
+                release("plugin-oneoff-packager-v1.0.0", "oneoff-packager-1.0.0.zip"),
+                release("plugin-sccm-migration-v1.0.0", "sccm-migration-1.0.0.zip"),
+                release("plugin-broken-v1.0.0", "wrong-name.zip"),
+                release("plugin-X-v1.0.0", "x-1.0.0.zip"),
+            ]
+            .join(",")
+        );
+        let catalog = parse_catalog(&json).unwrap();
+        assert_eq!(catalog.keys().map(String::as_str).collect::<Vec<_>>(), ["oneoff-packager", "sccm-migration"]);
+        assert_eq!(catalog["oneoff-packager"].version, "1.0.1");
+        assert_eq!(catalog["oneoff-packager"].asset_name, "oneoff-packager-1.0.1.zip");
+        assert!(catalog["sccm-migration"].sha256.is_some());
+        assert!(parse_catalog("not json").is_err());
+        assert_eq!(first_party_source("sccm-migration").tag_prefix, "plugin-sccm-migration-v");
+    }
+
+    #[test]
+    fn downloads_must_hold_the_plugin_the_release_names() {
+        let pkg = sample_package();
+        let release = |version: &str| Release { version: version.into(), notes: String::new(), html_url: String::new(), asset_name: String::new(), asset_url: String::new(), size: 0, sha256: None };
+        check_matches(&pkg, "sample-plugin", &release("1.0.0")).unwrap();
+        assert!(check_matches(&pkg, "other-plugin", &release("1.0.0")).unwrap_err().to_string().contains("not other-plugin"));
+        assert!(check_matches(&pkg, "sample-plugin", &release("2.0.0")).unwrap_err().to_string().contains("not sample-plugin 2.0.0"));
+    }
+
+    /// `plugins\Build-Plugins.ps1` makes the same bytes every time, from LF or CRLF
+    /// sources, in a form the Studio installs.
+    #[test]
+    fn the_build_script_packs_installable_zips() {
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let script = repo.join("plugins").join("Build-Plugins.ps1");
+        let d = tempfile::tempdir().unwrap();
+        let plugins = d.path().join("plugins");
+        let copy = plugins.join("sample-plugin");
+        walk_files(&fixture(), &fixture(), &mut |rel, path| {
+            let to = copy.join(rel);
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            // Check out with CRLF, as autocrlf does.
+            let text = std::fs::read_to_string(path).unwrap().replace("\r\n", "\n").replace('\n', "\r\n");
+            std::fs::write(to, text).unwrap();
+        });
+        std::fs::create_dir_all(copy.join("tests")).unwrap();
+        std::fs::write(copy.join("tests").join("Sample.Tests.ps1"), "# not packaged").unwrap();
+        std::fs::copy(&script, plugins.join("Build-Plugins.ps1")).unwrap();
+
+        let build = |out: &str| {
+            let spec = ProcessSpec::new("pack", crate::harness::powershell_exe(None), d.path())
+                .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+                .arg(plugins.join("Build-Plugins.ps1").to_string_lossy())
+                .arg("-OutputDirectory")
+                .arg(d.path().join(out).to_string_lossy());
+            crate::process::run_capture(&spec).unwrap();
+            std::fs::read(d.path().join(out).join("sample-plugin-1.0.0.zip")).unwrap()
+        };
+        let (first, second) = (build("one"), build("two"));
+        assert_eq!(first, second, "the same folder packs to the same bytes");
+
+        let pkg = Package::from_bytes(&first).unwrap();
+        assert_eq!((pkg.manifest.id.as_str(), pkg.manifest.version.as_str()), ("sample-plugin", "1.0.0"));
+        let names: Vec<&str> = pkg.file_names().collect();
+        assert!(names.contains(&"scripts/Echo.ps1") && !names.iter().any(|n| n.starts_with("tests/")), "{names:?}");
+        let sha = std::fs::read_to_string(d.path().join("one").join("sample-plugin-1.0.0.zip.sha256")).unwrap();
+        assert!(sha.starts_with(&pkg.sha256) && sha.contains("*sample-plugin-1.0.0.zip"), "{sha}");
+
+        // LF in the package whatever the checkout used, so installs match across machines.
+        let installed = install(&pkg, &d.path().join("installed"), VERSION, "test", false).unwrap();
+        let manifest = std::fs::read(installed.root.join(MANIFEST)).unwrap();
+        assert!(!manifest.contains(&b'\r'));
+        assert_eq!(installed.health, Health::Ok);
+    }
+
+    #[test]
+    #[ignore = "network"]
+    fn live_catalog_is_well_formed() {
+        let checked = check_catalog(&[]);
+        assert!(checked.errors.is_empty(), "{:?}", checked.errors);
     }
 
     #[test]

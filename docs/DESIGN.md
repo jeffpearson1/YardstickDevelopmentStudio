@@ -347,6 +347,19 @@ new page type needs one (`studio.hostApi` in the manifest says which kit it expe
   `INSTRUCTIONS.md`, the task prompt and the results of the steps it takes evidence from; the
   plugin's reference files are copied to `<work item>\.studio\agent`.
 
+Distribution. Plugin sources live in `plugins\<id>\`; `build.ps1 -Task plugins` runs
+`plugins\Build-Plugins.ps1`, which packs each into `target\plugins\<id>-<version>.zip` plus a
+`.sha256`: files in name order, fixed timestamps, LF line endings in text files, no `tests\`.
+A release is tagged `plugin-<id>-v<version>` with the zip attached and created with
+`--latest=false` (the Studio's own update check reads the latest release and needs an MSI there).
+*Settings → Plugins* lists the newest release of each plugin in this repository's releases
+(`plugin::parse_catalog`), flags installed plugins that have a newer one, and downloads with
+`update::download_verified`: the zip's SHA-256 must match GitHub's `digest`, and its manifest must
+name the plugin and version the release does. A plugin may name another repository in its
+`source`; it is checked too. Both checks run at startup (quietly, when *Check for updates at
+startup* is on) and on demand. A core test packs the sample plugin with the script and installs the
+result, so the packer and the Studio's validator cannot drift apart.
+
 Plugin safety, in addition to the model above:
 
 - **Trust.** Installing or updating shows the publisher, the package SHA-256 and every
