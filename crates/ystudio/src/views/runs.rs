@@ -1,4 +1,4 @@
-//! Runs: the harness's install-test evidence and lab runs.
+//! History: the harness's install-test evidence and lab runs.
 
 use std::path::{Path, PathBuf};
 
@@ -60,7 +60,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         app.runs_ui.loaded = true;
     }
     ui.horizontal(|ui| {
-        theme::page_title(ui, "Runs");
+        theme::page_title(ui, "History");
         if ui.button("\u{E72C}  Refresh").clicked() {
             app.refresh_runs();
         }

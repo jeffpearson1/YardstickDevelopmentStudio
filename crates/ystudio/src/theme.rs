@@ -172,11 +172,13 @@ pub mod icon {
     pub const ROBOT: &str = "\u{E99A}";
     pub const INBOX: &str = "\u{E8C3}";
     pub const PHOTO: &str = "\u{E91B}";
-    pub const CHART: &str = "\u{E9D2}";
     pub const BOOK: &str = "\u{E736}";
     pub const UPLOAD: &str = "\u{E898}";
     pub const SETTINGS: &str = "\u{E713}";
     pub const CONSOLE: &str = "\u{E756}";
+    pub const CLOCK: &str = "\u{E823}";
+    /// Segoe Fluent Icons has no hammer; [`super::nav_item`] draws this one.
+    pub const HAMMER: &str = "hammer";
 }
 
 /// Yardstick brand artwork (assets/branding), embedded in the binary.
@@ -551,10 +553,29 @@ pub fn nav_item(ui: &mut Ui, glyph: &str, label: &str, selected: bool, busy: boo
         painter.rect_stroke(rect, 4, Stroke::new(2.0, p.text), egui::StrokeKind::Inside);
     }
     let y = rect.center().y;
-    painter.text(egui::pos2(rect.left() + 12.0, y), egui::Align2::LEFT_CENTER, glyph, FontId::new(16.0, FontFamily::Name(ICONS.into())), p.text);
+    if glyph == icon::HAMMER {
+        paint_hammer(painter, egui::pos2(rect.left() + 12.0, y - 8.0), p.text);
+    } else {
+        painter.text(egui::pos2(rect.left() + 12.0, y), egui::Align2::LEFT_CENTER, glyph, FontId::new(16.0, FontFamily::Name(ICONS.into())), p.text);
+    }
     painter.text(egui::pos2(rect.left() + 44.0, y), egui::Align2::LEFT_CENTER, label, FontId::proportional(14.0), p.text);
     if busy {
         painter.circle_filled(egui::pos2(rect.right() - 14.0, y), 3.5, p.accent);
     }
     resp
+}
+
+/// A 16 px outline hammer in the Fluent icon style, `origin` at its top left.
+fn paint_hammer(painter: &egui::Painter, origin: egui::Pos2, color: Color32) {
+    let stroke = Stroke::new(1.0, color);
+    // `along` runs down the handle to the lower left; `across` along the head.
+    let d = std::f32::consts::FRAC_1_SQRT_2;
+    let (along, across) = (vec2(-d, d), vec2(d, d));
+    let top = origin + vec2(11.0, 5.0);
+    let quad = |c: egui::Pos2, half_len: f32, half_w: f32, len_dir: egui::Vec2, w_dir: egui::Vec2| {
+        vec![c - len_dir * half_len - w_dir * half_w, c + len_dir * half_len - w_dir * half_w, c + len_dir * half_len + w_dir * half_w, c - len_dir * half_len + w_dir * half_w]
+    };
+    painter.add(egui::Shape::closed_line(quad(top, 5.25, 1.75, across, along), stroke));
+    let handle = top + along * (1.75 + 5.0);
+    painter.add(egui::Shape::closed_line(quad(handle, 5.0, 0.9, along, across), stroke));
 }

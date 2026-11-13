@@ -23,7 +23,7 @@ yardstick-studio.exe
 │   ├─ highlight.rs      YAML/PowerShell syntax highlighting (egui LayoutJob)
 │   ├─ theme.rs          Fluent tokens (light/dark), brand art, fonts, nav items, badges, cards, info bars, accent buttons
 │   └─ views/            home (launcher), recipes (+ recipe header and tabs in mod.rs), designer, editor,
-│                        testbench, agent, batch (Requests), icons, runs, docs (Help), promote (Publish), settings,
+│                        testbench, agent, batch (Recipe Builder), icons, runs (History), docs (Help), promote (Publish), settings,
 │                        setup (first-run wizard), update
 └─ crates/ystudio-core   headless engine; no GUI types; unit tested
     ├─ workspace.rs      open + classify a Yardstick folder, layout from Yardstick.Project.psd1, recipe metadata
@@ -250,18 +250,18 @@ Enforcement:
 
 ## User journeys
 
-1. **Design.** Home or Recipes → *New recipe* (from a `Templates\` file) or *Copy to
+1. **Design.** Home or Recipe Library → *New recipe* (from a `Templates\` file) or *Copy to
    Development* → the recipe's Design tab steps (Identity, Source & version, Download scripts, Install & uninstall,
    Detection, Lifecycle & assignments, Advanced) with live lint → Ctrl+S.
 2. **Test.** The recipe's Test tab → *Run safe checks* (Lint → Schema → install-test dry run). Then,
-   optionally: Lab download/package, and a live install test after consent. Runs shows
+   optionally: Lab download/package, and a live install test after consent. History shows
    the history and per-phase results.
 3. **Agentic.** *New recipe* → *Write it with the agent* makes a one-item request that is
    written, tested and repaired like any other; or the open recipe's Agent tab (Fix with the
    latest failing run, Review, Update, Freeform) → stream → back to Test.
 4. **Publish.** Publish → select complete Development recipes → *Open pull requests…* →
    confirm → open the pull request (or GitHub's compare page) in the browser.
-5. **Requests.** Import a ticket export or paste a list → review the extracted items
+5. **Recipe Builder.** Import a ticket export or paste a list → review the extracted items
    (optionally *Extract with agent*) → find missing icons → *Run agent on N selected* →
    publish the recipes it produced. *Update several recipes* makes a request from library
    recipes to re-test, repair or update together.

@@ -183,6 +183,10 @@ pub struct PageDef {
     pub columns: Vec<String>,
     #[serde(default)]
     pub panels: Vec<PanelDef>,
+    /// Work-item steps and agent tasks in the order the page lists them.
+    /// Defaults to the order `after` implies, ties in declaration order.
+    #[serde(default)]
+    pub pipeline: Vec<String>,
 }
 
 fn default_noun() -> String {
@@ -366,6 +370,43 @@ impl TryFrom<GateRepr> for Gate {
     }
 }
 
+/// One row of a work item's pipeline.
+#[derive(Debug, Clone, Copy)]
+pub enum Stage<'a> {
+    Task(&'a AgentTaskDef),
+    Step(&'a StepDef),
+}
+
+impl<'a> Stage<'a> {
+    pub fn id(&self) -> &'a str {
+        match self {
+            Stage::Task(t) => &t.id,
+            Stage::Step(s) => &s.id,
+        }
+    }
+
+    pub fn label(&self) -> &'a str {
+        match self {
+            Stage::Task(t) => &t.label,
+            Stage::Step(s) => s.label(),
+        }
+    }
+
+    pub fn description(&self) -> &'a str {
+        match self {
+            Stage::Task(t) => &t.description,
+            Stage::Step(s) => &s.description,
+        }
+    }
+
+    pub fn after(&self) -> &'a [String] {
+        match self {
+            Stage::Task(t) => &t.after,
+            Stage::Step(s) => &s.after,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ActionDef {
     pub id: String,
@@ -417,6 +458,26 @@ impl Manifest {
 
     pub fn task(&self, id: &str) -> Option<&AgentTaskDef> {
         self.agent.as_ref()?.tasks.iter().find(|t| t.id == id)
+    }
+
+    /// A work item's pipeline: agent tasks and work-item steps, in page order.
+    pub fn pipeline(&self) -> Vec<Stage<'_>> {
+        let tasks = self.agent.iter().flat_map(|a| &a.tasks).map(Stage::Task);
+        let all: Vec<Stage> = tasks.chain(self.steps.iter().filter(|s| s.scope == Scope::Workitem).map(Stage::Step)).collect();
+        if !self.page.pipeline.is_empty() {
+            return self.page.pipeline.iter().filter_map(|id| all.iter().find(|s| s.id() == id).copied()).collect();
+        }
+        // Kahn's algorithm, always taking the first-declared stage that is ready.
+        let mut done: BTreeSet<&str> = BTreeSet::new();
+        let mut out = Vec::new();
+        let mut left = all;
+        while !left.is_empty() {
+            let ready = left.iter().position(|s| s.after().iter().all(|a| done.contains(a.as_str()) || !left.iter().any(|o| o.id() == a)));
+            let stage = left.remove(ready.unwrap_or(0));
+            done.insert(stage.id());
+            out.push(stage);
+        }
+        out
     }
 
     /// Why this Studio cannot run the plugin, if it can't.
@@ -548,6 +609,11 @@ impl Manifest {
         plugin_step("importer", &self.page.importer, &mut p);
         plugin_step("probe", &self.page.probe, &mut p);
         plugin_step("query", &self.page.query, &mut p);
+        for id in &self.page.pipeline {
+            if self.task(id).is_none() && !self.step(id).is_some_and(|s| s.scope == Scope::Workitem) {
+                p(format!("page pipeline lists '{id}', which is not an agent task or work-item step"));
+            }
+        }
         if self.page.kind == PageKind::Catalog && self.page.query.is_none() {
             p("a catalog page needs a query step".into());
         }
@@ -722,6 +788,24 @@ impl Package {
     pub fn total_bytes(&self) -> u64 {
         self.files.iter().map(|(_, b)| b.len() as u64).sum()
     }
+}
+
+/// Packs a plugin folder into a zip, files in name order with fixed
+/// timestamps so the same folder always gives the same SHA-256.
+pub fn zip_dir(dir: &Path) -> Result<Vec<u8>> {
+    use std::io::Write as _;
+    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).last_modified_time(zip::DateTime::default());
+    let mut files = Vec::new();
+    walk_files(dir, dir, &mut |rel, path| files.push((rel.to_string(), path.to_path_buf())));
+    for (rel, path) in files {
+        if rel == INSTALL_RECORD {
+            continue;
+        }
+        w.start_file(rel, opts)?;
+        w.write_all(&std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?)?;
+    }
+    Ok(w.finish()?.into_inner())
 }
 
 /// Written next to an installed plugin so later edits are noticed.
@@ -1538,6 +1622,75 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// `<work_root>`-relative paths (forward slashes) under `dir` matching any of
+/// `globs` (`*` within a name, `**` across folders). Studio scratch is skipped.
+pub fn glob_files(dir: &Path, globs: &[String]) -> Vec<String> {
+    let patterns: Vec<Regex> = globs.iter().filter_map(|g| Regex::new(&glob_regex(g)).ok()).collect();
+    let mut out = Vec::new();
+    walk_files(dir, dir, &mut |rel, _| {
+        if !rel.starts_with(STUDIO_DIR) && patterns.iter().any(|p| p.is_match(rel)) {
+            out.push(rel.to_string());
+        }
+    });
+    out
+}
+
+fn glob_regex(glob: &str) -> String {
+    let glob = glob.replace('\\', "/");
+    let mut re = String::from("(?i)^");
+    let mut chars = glob.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' if chars.peek() == Some(&'*') => {
+                chars.next();
+                if chars.peek() == Some(&'/') {
+                    chars.next();
+                    re.push_str("(?:.*/)?");
+                } else {
+                    re.push_str(".*");
+                }
+            }
+            '*' => re.push_str("[^/]*"),
+            '?' => re.push_str("[^/]"),
+            c => re.push_str(&regex::escape(&c.to_string())),
+        }
+    }
+    re.push('$');
+    re
+}
+
+/// Starts a work item in another plugin from files of this one, copying
+/// `files` (files or folders, relative to `from`) into its `intake` folder.
+#[allow(clippy::too_many_arguments)]
+pub fn hand_off(target: &Manifest, target_root: &Path, from: &Path, files: &[String], title: &str, reference: &str, origin: Origin, now: SystemTime) -> Result<WorkItem> {
+    for f in files {
+        if !safe_relative(f) || !from.join(f).exists() {
+            bail!("{f} is missing from {}.", from.display());
+        }
+    }
+    let item = WorkItem::create(target_root, &target.page.folder, title, reference, origin, now)?;
+    let intake = item.dir.join("intake");
+    for f in files {
+        let src = from.join(f);
+        let dest = intake.join(f);
+        if src.is_dir() {
+            walk_files(&src, &src, &mut |rel, path| {
+                let to = dest.join(rel);
+                if let Some(parent) = to.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::copy(path, to);
+            });
+        } else {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&src, &dest).with_context(|| format!("copying {f}"))?;
+        }
+    }
+    Ok(item)
+}
+
 /// `20261113-201500` (UTC) plus milliseconds, for names that sort by time.
 fn file_stamp(t: SystemTime) -> String {
     let s = crate::intake::utc_timestamp(t);
@@ -1602,6 +1755,11 @@ mod tests {
         assert_eq!(m.step("echo").unwrap().gate, Gate::None);
         assert!(m.incompatibility(VERSION).is_none());
         assert!(m.incompatibility("0.5.2").unwrap().contains("0.6.0"));
+        let order: Vec<&str> = m.pipeline().iter().map(|s| s.id()).collect();
+        assert_eq!(order, ["triage", "echo", "confirmed", "approve"]);
+        let explicit = Manifest::parse(&fixture_manifest().replace("  intake: [text, files]", "  intake: [text, files]\n  pipeline: [confirmed, triage]")).unwrap();
+        assert_eq!(explicit.pipeline().iter().map(|s| s.id()).collect::<Vec<_>>(), ["confirmed", "triage"]);
+        assert!(invalid(&fixture_manifest().replace("  intake: [text, files]", "  intake: [text, files]\n  pipeline: [nope]")).contains("pipeline lists 'nope'"));
     }
 
     #[test]
@@ -1651,6 +1809,9 @@ mod tests {
         // A top-level folder in the zip is accepted.
         let pkg = Package::from_bytes(&zip_dir(&fixture(), Some("sample-plugin"), None, &[])).unwrap();
         assert_eq!(pkg.manifest.id, "sample-plugin");
+        let packed = super::zip_dir(&fixture()).unwrap();
+        assert_eq!(packed, super::zip_dir(&fixture()).unwrap(), "the same folder packs to the same bytes");
+        assert_eq!(Package::from_bytes(&packed).unwrap().manifest.id, "sample-plugin");
         let inst = install(&pkg, d.path(), VERSION, "test.zip", false).unwrap();
         assert_eq!(inst.health, Health::Ok);
         assert!(inst.root.join("scripts/Echo.ps1").is_file());
@@ -1875,6 +2036,27 @@ mod tests {
             assert_eq!(m.id, e.file_name().to_string_lossy(), "folder name matches the id");
             assert!(m.incompatibility(env!("CARGO_PKG_VERSION")).is_none(), "{} needs a newer Studio than this one", m.id);
         }
+    }
+
+    #[test]
+    fn globs_and_handoffs() {
+        let d = tempfile::tempdir().unwrap();
+        let from = d.path().join("from");
+        for f in ["export.md", "a.txt", "artifacts/run1/summary.md", "source/setup.msi", ".studio/runs/x/input.json"] {
+            std::fs::create_dir_all(from.join(f).parent().unwrap()).unwrap();
+            std::fs::write(from.join(f), f).unwrap();
+        }
+        let globs = |g: &[&str]| glob_files(&from, &g.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(globs(&["*.md"]), ["export.md"]);
+        assert_eq!(globs(&["artifacts/**/summary.md", "*.TXT"]), ["a.txt", "artifacts/run1/summary.md"]);
+        assert!(globs(&["**/*.json"]).is_empty(), "Studio scratch is hidden");
+
+        let target = Manifest::parse(&fixture_manifest()).unwrap();
+        let origin = Origin { kind: "handoff".into(), from_plugin: "sccm-migration".into(), key: "ScopeId_1/Application_2".into() };
+        let item = hand_off(&target, &d.path().join("work"), &from, &["export.md".into(), "source".into()], "Spectragryph 1.2", "", origin, SystemTime::now()).unwrap();
+        assert!(item.dir.join("intake/export.md").is_file() && item.dir.join("intake/source/setup.msi").is_file());
+        assert_eq!(WorkItem::open(&item.dir).unwrap().meta.origin.from_plugin, "sccm-migration");
+        assert!(hand_off(&target, &d.path().join("work"), &from, &["missing.md".into()], "x", "", Origin::default(), SystemTime::now()).is_err());
     }
 
     #[test]

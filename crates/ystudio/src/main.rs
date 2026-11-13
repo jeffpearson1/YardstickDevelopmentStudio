@@ -3,6 +3,7 @@
 mod app;
 mod elevation;
 mod highlight;
+mod plugins;
 mod soft;
 mod theme;
 mod views;

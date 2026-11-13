@@ -37,20 +37,25 @@ pub enum View {
     Settings,
     /// The first-run wizard; not in the sidebar.
     Setup,
+    /// An installed plugin's tab, by its index in `plugins::Host::tabs`.
+    Plugin(u16),
 }
 
 impl View {
     /// The sidebar. The open recipe's pages (Designer, YAML, Test Bench,
-    /// Icons, Agent) are tabs under Recipes.
+    /// Icons, Agent) are tabs under Recipe Library. Plugin tabs follow Publish
+    /// ([`View::NAV_PLUGINS_AT`]).
     pub const NAV: [(View, &'static str, &'static str); 7] = [
         (View::Home, theme::icon::HOME, "Home"),
-        (View::Recipes, theme::icon::LIBRARY, "Recipes"),
-        (View::Batch, theme::icon::INBOX, "Requests"),
-        (View::Runs, theme::icon::CHART, "Runs"),
+        (View::Recipes, theme::icon::LIBRARY, "Recipe Library"),
+        (View::Batch, theme::icon::HAMMER, "Recipe Builder"),
         (View::Promote, theme::icon::UPLOAD, "Publish"),
+        (View::Runs, theme::icon::CLOCK, "History"),
         (View::Settings, theme::icon::SETTINGS, "Settings"),
         (View::Docs, theme::icon::BOOK, "Help"),
     ];
+    /// Where in [`View::NAV`] the plugin tabs go.
+    pub const NAV_PLUGINS_AT: usize = 4;
 }
 
 /// Test Bench pipeline steps, cheapest first.
@@ -119,6 +124,8 @@ pub enum JobKind {
     Setup { result: PathBuf },
     /// `winget install` of a missing tool, or `gh auth setup-git`.
     InstallTool,
+    /// A plugin step; `dir` is its work item, or the plugin's work root.
+    PluginStep { plugin: String, dir: PathBuf, step: String, result: PathBuf, risk: ystudio_core::plugin::Risk, purpose: views::plugin_page::Purpose },
 }
 
 pub struct Job {
@@ -307,6 +314,8 @@ pub struct StudioApp {
     pub refocus: bool,
     pub workflow: crate::workflow::State,
     pub elevation: crate::elevation::State,
+    pub plugins: crate::plugins::Host,
+    pub plugins_ui: views::plugins::ManagerState,
 }
 
 pub struct BenchState {
@@ -363,6 +372,7 @@ impl StudioApp {
             batch: Default::default(), icons: Default::default(), runs_ui: Default::default(),
             docs: Default::default(), promote: Default::default(), update: Default::default(), workflow: Default::default(),
             elevation: Default::default(), tools: views::tools::ToolsState::fixed(), refocus: false,
+            plugins: Default::default(), plugins_ui: Default::default(),
         };
         app.refresh_recipes();
         app
@@ -430,6 +440,8 @@ impl StudioApp {
             elevation: Default::default(),
             tools: Default::default(),
             refocus: false,
+            plugins: crate::plugins::Host::load(&ystudio_core::plugin::default_dir()),
+            plugins_ui: Default::default(),
         };
         theme::install_fonts(egui_ctx);
         app.apply_theme(egui_ctx);
@@ -1095,6 +1107,9 @@ impl StudioApp {
                 }
             }
             JobKind::InstallTool => views::tools::install_finished(self, ok),
+            JobKind::PluginStep { plugin, dir, step, result, purpose, .. } => {
+                views::plugin_page::step_finished(self, id, &plugin, &dir, &step, &result, purpose);
+            }
         }
     }
 
@@ -1228,14 +1243,35 @@ impl StudioApp {
         });
         ui.add_space(14.0);
         ui.spacing_mut().item_spacing.y = 0.0;
-        // Recipe pages belong to Recipes; the icon finder to Requests when it works for a batch item.
+        // Recipe pages belong to Recipe Library; the icon finder to Recipe Builder when it works for a batch item.
         let section = match self.view {
             View::Designer | View::Editor | View::TestBench | View::Agent => View::Recipes,
             View::Icons if self.icons.batch_item.is_some() => View::Batch,
             View::Icons => View::Recipes,
             v => v,
         };
-        for (view, icon, name) in View::NAV {
+        let plugin_tabs: Vec<(View, String, String)> = self
+            .plugins
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| self.settings.plugins.get(*id).is_none_or(|p| p.enabled))
+            .filter_map(|(i, id)| self.plugins.get(id).map(|p| (View::Plugin(i as u16), p.manifest.glyph(), p.manifest.name.clone())))
+            .collect();
+        for (i, (view, icon, name)) in View::NAV.into_iter().enumerate() {
+            if i == View::NAV_PLUGINS_AT {
+                for (view, glyph, name) in &plugin_tabs {
+                    let View::Plugin(tab) = *view else { continue };
+                    let busy = self.plugins.tabs.get(tab as usize).is_some_and(|id| views::plugin_page::plugin_busy(self, id));
+                    let mut resp = theme::nav_item(ui, glyph, name, section == *view, busy);
+                    if busy {
+                        resp = resp.on_hover_text("Running");
+                    }
+                    if resp.clicked() {
+                        self.view = *view;
+                    }
+                }
+            }
             let busy = match view {
                 View::Recipes => {
                     self.jobs.iter().any(|j| matches!(j.kind, JobKind::Agent { batch_item: None, .. }) && j.proc.is_running())
@@ -1514,6 +1550,7 @@ impl StudioApp {
                 View::Promote => views::promote::show(self, ui),
                 View::Settings => views::settings::show(self, ui),
                 View::Setup => views::setup::show(self, ui),
+                View::Plugin(tab) => views::plugin_page::show(self, ui, tab),
             }
         });
 
@@ -1523,6 +1560,8 @@ impl StudioApp {
         views::testbench::live_modal(self, &ctx);
         views::promote::modals(self, &ctx);
         crate::workflow::modal(self, &ctx);
+        views::plugin_page::modals(self, &ctx);
+        views::plugins::modals(self, &ctx);
         self.perf.record(self.view, frame_start.elapsed().as_secs_f32() * 1000.0);
         if self.perf.continuous {
             ctx.request_repaint();

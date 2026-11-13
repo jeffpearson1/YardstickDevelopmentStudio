@@ -116,7 +116,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                     if ui.small_button("\u{E838}  Run folder").clicked() {
                         super::open_in_explorer(&run.dir);
                     }
-                    if ui.small_button("\u{E9D2}  Open in Runs").clicked() {
+                    if ui.small_button("\u{E823}  Open in History").clicked() {
                         app.runs_ui.select_dir(&run.dir);
                         app.view = View::Runs;
                     }

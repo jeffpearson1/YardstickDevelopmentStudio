@@ -113,7 +113,7 @@ pub fn open_file(app: &mut StudioApp, path: &Path) {
     }
 }
 
-/// Opens a request made in the Studio (see [`Batch::from_items`]) under Requests.
+/// Opens a request made in the Studio (see [`Batch::from_items`]) in Recipe Builder.
 pub(crate) fn open_made(app: &mut StudioApp, batch: Batch) -> bool {
     if app.batch.busy(app) {
         app.error("Finish or cancel the active batch/agent/test run first.");
@@ -490,7 +490,7 @@ pub fn icon_saved(app: &mut StudioApp, batch_id: &str, idx: usize, file: &str) {
 
 pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
-        theme::page_title(ui, "Requests");
+        theme::page_title(ui, "Recipe Builder");
         ui.label(RichText::new("new recipes, imported request lists and recipe updates - written, tested and repaired together").weak());
     });
     // Dropped request lists open as a new batch.

@@ -139,7 +139,8 @@ pub fn busy(app: &StudioApp) -> bool {
     app.workflow.busy()
         || app.jobs.iter().any(|j| j.proc.is_running()
             && matches!(j.kind, JobKind::Agent { .. } | JobKind::BatchExtract { .. }
-                | JobKind::Harness { .. } | JobKind::WorkflowHarness { .. } | JobKind::WorkflowRepair { .. }))
+                | JobKind::Harness { .. } | JobKind::WorkflowHarness { .. } | JobKind::WorkflowRepair { .. }
+                | JobKind::PluginStep { risk: ystudio_core::plugin::Risk::LocalInstall, .. }))
         || !app.bench.queue.is_empty() || app.bench.live_modal
 }
 
@@ -669,7 +670,7 @@ pub fn progress(app: &mut StudioApp, ui: &mut Ui) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -729,7 +730,7 @@ mod tests {
         assert_eq!(options.consent, Consent::None);
     }
 
-    fn fake_app() -> (tempfile::TempDir, StudioApp) {
+    pub(crate) fn fake_app() -> (tempfile::TempDir, StudioApp) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("Yardstick.Project.psd1"), "@{\nRuntimeRoot = '.'\nRecipesPath = 'Recipes'\nDevelopmentRecipes = 'Recipes\\Development'\n}\n").unwrap();
@@ -977,7 +978,7 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         assert_eq!(app.step_state("app", Step::Download), None);
     }
 
-    fn render(app: &mut StudioApp, name: &str, width: u32, height: u32) {
+    pub(crate) fn render(app: &mut StudioApp, name: &str, width: u32, height: u32) {
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx);
         crate::theme::apply(&ctx, app.settings.dark_mode);
