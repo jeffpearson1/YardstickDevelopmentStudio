@@ -200,10 +200,6 @@ fn available_list(app: &mut StudioApp, ui: &mut Ui, installed: &[plugin::Install
         ui.horizontal(|ui| {
             ui.label(RichText::new(&id).semibold());
             ui.label(RichText::new(&release.version).weak());
-            let first = release.notes.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
-            if !first.is_empty() {
-                ui.label(RichText::new(first.chars().take(90).collect::<String>()).weak());
-            }
             let busy = app.plugins_ui.downloading.is_some();
             let resp = ui.add_enabled(!busy, egui::Button::new("Install…"));
             if resp.clicked() {
@@ -213,7 +209,26 @@ fn available_list(app: &mut StudioApp, ui: &mut Ui, installed: &[plugin::Install
                 ui.spinner();
             }
         });
+        let about = release_summary(&release.notes, 300);
+        if !about.is_empty() {
+            ui.label(RichText::new(about).weak());
+        }
+        ui.add_space(4.0);
     }
+}
+
+/// The first paragraph of release notes as plain text: markdown marks removed, one line,
+/// cut at a word boundary after about `max` characters.
+fn release_summary(notes: &str, max: usize) -> String {
+    let paragraph: Vec<&str> = notes.lines().map(str::trim).skip_while(|l| l.is_empty()).take_while(|l| !l.is_empty()).collect();
+    let plain: String = paragraph.join(" ").chars().filter(|c| !matches!(c, '*' | '`' | '_')).collect();
+    let plain = plain.trim_start_matches('#').split_whitespace().collect::<Vec<_>>().join(" ");
+    if plain.chars().count() <= max {
+        return plain;
+    }
+    let cut: String = plain.chars().take(max).collect();
+    let end = cut.rfind(' ').unwrap_or(cut.len());
+    format!("{}…", cut[..end].trim_end_matches([',', ';', ':', '.']))
 }
 
 /// Reads a package and shows the trust prompt for it.
@@ -508,6 +523,18 @@ mod tests {
     }
 
     #[test]
+    fn available_plugins_show_a_readable_description() {
+        let notes = "**SCCM App Migration** browses the applications in a Configuration Manager site and migrates one to Intune. It reads the site through the SMS Provider over CIM and `never` changes it.\n\nNeeds Studio 0.6.0.\n\n## 1.0.0\n- more";
+        let short = release_summary(notes, 90);
+        assert_eq!(short, "SCCM App Migration browses the applications in a Configuration Manager site and migrates…");
+        let full = release_summary(notes, 400);
+        assert!(full.starts_with("SCCM App Migration browses") && full.ends_with("never changes it."), "{full}");
+        assert!(!full.contains("Needs Studio") && !full.contains('*') && !full.contains('`'));
+        assert_eq!(release_summary("\n\n# Title line\nsecond line", 100), "Title line second line");
+        assert_eq!(release_summary("", 100), "");
+    }
+
+    #[test]
     fn checks_show_updates_and_installable_plugins() {
         let (dir, mut app) = fake_app();
         install_sample(&mut app, dir.path(), "sample-plugin", |m| m);
@@ -522,6 +549,7 @@ mod tests {
         let installed = app.plugins.registry.plugins.clone();
         assert_eq!(app.plugins_ui.available(&installed).map(|(id, _)| id.as_str()).collect::<Vec<_>>(), ["oneoff-packager"]);
 
+        app.plugins_ui.latest.get_mut("oneoff-packager").unwrap().notes = "**One-Off Packager** packages software requests that are not good candidates for a Yardstick recipe. An agent triages the ticket and drafts the recipe; everything that downloads, installs, packages or touches Intune is a separate step.\n\nNeeds Studio 0.6.0.".into();
         app.view = View::Settings;
         render(&mut app, "plugin-updates", 1315, 1900);
     }
