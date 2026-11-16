@@ -20,7 +20,8 @@ pub enum Tool {
 }
 
 impl Tool {
-    pub const ALL: [Tool; 5] = [Tool::PowerShell, Tool::Git, Tool::Gh, Tool::Agent(AgentBackend::CopilotCli), Tool::Agent(AgentBackend::ClaudeCode)];
+    pub const ALL: [Tool; 6] =
+        [Tool::PowerShell, Tool::Git, Tool::Gh, Tool::Agent(AgentBackend::CopilotCli), Tool::Agent(AgentBackend::ClaudeCode), Tool::Agent(AgentBackend::Codex)];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -43,6 +44,7 @@ impl Tool {
             Tool::Gh => "GitHub.cli",
             Tool::Agent(AgentBackend::CopilotCli) => "GitHub.Copilot",
             Tool::Agent(AgentBackend::ClaudeCode) => "Anthropic.ClaudeCode",
+            Tool::Agent(AgentBackend::Codex) => "OpenAI.Codex",
         }
     }
 
@@ -54,6 +56,7 @@ impl Tool {
             Tool::Gh => "https://cli.github.com",
             Tool::Agent(AgentBackend::CopilotCli) => "https://github.com/github/copilot-cli",
             Tool::Agent(AgentBackend::ClaudeCode) => "https://code.claude.com/docs/en/setup",
+            Tool::Agent(AgentBackend::Codex) => "https://developers.openai.com/codex/cli",
         }
     }
 
@@ -136,6 +139,7 @@ impl Report {
                             },
                             Tool::Agent(AgentBackend::CopilotCli) => copilot_status(),
                             Tool::Agent(AgentBackend::ClaudeCode) => claude_status(exe),
+                            Tool::Agent(AgentBackend::Codex) => codex_status(exe),
                             Tool::PowerShell => unreachable!(),
                         };
                         (*tool, state)
@@ -333,6 +337,35 @@ fn classify_claude(success: bool, stdout: &str, stderr: &str) -> SignIn {
     }
 }
 
+/// `codex login status` says how it is signed in ("Logged in using ChatGPT") and exits 0, or says it is not.
+pub fn codex_status(exe: &Path) -> SignIn {
+    let Ok((program, prefix)) = launcher(exe) else {
+        return SignIn::Unknown(format!("cannot run {}", exe.display()));
+    };
+    let spec = ProcessSpec::new("codex", &program, &std::env::temp_dir()).args(prefix).args(["login", "status"]).env("NO_COLOR", "1");
+    match run_output(&spec) {
+        Ok(out) => classify_codex(out.success, &out.stdout, &out.stderr),
+        Err(e) => SignIn::Unknown(format!("{e:#}")),
+    }
+}
+
+fn classify_codex(success: bool, stdout: &str, stderr: &str) -> SignIn {
+    let text = format!("{stdout}\n{stderr}");
+    let lower = text.to_lowercase();
+    if lower.contains("not logged in") || lower.contains("not signed in") {
+        return SignIn::SignedOut("Codex is not signed in".into());
+    }
+    if success && let Some(rest) = text.lines().find_map(|l| l.trim().strip_prefix("Logged in using")) {
+        // "Logged in using ChatGPT", or "... an API key - sk-...": keep the method, never the key.
+        let method = rest.trim().split(" - ").next().unwrap_or_default().trim().to_string();
+        return SignIn::SignedIn { account: Some(method).filter(|m| !m.is_empty()) };
+    }
+    if success && lower.contains("logged in") {
+        return SignIn::SignedIn { account: None };
+    }
+    SignIn::Unknown(last_line(&text))
+}
+
 /// The first string under a key that mentions "email", at any depth.
 fn find_email(v: &serde_json::Value) -> Option<String> {
     match v {
@@ -417,6 +450,7 @@ pub fn sign_in_spec(tool: Tool, exe: &Path, gh: Option<&Path>, workspace: Option
         },
         Tool::Agent(AgentBackend::CopilotCli) => invoke(exe, &["login"])?,
         Tool::Agent(AgentBackend::ClaudeCode) => invoke(exe, &["auth", "login"])?,
+        Tool::Agent(AgentBackend::Codex) => invoke(exe, &["login"])?,
     };
     Ok(console(&format!("Sign in to {}", tool.label()), &script))
 }
@@ -470,6 +504,18 @@ mod tests {
         assert_eq!(classify_claude(true, r#"{"authMethod": "api_key"}"#, ""), SignIn::SignedIn { account: Some("api key".into()) });
         assert!(matches!(classify_claude(false, r#"{"loggedIn": false, "authMethod": "none"}"#, ""), SignIn::SignedOut(_)));
         assert!(matches!(classify_claude(false, "", "boom"), SignIn::Unknown(_)));
+    }
+
+    #[test]
+    fn reads_codex_status() {
+        assert_eq!(classify_codex(true, "Logged in using ChatGPT\n", ""), SignIn::SignedIn { account: Some("ChatGPT".into()) });
+        let key = classify_codex(true, "Logged in using an API key - sk-proj-abcdef\n", "");
+        assert_eq!(key, SignIn::SignedIn { account: Some("an API key".into()) }, "the key itself is never kept");
+        assert!(classify_codex(false, "Not logged in\n", "").needs_sign_in());
+        assert!(classify_codex(false, "", "Error: not logged in").needs_sign_in());
+        assert!(matches!(classify_codex(false, "", "could not reach the server"), SignIn::Unknown(_)));
+        assert_eq!(Tool::Agent(AgentBackend::Codex).winget_id(), "OpenAI.Codex");
+        assert!(Tool::ALL.contains(&Tool::Agent(AgentBackend::Codex)));
     }
 
     #[test]

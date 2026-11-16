@@ -22,15 +22,17 @@ pub enum AgentBackend {
     #[default]
     CopilotCli,
     ClaudeCode,
+    Codex,
 }
 
 impl AgentBackend {
-    pub const ALL: [AgentBackend; 2] = [AgentBackend::CopilotCli, AgentBackend::ClaudeCode];
+    pub const ALL: [AgentBackend; 3] = [AgentBackend::CopilotCli, AgentBackend::ClaudeCode, AgentBackend::Codex];
 
     pub fn label(self) -> &'static str {
         match self {
             AgentBackend::CopilotCli => "GitHub Copilot CLI",
             AgentBackend::ClaudeCode => "Claude Code",
+            AgentBackend::Codex => "OpenAI Codex",
         }
     }
 
@@ -38,7 +40,20 @@ impl AgentBackend {
         match self {
             AgentBackend::CopilotCli => "copilot",
             AgentBackend::ClaudeCode => "claude",
+            AgentBackend::Codex => "codex",
         }
+    }
+
+    /// Whether the CLI can run subagents under a coordinator (Copilot's fleet,
+    /// Claude's Task tool). Codex runs one agent.
+    pub fn supports_multi_agent(self) -> bool {
+        !matches!(self, AgentBackend::Codex)
+    }
+
+    /// Whether the Studio can deny individual shell commands for a run. Codex has
+    /// a sandbox but no per-run deny list, so the prompt carries those rules.
+    pub fn enforces_denied_commands(self) -> bool {
+        !matches!(self, AgentBackend::Codex)
     }
 
     /// Where the CLI's installers put it, in case PATH does not have it yet.
@@ -49,6 +64,11 @@ impl AgentBackend {
         match self {
             AgentBackend::CopilotCli => vec![local.join("GitHubCopilotCLI"), winget, npm],
             AgentBackend::ClaudeCode => vec![dirs::home_dir().unwrap_or_default().join(r".local\bin"), winget, npm],
+            AgentBackend::Codex => {
+                let mut dirs = codex_app_dirs();
+                dirs.extend([winget, npm]);
+                dirs
+            }
         }
     }
 
@@ -80,8 +100,45 @@ impl AgentBackend {
                 Ok(models)
             }
             AgentBackend::ClaudeCode => Ok(["opus", "sonnet", "haiku"].map(String::from).to_vec()),
+            AgentBackend::Codex => {
+                let spec = self.spec("list models", &std::env::temp_dir())?.args(["debug", "models"]);
+                let models = parse_codex_models(&crate::process::run_capture(&spec)?);
+                if models.is_empty() {
+                    bail!("`codex debug models` listed no models.");
+                }
+                Ok(models)
+            }
         }
     }
+}
+
+/// The Codex desktop app unpacks its CLI to `%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe`,
+/// a new folder for each version. Newest first.
+fn codex_app_dirs() -> Vec<PathBuf> {
+    let bin = dirs::data_local_dir().unwrap_or_default().join(r"OpenAI\Codex\bin");
+    let mut found: Vec<(SystemTime, PathBuf)> = std::fs::read_dir(bin)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().join("codex.exe").is_file())
+        .map(|e| (e.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH), e.path()))
+        .collect();
+    found.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    found.into_iter().map(|(_, p)| p).collect()
+}
+
+/// The models `codex debug models` offers in its picker (those not hidden), in its order.
+fn parse_codex_models(json: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return Vec::new() };
+    let mut models: Vec<(i64, String)> = v["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| m["visibility"].as_str().is_none_or(|v| v == "list"))
+        .filter_map(|m| Some((m["priority"].as_i64().unwrap_or(i64::MAX), m["slug"].as_str()?.to_string())))
+        .collect();
+    models.sort_by_key(|(priority, _)| *priority);
+    models.into_iter().map(|(_, slug)| slug).collect()
 }
 
 /// The quoted values under the `model` setting in `copilot help config`.
@@ -213,7 +270,8 @@ fn approvals_text(downloads: &Path, production_paths: &[PathBuf], options: Agent
         format!(
             "The user has not approved downloading or unpacking installers outside the recipe harness for this run. \
              Use the harness's own download stage and the vendor's documentation. If a command is denied because it \
-             needs approval, do not work around the denial: finish your report, then add a line \
+             needs approval, or the environment blocks a download (a sandbox that cannot make HTTPS requests, say), \
+             do not work around it: finish your report, then add a line \
              `{NEEDS_APPROVAL} downloads` so the Studio can ask the user to approve downloads and run you again.\n"
         )
     }
@@ -404,6 +462,7 @@ pub fn build_command(
     if !ws.has_skill() {
         bail!("This Yardstick folder has no .claude\\skills\\yardstick-recipes\\SKILL.md; update it from GitHub first.");
     }
+    let options = options_for(backend, options);
     let prompt = full_prompt(ws, production_paths, task, options);
     let root = ws.root.to_string_lossy().into_owned();
     let mut spec = backend.spec(task.title(), &ws.root)?;
@@ -428,14 +487,20 @@ pub fn build_command(
             spec = spec.args(["-p", &prompt, "--add-dir", &root, "--permission-mode", "acceptEdits", "--allowedTools", &allowed]);
             spec = spec.arg("--disallowedTools").arg(denied.join(" "));
         }
+        AgentBackend::Codex => spec = spec.args(codex_args(&prompt, &root, task.writes(), model, options)),
     }
-    if !model.trim().is_empty() {
+    if !model.trim().is_empty() && backend != AgentBackend::Codex {
         spec = spec.args(["--model", model.trim()]);
     }
     if options.diagnostics {
         spec = spec.args(crate::diagnostics::agent_args(backend, &task.title()));
     }
     Ok(spec)
+}
+
+/// Options as the backend can honour them.
+fn options_for(backend: AgentBackend, options: AgentOptions) -> AgentOptions {
+    AgentOptions { multi_agent: options.multi_agent && backend.supports_multi_agent(), ..options }
 }
 
 /// Prompt for turning a batch's request list into structured items.
@@ -486,14 +551,47 @@ pub fn build_extract_command(backend: AgentBackend, model: &str, batch_dir: &Pat
             spec = spec.args(["-p", &prompt, "--add-dir", &dir, "--permission-mode", "acceptEdits"]);
             spec = spec.args(["--allowedTools", tools, "--disallowedTools", "Bash Edit"]);
         }
+        // Reading a list needs no downloads, so Codex keeps its sandbox.
+        AgentBackend::Codex => spec = spec.args(codex_args(&prompt, &dir, true, model, AgentOptions { downloads: false, ..options })),
     }
-    if !model.trim().is_empty() {
+    if !model.trim().is_empty() && backend != AgentBackend::Codex {
         spec = spec.args(["--model", model.trim()]);
     }
     if options.diagnostics {
         spec = spec.args(crate::diagnostics::agent_args(backend, "Extract software from request list"));
     }
     Ok(spec)
+}
+
+/// Codex CLI arguments for a headless run in `cwd`. Its sandbox is what confines the run:
+/// commands can write only in `cwd` and the temp folder (nowhere at all when the task
+/// only reads), and nothing waits for an approval nobody is there to give.
+///
+/// Research uses Codex's own live web search, which works inside the sandbox. Commands
+/// in the Windows sandbox cannot make HTTPS requests (Schannel finds no credentials there),
+/// so downloading an installer is impossible in it. The user's explicit "allow downloads"
+/// approval is therefore what lifts the sandbox (`danger-full-access`) for a task that
+/// writes. Codex has no per-run command deny list, so the prompt's rules stand in for
+/// `DENIED_COMMANDS`.
+fn codex_args(prompt: &str, cwd: &str, writes: bool, model: &str, options: AgentOptions) -> Vec<String> {
+    let sandbox = if !writes {
+        "read-only"
+    } else if options.downloads {
+        "danger-full-access"
+    } else {
+        "workspace-write"
+    };
+    let mut args: Vec<String> = ["exec", "--skip-git-repo-check", "--color", "never", "-C", cwd, "-s", sandbox].map(String::from).to_vec();
+    args.extend(["-c".into(), "approval_policy=\"never\"".into(), "-c".into(), "web_search=\"live\"".into(), "-c".into(), "sandbox_workspace_write.network_access=true".into()]);
+    if !options.diagnostics {
+        // With diagnostics on, Codex's own session log is kept.
+        args.push("--ephemeral".into());
+    }
+    if !model.trim().is_empty() {
+        args.extend(["-m".into(), model.trim().to_string()]);
+    }
+    args.push(prompt.to_string());
+    args
 }
 
 /// Copilot CLI arguments for an agent run. It runs headless, so anything it
@@ -722,6 +820,7 @@ pub fn build_plugin_command(
     if !ctx.dir.is_dir() {
         bail!("{} does not exist.", ctx.dir.display());
     }
+    let options = options_for(backend, options);
     let prompt = plugin_prompt(ctx, production_paths, options)?;
     stage_references(ctx)?;
     let dir = ctx.dir.to_string_lossy().into_owned();
@@ -744,8 +843,9 @@ pub fn build_plugin_command(
             spec = spec.args(["-p", &prompt, "--add-dir", &dir, "--permission-mode", "acceptEdits", "--allowedTools", &allowed]);
             spec = spec.arg("--disallowedTools").arg(blocked.join(" "));
         }
+        AgentBackend::Codex => spec = spec.args(codex_args(&prompt, &dir, true, model, options)),
     }
-    if !model.trim().is_empty() {
+    if !model.trim().is_empty() && backend != AgentBackend::Codex {
         spec = spec.args(["--model", model.trim()]);
     }
     if options.diagnostics {
@@ -1050,6 +1150,96 @@ mod tests {
         let mut changes = before.diff(&Snapshot::of_dir(d.path()));
         changes.sort_by(|a, b| a.path().cmp(b.path()));
         assert_eq!(changes, [Change::Modified(d.path().join("notes.md")), Change::Added(d.path().join("products.json"))]);
+    }
+
+    #[test]
+    fn codex_runs_in_its_sandbox_and_never_waits_for_an_approval() {
+        let write = codex_args("PROMPT", r"C:\ws", true, " gpt-x ", AgentOptions::default());
+        assert_eq!(write[0], "exec");
+        for pair in [["-C", r"C:\ws"], ["-s", "workspace-write"], ["-m", "gpt-x"], ["--color", "never"]] {
+            assert!(write.windows(2).any(|w| w == pair), "{pair:?} in {write:?}");
+        }
+        assert!(write.contains(&"approval_policy=\"never\"".to_string()), "a headless run cannot answer a prompt");
+        assert!(write.contains(&"web_search=\"live\"".to_string()), "research uses Codex's own web search");
+        assert!(write.contains(&"sandbox_workspace_write.network_access=true".to_string()));
+        assert!(write.contains(&"--ephemeral".to_string()) && write.contains(&"--skip-git-repo-check".to_string()));
+        assert_eq!(write.last().unwrap(), "PROMPT", "the model and every flag come before the prompt");
+
+        // Only the user's download approval lifts the sandbox, and never for a task that only reads.
+        let approved = AgentOptions { downloads: true, ..Default::default() };
+        let open = codex_args("P", r"C:\ws", true, "", approved);
+        assert!(open.windows(2).any(|w| w == ["-s", "danger-full-access"]));
+        assert!(codex_args("P", r"C:\ws", false, "", approved).windows(2).any(|w| w == ["-s", "read-only"]));
+        let read = codex_args("P", r"C:\ws", false, "", AgentOptions::default());
+        assert!(read.windows(2).any(|w| w == ["-s", "read-only"]) && !read.contains(&"-m".to_string()));
+        let kept = codex_args("P", r"C:\ws", true, "", AgentOptions { diagnostics: true, ..Default::default() });
+        assert!(!kept.contains(&"--ephemeral".to_string()), "diagnostics keeps Codex's own session log");
+    }
+
+    #[test]
+    fn codex_lists_the_models_its_picker_offers() {
+        let json = r#"{"models":[
+            {"slug":"gpt-5.6-terra","visibility":"list","priority":5},
+            {"slug":"codex-auto-review","visibility":"hide","priority":7},
+            {"slug":"gpt-6.1-sol","visibility":"list","priority":1},
+            {"slug":"no-visibility-field","priority":6}]}"#;
+        assert_eq!(parse_codex_models(json), ["gpt-6.1-sol", "gpt-5.6-terra", "no-visibility-field"]);
+        assert!(parse_codex_models("not json").is_empty() && parse_codex_models("{}").is_empty());
+    }
+
+    #[test]
+    fn what_each_backend_can_enforce() {
+        assert!(AgentBackend::CopilotCli.supports_multi_agent() && AgentBackend::ClaudeCode.supports_multi_agent());
+        assert!(!AgentBackend::Codex.supports_multi_agent() && !AgentBackend::Codex.enforces_denied_commands());
+        assert!(AgentBackend::ClaudeCode.enforces_denied_commands() && AgentBackend::CopilotCli.enforces_denied_commands());
+        let multi = AgentOptions { multi_agent: true, downloads: true, ..Default::default() };
+        assert!(!options_for(AgentBackend::Codex, multi).multi_agent && options_for(AgentBackend::Codex, multi).downloads);
+        assert!(options_for(AgentBackend::ClaudeCode, multi).multi_agent);
+        assert_eq!(AgentBackend::Codex.executable(), "codex");
+        assert!(AgentBackend::ALL.contains(&AgentBackend::Codex));
+        // Settings saved before Codex existed still load.
+        assert_eq!(serde_json::from_str::<AgentBackend>("\"ClaudeCode\"").unwrap(), AgentBackend::ClaudeCode);
+        assert_eq!(serde_json::from_str::<AgentBackend>("\"Codex\"").unwrap(), AgentBackend::Codex);
+    }
+
+    #[test]
+    fn codex_commands_for_recipes_and_plugins_when_codex_is_installed() {
+        if AgentBackend::Codex.locate().is_none() {
+            return;
+        }
+        let (_d, ws) = dev_ws();
+        let multi = AgentOptions { multi_agent: true, ..Default::default() };
+        let task = AgentTask::Review { id: "x".into() };
+        let spec = build_command(&ws, AgentBackend::Codex, "gpt-x", &[], &task, multi).unwrap();
+        assert_eq!(spec.cwd, ws.root);
+        assert!(spec.args.windows(2).any(|w| w == ["-s", "read-only"]), "a review only reads");
+        assert!(spec.args.windows(2).any(|w| w == ["-m", "gpt-x"]) && !spec.args.contains(&"--model".to_string()));
+        assert!(spec.usage.is_none());
+        let prompt = spec.args.last().unwrap();
+        assert!(prompt.contains("Hard rules set by the Studio") && !prompt.contains("coordinator"), "Codex gets no coordinator instructions");
+        let fix = build_command(&ws, AgentBackend::Codex, "", &[], &AgentTask::Fix { id: "x".into(), evidence: String::new(), notes: String::new() }, AgentOptions::default()).unwrap();
+        assert!(fix.args.windows(2).any(|w| w == ["-s", "workspace-write"]));
+
+        let d = tempfile::tempdir().unwrap();
+        let (plugin, work) = sample_plugin(d.path());
+        let ctx = PluginAgentContext { plugin: &plugin, task: plugin.manifest.task("triage").unwrap(), dir: &work, title: "t", evidence: &[] };
+        let spec = build_plugin_command(AgentBackend::Codex, "", &[], &ctx, AgentOptions::default()).unwrap();
+        assert_eq!(spec.cwd, work);
+        assert!(spec.args.windows(2).any(|w| w[0] == "-C" && w[1] == work.to_string_lossy()), "{:?}", spec.args);
+        assert!(spec.args.last().unwrap().contains("Only create or modify files inside"));
+    }
+
+    #[test]
+    #[ignore = "runs the installed Codex CLI and uses a few tokens"]
+    fn live_codex_answers_a_prompt_in_a_read_only_sandbox() {
+        let backend = AgentBackend::Codex;
+        assert!(backend.locate().is_some(), "Codex is not installed");
+        let dir = tempfile::tempdir().unwrap();
+        let args = codex_args("Reply with exactly the single word OK and nothing else. Do not run any commands.", &dir.path().to_string_lossy(), false, "", AgentOptions::default());
+        let spec = backend.spec("live codex", dir.path()).unwrap().args(args);
+        let out = crate::process::run_output(&spec).unwrap();
+        assert!(out.success, "{}\n{}", out.stdout, out.stderr);
+        assert!(out.stdout.contains("OK"), "{}\n{}", out.stdout, out.stderr);
     }
 
     #[test]
