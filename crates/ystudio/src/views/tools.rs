@@ -164,7 +164,7 @@ fn purpose(tool: Tool) -> &'static str {
         Tool::PowerShell => "Runs Yardstick's setup and the recipe harness.",
         Tool::Git => "Clones and updates the workspace, and pushes recipes for pull requests.",
         Tool::Gh => "Opens pull requests for you. Without it, the Studio offers GitHub's page instead.",
-        Tool::Agent(_) => "A coding agent that writes and repairs recipes. You need one of the two.",
+        Tool::Agent(_) => "A coding agent that writes and repairs recipes. You need at least one.",
     }
 }
 

@@ -59,6 +59,8 @@ fn agent_args_in(dir: &Path, backend: AgentBackend, label: &str, now: SystemTime
             dir.join(format!("{base}-session.md")).to_string_lossy().into_owned(),
         ],
         AgentBackend::ClaudeCode => vec!["--debug-file".into(), dir.join(format!("{base}-claude-debug.log")).to_string_lossy().into_owned()],
+        // Codex keeps its own session log under CODEX_HOME; the Studio's job log has the output.
+        AgentBackend::Codex => Vec::new(),
     }
 }
 

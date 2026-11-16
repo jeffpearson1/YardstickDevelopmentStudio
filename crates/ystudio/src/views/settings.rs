@@ -198,6 +198,7 @@ fn environment(app: &mut StudioApp, ui: &mut Ui) {
             ("gh", which("gh"), "Opening pull requests (optional)"),
             ("copilot", AgentBackend::CopilotCli.locate(), "GitHub Copilot CLI agent"),
             ("claude", AgentBackend::ClaudeCode.locate(), "Claude Code agent (optional)"),
+            ("codex", AgentBackend::Codex.locate(), "OpenAI Codex agent (optional)"),
             ("code", which("code"), "Open files in VS Code (optional)"),
         ]
     });
@@ -329,11 +330,17 @@ fn effective_model(app: &StudioApp) -> Option<String> {
 /// The download approval, wherever an agent run starts. Saved as it changes,
 /// so it carries to the next run.
 pub fn downloads_checkbox(app: &mut StudioApp, ui: &mut Ui) {
-    let r = ui.checkbox(&mut app.settings.agent_downloads, "Allow the agent to download and inspect installers").on_hover_text(
+    let mut hover = String::from(
         "The agent runs without a window, so it cannot ask. With this ticked it is told you approved downloading vendor \
          files and unpacking them with tools such as 7-Zip, and Copilot CLI's path checks are lifted for the run. It is \
          still never allowed to run installers, touch production, or push.",
     );
+    if app.settings.agent_backend == AgentBackend::Codex {
+        hover += "\n\nCodex: commands inside its Windows sandbox cannot make HTTPS requests, so downloads only work with the \
+                  sandbox off. Ticking this runs Codex without its sandbox for tasks that write; the Studio's rules are then \
+                  only in the prompt. Without it, Codex stays sandboxed to the work folder and researches with its web search.";
+    }
+    let r = ui.checkbox(&mut app.settings.agent_downloads, "Allow the agent to download and inspect installers").on_hover_text(hover);
     if r.changed() {
         app.save_settings();
     }
@@ -399,13 +406,27 @@ pub fn agent_picker(app: &mut StudioApp, ui: &mut Ui, salt: &str) {
                 .add(egui::TextEdit::singleline(&mut app.settings.agent_model).hint_text("model id").desired_width(160.0))
                 .lost_focus();
         }
-        save |= ui
-            .checkbox(&mut app.settings.agent_multi, "Multi-agent (coordinator)")
-            .on_hover_text(
-                "A coordinating agent splits the work into parts (download source, switches, detection, icon) and runs them \
-                 as parallel subagents, then writes the recipe itself. Faster on big recipes, but uses more AI credits.",
-            )
-            .changed();
+        let multi = backend.supports_multi_agent();
+        let checkbox = ui.add_enabled(multi, egui::Checkbox::new(&mut app.settings.agent_multi, "Multi-agent (coordinator)"));
+        save |= if multi {
+            checkbox
+                .on_hover_text(
+                    "A coordinating agent splits the work into parts (download source, switches, detection, icon) and runs them \
+                     as parallel subagents, then writes the recipe itself. Faster on big recipes, but uses more AI credits.",
+                )
+                .changed()
+        } else {
+            checkbox.on_disabled_hover_text(format!("{} runs one agent, so there is nothing to coordinate.", backend.label()));
+            false
+        };
+        if !backend.enforces_denied_commands() {
+            ui.label(RichText::new("\u{E946}").color(theme::amber())).on_hover_text(format!(
+                "{} has a workspace sandbox (it can write only in the work folder) but no per-run list of commands to refuse, \
+                 so the Studio's rules - never run Yardstick.ps1, use Graph, or push - are in the prompt rather than enforced. \
+                 Steps that change the tenant still need your approval.",
+                backend.label()
+            ));
+        }
         // What an app has cost with this model so far.
         if let Some(model) = effective_model(app)
             && let Some(m) = ystudio_core::usage::by_model(&app.usage).into_iter().find(|m| m.model == model)

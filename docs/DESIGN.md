@@ -40,7 +40,7 @@ yardstick-studio.exe
     ├─ plugin.rs         plugins: plugin.yaml manifest + validation, zip install/update/uninstall with integrity
     │                    records, work items, hash-bound approvals, step runs (pwsh -File with input/result JSON)
     ├─ results.rs        parses _install-tests/<ts>/summary.json into verdicts and phases
-    ├─ agent.rs          prompt (guardrails + task), CLI command and model list for Copilot CLI / Claude Code
+    ├─ agent.rs          prompt (guardrails + task), CLI command and model list for Copilot CLI / Claude Code / Codex
     ├─ intake.rs         request-list readers, quick-scan extraction, recipe matching, Batch persistence
     ├─ icons.rs          multi-source icon search, scoring, dedupe, image clean-up
     ├─ process.rs        child processes with streamed stdout/stderr, cancel (taskkill /T), PATH reload from the registry
@@ -248,6 +248,18 @@ Enforcement:
   tasks also deny writes. The prompt opens with explicit rules: work only in
   `Recipes\Development`, never touch production, run only harness dry runs, and report
   the recipes changed on a `STUDIO-RECIPES:` line.
+- **Codex** (`codex exec`) is confined differently: by its own sandbox rather than tool
+  flags. `workspace-write` lets commands write only in the work folder and temp (`read-only`
+  for review tasks), with `approval_policy="never"` so nothing waits on a prompt nobody can
+  answer, and Codex's live web search for research. The Windows sandbox cannot make HTTPS
+  requests from commands (Schannel has no credentials there), so downloading an installer
+  works only with the sandbox off: the user's explicit *Allow the agent to download and
+  inspect installers* approval switches a writing task to `danger-full-access`, and the
+  checkbox says so. Codex has no per-run list of refused commands, so the rules that are
+  enforced for Copilot and Claude (no `Yardstick.ps1`, Graph, `git push`, a plugin's own
+  step scripts) are in the prompt only; the Studio shows a warning when Codex is selected.
+  Codex has no subagents here, so Multi-agent is off, and its runs are not counted in the
+  credit totals.
 - **Recipe paths** are checked to lie inside the workspace. Recipe ids are validated
   before they are passed to PowerShell, and every argument is single-quote escaped
   (`ps_quote`).
@@ -342,7 +354,7 @@ new page type needs one (`studio.hostApi` in the manifest says which kit it expe
   workspace, and any approval go in `input.json`, and the script reports `status`, `summary`,
   `outputs`, `artifacts` and `rows` in `result.json`. A non-zero exit, or a missing or invalid
   result, is a failure.
-- **Agent tasks** use the same Copilot CLI / Claude Code runners as recipes
+- **Agent tasks** use the same Copilot CLI / Claude Code / Codex runners as recipes
   (`agent::build_plugin_command`). The prompt carries the Studio's rules, the plugin's
   `INSTRUCTIONS.md`, the task prompt and the results of the steps it takes evidence from; the
   plugin's reference files are copied to `<work item>\.studio\agent`.

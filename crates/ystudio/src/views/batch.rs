@@ -594,7 +594,7 @@ fn start_page(app: &mut StudioApp, ui: &mut Ui) {
         ui.label(RichText::new("How it works").semibold());
         ui.label("1. The Studio reads the file and strips the noise (HTML, signatures, approval boilerplate).");
         ui.label("2. A quick scan lists the software it can see and matches it against existing recipes.");
-        ui.label("3. For messy tickets, “Extract with agent” has Copilot / Claude read every request and return a clean list.");
+        ui.label("3. For messy tickets, “Extract with agent” has your agent read every request and return a clean list.");
         ui.label("4. Review the list, then queue agent runs that write (or update) one recipe per item and find icons.");
         ui.label("5. Studio tests and repairs each recipe. Use Test selected to recheck them all, then copy the report.");
     });

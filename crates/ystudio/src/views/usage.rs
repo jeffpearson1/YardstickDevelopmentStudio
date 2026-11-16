@@ -19,7 +19,7 @@ pub fn card(app: &StudioApp, ui: &mut Ui) {
         ui.label(
             RichText::new(
                 "Every agent run on an app counted together - writing, fixes and repairs - by the model the run used. \
-                 Copilot CLI reports credits; Claude Code runs are not counted.",
+                 Copilot CLI reports credits; Claude Code and Codex runs are not counted.",
             )
             .small()
             .weak(),

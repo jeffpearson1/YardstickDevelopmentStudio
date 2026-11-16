@@ -1,4 +1,4 @@
-//! Agentic authoring: hand a task to GitHub Copilot CLI (or Claude Code) with
+//! Agentic authoring: hand a task to GitHub Copilot CLI, Claude Code or Codex with
 //! the yardstick-recipes skill and the Studio's guardrails, stream its work,
 //! then review what changed and send the result to the Test Bench.
 
