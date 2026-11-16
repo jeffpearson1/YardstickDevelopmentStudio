@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-16"?>
+<EnhancedDetectionMethod xmlns="http://schemas.microsoft.com/SystemCenterConfigurationManager/2009/AppMgmtDigest">
+  <Settings xmlns="http://schemas.microsoft.com/SystemCenterConfigurationManager/2009/AppMgmtDigest">
+    <SimpleSetting LogicalName="RegSetting_b917b099-7deb-4a1c-a66b-e0809c064451" DataType="String" xmlns="http://schemas.microsoft.com/SystemsCenterConfigurationManager/2009/07/10/DesiredConfiguration">
+      <Annotation xmlns="http://schemas.microsoft.com/SystemsCenterConfigurationManager/2009/06/14/Rules">
+        <DisplayName Text="" />
+        <Description Text="" />
+      </Annotation>
+      <RegistryDiscoverySource Hive="HKEY_LOCAL_MACHINE" Depth="Base" Is64Bit="true" CreateMissingPath="true">
+        <Key>SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\{5032C752-8E23-46C7-9D34-7D652A415164}_is1</Key>
+        <ValueName>DisplayVersion</ValueName>
+      </RegistryDiscoverySource>
+    </SimpleSetting>
+  </Settings>
+  <Rule id="ScopeId_00000000-0000-0000-0000-000000000000/DeploymentType_22222222-2222-2222-2222-222222222222" Severity="Informational" NonCompliantWhenSettingIsNotFound="false" xmlns="http://schemas.microsoft.com/SystemsCenterConfigurationManager/2009/06/14/Rules">
+    <Annotation>
+      <DisplayName Text="" />
+      <Description Text="" />
+    </Annotation>
+    <Expression>
+      <Operator>Equals</Operator>
+      <Operands>
+        <SettingReference AuthoringScopeId="ScopeId_00000000-0000-0000-0000-000000000000" LogicalName="Application_11111111-1111-1111-1111-111111111111" Version="1" DataType="String" SettingLogicalName="RegSetting_b917b099-7deb-4a1c-a66b-e0809c064451" SettingSourceType="Registry" Method="Value" Changeable="false" />
+        <ConstantValue Value="V 1.0.7" DataType="String" />
+      </Operands>
+    </Expression>
+  </Rule>
+</EnhancedDetectionMethod>

@@ -1,0 +1,98 @@
+schema: 1
+id: sccm-migration
+name: SCCM App Migration
+version: 1.0.0
+publisher: Yardstick contributors
+description: Browse the applications in a Configuration Manager site and migrate one to Intune, either as a one-off package built from its content or as a Yardstick recipe. Read-only towards Configuration Manager.
+icon: E968
+studio: { minVersion: 0.6.0, hostApi: 1 }
+source: { github: jeffpearson1/YardstickDevelopmentStudio, tagPrefix: plugin-sccm-migration-v }
+requires:
+  plugins:
+    - { id: oneoff-packager, minVersion: 1.0.1 }
+settings:
+  - key: smsProvider
+    label: SMS Provider server
+    type: string
+    required: true
+    help: The server that runs the SMS Provider, usually the site server (a name, not a URL).
+  - key: siteCode
+    label: Site code
+    type: string
+    required: true
+    help: Three characters, e.g. ABC.
+  - key: cimProtocol
+    label: Connection protocol
+    type: choice
+    choices: [Dcom, Wsman]
+    default: Dcom
+    help: Dcom works against most sites. Use Wsman if DCOM is blocked and WinRM to the provider is open.
+  - key: workRoot
+    label: Work folder
+    type: folder
+    required: true
+    help: Each exported application gets a folder here.
+  - key: maxContentMB
+    label: Largest content to copy (MB)
+    type: string
+    default: "2048"
+    help: Copying more than this is refused.
+page:
+  type: catalog
+  noun: Application
+  probe: connect
+  query: search
+  columns: [name, version, manufacturer, state, deployed]
+  panels:
+    - { type: markdown, title: Export, file: export.md }
+    - { type: table, title: Deployment types, file: intune-mapping.json, rows: /deploymentTypes, columns: [title, technology, context, detection, status] }
+    - { type: files, title: Files, globs: ["*.json", "*.md", "icon.png", "source/*"] }
+steps:
+  - id: connect
+    label: Check the connection
+    description: Opens a read-only CIM session to the SMS Provider and reads the site.
+    script: scripts/Step-Connect.ps1
+    risk: sccm-read
+    scope: plugin
+  - id: search
+    label: Search applications
+    description: Lists the latest revision of each application whose name or manufacturer contains the text.
+    script: scripts/Step-Search.ps1
+    risk: sccm-read
+    scope: plugin
+  - id: export
+    label: Export details
+    description: Reads the application's deployment types, commands and detection and works out what an Intune app would need.
+    script: scripts/Step-Export.ps1
+    risk: sccm-read
+    scope: plugin
+  - id: copy-content
+    label: Copy the content
+    description: Copies the deployment type's content from its share into the export folder, with each file's SHA-256, signature and version recorded.
+    script: scripts/Step-CopyContent.ps1
+    risk: local-write
+    gate: confirm
+    scope: plugin
+actions:
+  - id: export
+    label: Export details
+    description: Read the application from the site and write its export.
+    kind: step
+    step: export
+  - id: copy-content
+    label: Copy content
+    description: Copy the installer files from the SCCM content share (needed for a one-off package).
+    kind: step
+    step: copy-content
+  - id: to-oneoff
+    label: Package as one-off
+    description: Starts a One-Off Packager ticket from this export, with the copied content as the payload.
+    kind: handoff.workitem
+    plugin: oneoff-packager
+    title: "SCCM migration: {name}"
+    files: [export.md, sccm-export.json, intune-mapping.json, "icon.png?", "source-manifest.json?", "source?"]
+  - id: to-recipe
+    label: Draft a Yardstick recipe
+    description: Opens the New recipe dialog with this application's details, for the recipe agent to research.
+    kind: handoff.recipe
+    notesFile: export.md

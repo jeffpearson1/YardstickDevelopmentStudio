@@ -7,15 +7,42 @@ Builds, tests or runs Yardstick Development Studio with the Rust toolchain on PA
 .\build.ps1 -Task test  # run the unit tests
 .\build.ps1 -Task run   # build and launch (debug)
 .\build.ps1 -Task installer  # release build + MSI -> target\installer\
+.\build.ps1 -Task plugins    # plugin zips + SHA-256 -> target\plugins\
+.\build.ps1 -Task plugin-test  # Pester tests of the plugins (needs Pester 5)
 #>
 param(
-    [ValidateSet('build', 'test', 'run', 'check', 'clippy', 'installer')]
+    [ValidateSet('build', 'test', 'run', 'check', 'clippy', 'installer', 'plugins', 'plugin-test')]
     [string]$Task = 'build',
     [switch]$Debug,
     # Extra arguments passed through to cargo, e.g. -CargoArgs '--', '--ignored'
     [string[]]$CargoArgs = @()
 )
 $ErrorActionPreference = 'Stop'
+
+# Plugins are scripts and text, so these tasks need no Rust toolchain.
+if ($Task -eq 'plugins') {
+    & (Join-Path $PSScriptRoot 'plugins\Build-Plugins.ps1') -OutputDirectory (Join-Path $PSScriptRoot 'target\plugins')
+    exit $LASTEXITCODE
+}
+if ($Task -eq 'plugin-test') {
+    # The plugins' scripts and tests are PowerShell 7; run them there even from Windows PowerShell.
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
+        if (-not $pwsh) { throw 'The plugin tests need PowerShell 7 (pwsh).' }
+        & $pwsh.Source -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -Task plugin-test
+        exit $LASTEXITCODE
+    }
+    if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version.Major -ge 5 })) {
+        throw 'Pester 5 or later is needed: Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser'
+    }
+    Import-Module Pester -MinimumVersion 5.0
+    $tests = @(Get-ChildItem (Join-Path $PSScriptRoot 'plugins') -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object { Join-Path $_.FullName 'tests' } | Where-Object { Test-Path $_ })
+    if (-not $tests) { Write-Host 'No plugin tests.'; exit 0 }
+    $result = Invoke-Pester -Path $tests -Output Detailed -PassThru
+    exit ([int]($result.FailedCount -gt 0 -or $result.FailedContainersCount -gt 0))
+}
+
 $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
 if (Test-Path $cargoBin) { $env:PATH = "$cargoBin;$env:PATH" }
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {

@@ -116,6 +116,8 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         ui.add_space(theme::CARD_GAP);
         tools_card(app, ui);
         ui.add_space(theme::CARD_GAP);
+        super::plugins::card(app, ui);
+        ui.add_space(theme::CARD_GAP);
         appearance_card(app, ui);
         ui.add_space(theme::CARD_GAP);
         theme::card(ui, |ui| {
@@ -410,7 +412,7 @@ pub fn agent_picker(app: &mut StudioApp, ui: &mut Ui, salt: &str) {
             && let Some(per_app) = m.per_app()
         {
             ui.add(egui::Label::new(RichText::new(format!("≈ {per_app:.1} credits per app")).small().weak()).extend()).on_hover_text(format!(
-                "{model}: {per_app:.1} AI credits per app over {} app(s), {:.1} per run over {} run(s). See Runs for every model.",
+                "{model}: {per_app:.1} AI credits per app over {} app(s), {:.1} per run over {} run(s). See History for every model.",
                 m.apps,
                 m.per_run(),
                 m.runs

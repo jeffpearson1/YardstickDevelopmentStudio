@@ -108,15 +108,15 @@ impl AgentState {
                 if self.freeform.trim().is_empty() {
                     return Err("Write a prompt.");
                 }
-                AgentTask::Freeform { prompt: self.freeform.clone() }
+                AgentTask::Freeform { prompt: self.freeform.clone(), recipe: Some(self.target_id.trim().to_string()).filter(|id| !id.is_empty()) }
             }
         })
     }
 }
 
 /// A one-item request recording an Agent tab run, so its status and test
-/// results are kept under Requests like any other work. It is saved, not
-/// opened: the request open in Requests stays as it is.
+/// results are kept in Recipe Builder like any other work. It is saved, not
+/// opened: the request open in Recipe Builder stays as it is.
 pub(crate) fn tracking_request(app: &StudioApp, task: &AgentTask) -> Option<Batch> {
     let recipe = app.agent.target_id.trim().to_string();
     if recipe.is_empty() {
@@ -277,7 +277,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     }
     if let Some((id, label)) = app.agent.request.clone() {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Tracked under Requests as").weak());
+            ui.label(RichText::new("Tracked in Recipe Builder as").weak());
             if ui.link(&label).on_hover_text("Its status and test results are kept there.").clicked() {
                 if app.batch.busy(app) && app.batch.batch.as_ref().is_none_or(|b| b.id != id) {
                     app.error("Finish or cancel the active run before switching requests.");

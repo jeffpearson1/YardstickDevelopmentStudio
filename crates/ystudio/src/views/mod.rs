@@ -5,6 +5,8 @@ pub mod docs;
 pub mod editor;
 pub mod home;
 pub mod icons;
+pub mod plugin_page;
+pub mod plugins;
 pub mod promote;
 pub mod recipes;
 pub mod runs;
@@ -50,7 +52,7 @@ pub fn need_recipe(app: &mut StudioApp, ui: &mut Ui) -> bool {
     ui.label(RichText::new("Pick one in the library, or start a new one - written by the agent or from a template.").weak());
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        if theme::primary(ui, true, format!("{}  Recipe library", theme::icon::LIBRARY)).clicked() {
+        if theme::primary(ui, true, format!("{}  Recipe Library", theme::icon::LIBRARY)).clicked() {
             app.view = crate::app::View::Recipes;
         }
         if ui.add_enabled(app.writable(), egui::Button::new("\u{E710}  New recipe…")).clicked() {

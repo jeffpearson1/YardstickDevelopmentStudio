@@ -19,12 +19,13 @@ yardstick-studio.exe
 ├─ crates/ystudio        GUI (eframe/egui 0.37; wgpu, or a CPU renderer without a GPU)
 │   ├─ main.rs           renderer selection, window icon
 │   ├─ soft/             winit + softbuffer runner and parallel damage-tracking rasterizer
-│   ├─ app.rs            StudioApp: state, job registry, caches, navigation shell
+│   ├─ app.rs            StudioApp: state, job registry, caches, navigation shell, minimum layout size
+│   ├─ plugins.rs        the session's plugins: registry, sidebar tab order, page state, work-item locks
 │   ├─ highlight.rs      YAML/PowerShell syntax highlighting (egui LayoutJob)
 │   ├─ theme.rs          Fluent tokens (light/dark), brand art, fonts, nav items, badges, cards, info bars, accent buttons
 │   └─ views/            home (launcher), recipes (+ recipe header and tabs in mod.rs), designer, editor,
-│                        testbench, agent, batch (Requests), icons, runs, docs (Help), promote (Publish), settings,
-│                        setup (first-run wizard), update
+│                        testbench, agent, batch (Recipe Builder), icons, runs (History), docs (Help), promote (Publish), settings,
+│                        setup (first-run wizard), update, plugins (Settings card, trust prompt), plugin_page (a plugin's tab)
 └─ crates/ystudio-core   headless engine; no GUI types; unit tested
     ├─ workspace.rs      open + classify a Yardstick folder, layout from Yardstick.Project.psd1, recipe metadata
     ├─ recipe.rs         ordered YAML document model (key order kept, scripts as literal blocks) + templates
@@ -36,6 +37,8 @@ yardstick-studio.exe
     ├─ setup.rs          Install-Yardstick -Status / -DevelopmentOnly -NonInteractive commands and their JSON results
     ├─ git.rs            git clone/fetch/pull (ff-only) and ahead/behind status; finds git after a PATH refresh
     ├─ update.rs         self-update: latest GitHub release, SHA-256-verified MSI download, install-and-relaunch helper
+    ├─ plugin.rs         plugins: plugin.yaml manifest + validation, zip install/update/uninstall with integrity
+    │                    records, work items, hash-bound approvals, step runs (pwsh -File with input/result JSON)
     ├─ results.rs        parses _install-tests/<ts>/summary.json into verdicts and phases
     ├─ agent.rs          prompt (guardrails + task), CLI command and model list for Copilot CLI / Claude Code
     ├─ intake.rs         request-list readers, quick-scan extraction, recipe matching, Batch persistence
@@ -72,6 +75,9 @@ dispatches on `JobKind`:
   pipeline before starting the next queued item;
 - workflow harness jobs verify fresh matching evidence, advance the stage, or send a recipe failure
   to a repair agent; repair jobs restart the checks from lint;
+- plugin step jobs read their `result.json` into the work item's record (or into the catalog
+  page); plugin agent jobs record what the agent changed, what stopped it and whether it wrote
+  the files the task expects. Both release the work item's lock;
 - git fetch/pull jobs refresh the ahead/behind status (a pull also rescans recipes and reloads an
   unedited open recipe); shared-sync jobs rescan icons and re-lint.
 
@@ -248,18 +254,18 @@ Enforcement:
 
 ## User journeys
 
-1. **Design.** Home or Recipes → *New recipe* (from a `Templates\` file) or *Copy to
+1. **Design.** Home or Recipe Library → *New recipe* (from a `Templates\` file) or *Copy to
    Development* → the recipe's Design tab steps (Identity, Source & version, Download scripts, Install & uninstall,
    Detection, Lifecycle & assignments, Advanced) with live lint → Ctrl+S.
 2. **Test.** The recipe's Test tab → *Run safe checks* (Lint → Schema → install-test dry run). Then,
-   optionally: Lab download/package, and a live install test after consent. Runs shows
+   optionally: Lab download/package, and a live install test after consent. History shows
    the history and per-phase results.
 3. **Agentic.** *New recipe* → *Write it with the agent* makes a one-item request that is
    written, tested and repaired like any other; or the open recipe's Agent tab (Fix with the
    latest failing run, Review, Update, Freeform) → stream → back to Test.
 4. **Publish.** Publish → select complete Development recipes → *Open pull requests…* →
    confirm → open the pull request (or GitHub's compare page) in the browser.
-5. **Requests.** Import a ticket export or paste a list → review the extracted items
+5. **Recipe Builder.** Import a ticket export or paste a list → review the extracted items
    (optionally *Extract with agent*) → find missing icons → *Run agent on N selected* →
    publish the recipes it produced. *Update several recipes* makes a request from library
    recipes to re-test, repair or update together.
@@ -315,10 +321,96 @@ Enforcement:
 - **Text.** Windows PowerShell 5.1 writes UTF-8 with a BOM, so all reads go through
   `read_text`, which strips it.
 
+## Plugins
+
+A plugin adds a tab after Publish in the sidebar (Home, Recipe Library, Recipe Builder,
+Publish, *plugins*, History, Settings, Help). It is a zip with a `plugin.yaml` manifest,
+PowerShell step scripts and agent instructions, installed to
+`%APPDATA%\YardstickStudio\plugins\<id>\`. There is no native code: a page is drawn by one of
+the Studio's built-in page types, so a plugin can change without a Studio release, and a
+new page type needs one (`studio.hostApi` in the manifest says which kit it expects).
+
+- **`workitems` pages** list folders under the plugin's work root. Each has a pipeline of
+  steps and agent tasks in order (`after`), with state, risk and gate, and read-only panels
+  (a JSON table, markdown, a file list) bound to files in the folder.
+- **`catalog` pages** probe a connection, search an outside system (a step whose `rows`
+  fill a table) and offer per-row actions: run a step, start a work item in another plugin
+  (`handoff.workitem`, which copies files into its `intake` folder), or pre-fill the New
+  recipe dialog (`handoff.recipe`).
+- **Steps** run as `pwsh -File <script> -StudioInput <input.json> -StudioResult <result.json>`.
+  Only those paths are on the command line; settings, parameters, the Studio's version and
+  workspace, and any approval go in `input.json`, and the script reports `status`, `summary`,
+  `outputs`, `artifacts` and `rows` in `result.json`. A non-zero exit, or a missing or invalid
+  result, is a failure.
+- **Agent tasks** use the same Copilot CLI / Claude Code runners as recipes
+  (`agent::build_plugin_command`). The prompt carries the Studio's rules, the plugin's
+  `INSTRUCTIONS.md`, the task prompt and the results of the steps it takes evidence from; the
+  plugin's reference files are copied to `<work item>\.studio\agent`.
+
+Distribution. Plugin sources live in `plugins\<id>\`; `build.ps1 -Task plugins` runs
+`plugins\Build-Plugins.ps1`, which packs each into `target\plugins\<id>-<version>.zip` plus a
+`.sha256`: files in name order, fixed timestamps, LF line endings in text files, no `tests\`.
+A release is tagged `plugin-<id>-v<version>` with the zip attached and created with
+`--latest=false` (the Studio's own update check reads the latest release and needs an MSI there).
+*Settings → Plugins* lists the newest release of each plugin in this repository's releases
+(`plugin::parse_catalog`), flags installed plugins that have a newer one, and downloads with
+`update::download_verified`: the zip's SHA-256 must match GitHub's `digest`, and its manifest must
+name the plugin and version the release does. A plugin may name another repository in its
+`source`; it is checked too. Both checks run at startup (quietly, when *Check for updates at
+startup* is on) and on demand. A core test packs the sample plugin with the script and installs the
+result, so the packer and the Studio's validator cannot drift apart.
+
+Shipped plugins. **One-Off Packager** is a `workitems` plugin: a ticket folder with the
+pipeline in `plugin.yaml`; its scripts share `StudioPlugin.psm1` (the input/result protocol and
+approval check) and `OneOffPackager.psm1` (inventory, packaging, change set and the resumable live
+change, with every tenant, group and path coming in as a setting or from the work item).
+**SCCM App Migration** is a `catalog` plugin: a connection check, a search whose rows fill the table,
+and per-row steps (export, copy content) and handoffs (`handoff.workitem` to the One-Off Packager,
+`handoff.recipe` into the New recipe dialog). A handoff's `files` may end in `?` for "if present", and
+folders are hard-linked where possible. The SCCM scripts only ever `SELECT`: a test fails the build if
+one calls a cmdlet that could change the site. Each plugin is a self-contained package, so
+`StudioPlugin.psm1` is duplicated, and a test checks the copies are identical.
+
+Plugin safety, in addition to the model above:
+
+- **Trust.** Installing or updating shows the publisher, the package SHA-256 and every
+  step with its risk (reads/writes local files, installs software, reads or changes the
+  tenant, reads Configuration Manager) and gate. An update marks new or changed steps.
+- **Integrity.** Install records the SHA-256 of every file. A plugin whose files were
+  changed, added or removed afterwards is shown as modified and its steps and agent tasks
+  refuse to run until it is reinstalled. Zips are read in memory with limits (2,000 entries,
+  50 MB), no links, no paths outside the folder, and only script, text and image files.
+- **Approvals.** A step that installs software or changes the tenant must name a gate file.
+  The user approves the SHA-256 of exactly that file, shown with the plugin's summary of it.
+  The grant is written to `approvals\`, is single use, and is checked again when the step
+  starts: if the file changed, the step refuses. The script checks it a second time.
+- **Confinement.** A step or agent runs only in a work item under the plugin's work root,
+  never in or around a production folder, and one at a time per work item (a `.studio-lock`
+  file, because the work root may be a share). Steps that install software and agent runs
+  wait for each other and for recipe agents and install tests (`workflow::busy`).
+- **Agents** write only in their work item (`--add-dir`), may not run the Studio's denied
+  commands, the plugin's `deniedCommands` or any of the plugin's own step scripts, and are
+  told never to use Graph or credentials and to treat the request text as untrusted. This is
+  a prompt and a prefix deny list, not a sandbox: a shell can still be asked for anything,
+  so tenant-writing steps rely on the user's approval, not on the agent's restraint. The
+  agent's changes are listed from a snapshot that ignores the Studio's own files.
+- No elevated worker for plugins: a plugin that installs software does it in the user's
+  session and asks the user's consent.
+
+## Window size
+
+The layout is designed for at least 1100 × 680 (`app::MIN_LAYOUT`). A smaller window keeps
+that size and scrolls over it, with solid scrollbars, instead of squeezing pages into too
+little room. The window itself can still be shrunk to 900 × 600 so it never exceeds a small
+screen at high display scaling.
+
 ## Testing
 
 - `.\build.ps1 -Task test` runs the unit tests: classification, refusals, lossless edits,
   lint rules, command construction, summary parsing and highlighting.
+- `crates/ystudio-core/tests/fixtures/plugins/sample` is a small plugin the tests install and
+  run; GUI tests render its pages headlessly (set `YSTUDIO_TEST_SCREENSHOT_DIR` to keep
+  PNGs), including below the minimum window size.
 - `crates/ystudio-core/tests/live_harness.rs` is ignored by default. It runs the real
   Schema check and an install-test dry run against a throwaway clone, and checks that the
   production folder is refused.

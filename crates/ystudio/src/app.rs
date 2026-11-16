@@ -21,6 +21,27 @@ use ystudio_core::workspace::{RecipeEntry, RecipeLocation, Workspace, WorkspaceK
 use crate::theme::{self, FluentText as _};
 use crate::views;
 
+/// The smallest size the layout is designed for. A smaller window scrolls
+/// over a layout of this size rather than squeezing the pages into it.
+pub const MIN_LAYOUT: egui::Vec2 = egui::vec2(1100.0, 680.0);
+
+/// The layout size when `avail` is too small for `min`, or `None` when it
+/// fits. Each scroll bar takes `bar` from the other direction, so a bar that
+/// appears can make the other one necessary.
+pub fn scroll_layout(avail: egui::Vec2, min: egui::Vec2, bar: f32) -> Option<egui::Vec2> {
+    let (mut h, mut v) = (avail.x < min.x, avail.y < min.y);
+    for _ in 0..2 {
+        h = avail.x - if v { bar } else { 0.0 } < min.x;
+        v = avail.y - if h { bar } else { 0.0 } < min.y;
+    }
+    if !h && !v {
+        return None;
+    }
+    let w = if h { min.x } else { avail.x - bar };
+    let height = if v { min.y } else { avail.y - bar };
+    Some(egui::vec2(w, height))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Home,
@@ -37,20 +58,25 @@ pub enum View {
     Settings,
     /// The first-run wizard; not in the sidebar.
     Setup,
+    /// An installed plugin's tab, by its index in `plugins::Host::tabs`.
+    Plugin(u16),
 }
 
 impl View {
     /// The sidebar. The open recipe's pages (Designer, YAML, Test Bench,
-    /// Icons, Agent) are tabs under Recipes.
+    /// Icons, Agent) are tabs under Recipe Library. Plugin tabs follow Publish
+    /// ([`View::NAV_PLUGINS_AT`]).
     pub const NAV: [(View, &'static str, &'static str); 7] = [
         (View::Home, theme::icon::HOME, "Home"),
-        (View::Recipes, theme::icon::LIBRARY, "Recipes"),
-        (View::Batch, theme::icon::INBOX, "Requests"),
-        (View::Runs, theme::icon::CHART, "Runs"),
+        (View::Recipes, theme::icon::LIBRARY, "Recipe Library"),
+        (View::Batch, theme::icon::HAMMER, "Recipe Builder"),
         (View::Promote, theme::icon::UPLOAD, "Publish"),
+        (View::Runs, theme::icon::CLOCK, "History"),
         (View::Settings, theme::icon::SETTINGS, "Settings"),
         (View::Docs, theme::icon::BOOK, "Help"),
     ];
+    /// Where in [`View::NAV`] the plugin tabs go.
+    pub const NAV_PLUGINS_AT: usize = 4;
 }
 
 /// Test Bench pipeline steps, cheapest first.
@@ -119,6 +145,10 @@ pub enum JobKind {
     Setup { result: PathBuf },
     /// `winget install` of a missing tool, or `gh auth setup-git`.
     InstallTool,
+    /// A plugin step; `dir` is its work item, or the plugin's work root.
+    PluginStep { plugin: String, dir: PathBuf, step: String, result: PathBuf, risk: ystudio_core::plugin::Risk, purpose: views::plugin_page::Purpose },
+    /// An agent task of a plugin, working in a work item's folder.
+    PluginAgent { plugin: String, dir: PathBuf, task: String, before: Snapshot },
 }
 
 pub struct Job {
@@ -131,7 +161,7 @@ pub struct Job {
 
 impl Job {
     pub fn is_agent(&self) -> bool {
-        matches!(self.kind, JobKind::Agent { .. } | JobKind::WorkflowRepair { .. })
+        matches!(self.kind, JobKind::Agent { .. } | JobKind::WorkflowRepair { .. } | JobKind::PluginAgent { .. })
     }
 }
 
@@ -307,6 +337,8 @@ pub struct StudioApp {
     pub refocus: bool,
     pub workflow: crate::workflow::State,
     pub elevation: crate::elevation::State,
+    pub plugins: crate::plugins::Host,
+    pub plugins_ui: views::plugins::ManagerState,
 }
 
 pub struct BenchState {
@@ -363,6 +395,7 @@ impl StudioApp {
             batch: Default::default(), icons: Default::default(), runs_ui: Default::default(),
             docs: Default::default(), promote: Default::default(), update: Default::default(), workflow: Default::default(),
             elevation: Default::default(), tools: views::tools::ToolsState::fixed(), refocus: false,
+            plugins: Default::default(), plugins_ui: Default::default(),
         };
         app.refresh_recipes();
         app
@@ -430,6 +463,8 @@ impl StudioApp {
             elevation: Default::default(),
             tools: Default::default(),
             refocus: false,
+            plugins: crate::plugins::Host::load(&ystudio_core::plugin::default_dir()),
+            plugins_ui: Default::default(),
         };
         theme::install_fonts(egui_ctx);
         app.apply_theme(egui_ctx);
@@ -452,6 +487,7 @@ impl StudioApp {
         }
         if app.settings.auto_check_updates {
             views::update::start_check(&mut app, true);
+            views::plugins::start_check(&mut app, true);
         }
         app
     }
@@ -1095,6 +1131,12 @@ impl StudioApp {
                 }
             }
             JobKind::InstallTool => views::tools::install_finished(self, ok),
+            JobKind::PluginStep { plugin, dir, step, result, purpose, .. } => {
+                views::plugin_page::step_finished(self, id, &plugin, &dir, &step, &result, purpose);
+            }
+            JobKind::PluginAgent { plugin, dir, task, before } => {
+                views::plugin_page::agent_finished(self, id, &plugin, &dir, &task, before);
+            }
         }
     }
 
@@ -1228,14 +1270,35 @@ impl StudioApp {
         });
         ui.add_space(14.0);
         ui.spacing_mut().item_spacing.y = 0.0;
-        // Recipe pages belong to Recipes; the icon finder to Requests when it works for a batch item.
+        // Recipe pages belong to Recipe Library; the icon finder to Recipe Builder when it works for a batch item.
         let section = match self.view {
             View::Designer | View::Editor | View::TestBench | View::Agent => View::Recipes,
             View::Icons if self.icons.batch_item.is_some() => View::Batch,
             View::Icons => View::Recipes,
             v => v,
         };
-        for (view, icon, name) in View::NAV {
+        let plugin_tabs: Vec<(View, String, String)> = self
+            .plugins
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| self.settings.plugins.get(*id).is_none_or(|p| p.enabled))
+            .filter_map(|(i, id)| self.plugins.get(id).map(|p| (View::Plugin(i as u16), p.manifest.glyph(), p.manifest.name.clone())))
+            .collect();
+        for (i, (view, icon, name)) in View::NAV.into_iter().enumerate() {
+            if i == View::NAV_PLUGINS_AT {
+                for (view, glyph, name) in &plugin_tabs {
+                    let View::Plugin(tab) = *view else { continue };
+                    let busy = self.plugins.tabs.get(tab as usize).is_some_and(|id| views::plugin_page::plugin_busy(self, id));
+                    let mut resp = theme::nav_item(ui, glyph, name, section == *view, busy);
+                    if busy {
+                        resp = resp.on_hover_text("Running");
+                    }
+                    if resp.clicked() {
+                        self.view = *view;
+                    }
+                }
+            }
             let busy = match view {
                 View::Recipes => {
                     self.jobs.iter().any(|j| matches!(j.kind, JobKind::Agent { batch_item: None, .. }) && j.proc.is_running())
@@ -1465,6 +1528,7 @@ impl StudioApp {
         let ctx = ui.ctx().clone();
         self.poll_jobs();
         views::update::poll(self);
+        views::plugins::poll(self);
         views::tools::poll(self, &ctx);
         if std::mem::take(&mut self.refocus) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -1476,6 +1540,48 @@ impl StudioApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
 
+        // Below the minimum the pages overlap, so the whole layout keeps that
+        // size and the window scrolls over it instead.
+        let avail = ui.available_size();
+        let bar = egui::style::ScrollStyle::solid().allocated_width();
+        match scroll_layout(avail, MIN_LAYOUT, bar) {
+            None => self.layout(ui),
+            Some(size) => {
+                ui.scope(|ui| {
+                    // Solid bars: floating ones are invisible until hovered.
+                    ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                    ui.spacing_mut().scroll.foreground_color = false;
+                    let text = theme::palette().text;
+                    let w = &mut ui.visuals_mut().widgets;
+                    w.inactive.bg_fill = text.gamma_multiply(0.45);
+                    w.hovered.bg_fill = text.gamma_multiply(0.65);
+                    w.active.bg_fill = text.gamma_multiply(0.85);
+                    egui::ScrollArea::both().id_salt("window-scroll").auto_shrink(false).show(ui, |ui| {
+                        ui.allocate_ui(size, |ui| {
+                            ui.set_min_size(size);
+                            self.layout(ui);
+                        });
+                    });
+                });
+            }
+        }
+
+        self.pending_modal(&ctx);
+        views::recipes::windows(self, &ctx);
+        views::batch::paste_window(self, &ctx);
+        views::testbench::live_modal(self, &ctx);
+        views::promote::modals(self, &ctx);
+        crate::workflow::modal(self, &ctx);
+        views::plugin_page::modals(self, &ctx);
+        views::plugins::modals(self, &ctx);
+        self.perf.record(self.view, frame_start.elapsed().as_secs_f32() * 1000.0);
+        if self.perf.continuous {
+            ctx.request_repaint();
+        }
+    }
+
+    /// The sidebar, status bar, console and current page, filling `ui`.
+    fn layout(&mut self, ui: &mut Ui) {
         let base = theme::palette().base;
         egui::Panel::left("nav")
             .resizable(false)
@@ -1514,19 +1620,9 @@ impl StudioApp {
                 View::Promote => views::promote::show(self, ui),
                 View::Settings => views::settings::show(self, ui),
                 View::Setup => views::setup::show(self, ui),
+                View::Plugin(tab) => views::plugin_page::show(self, ui, tab),
             }
         });
-
-        self.pending_modal(&ctx);
-        views::recipes::windows(self, &ctx);
-        views::batch::paste_window(self, &ctx);
-        views::testbench::live_modal(self, &ctx);
-        views::promote::modals(self, &ctx);
-        crate::workflow::modal(self, &ctx);
-        self.perf.record(self.view, frame_start.elapsed().as_secs_f32() * 1000.0);
-        if self.perf.continuous {
-            ctx.request_repaint();
-        }
     }
 
     pub fn shutdown(&mut self) {
@@ -1565,5 +1661,25 @@ mod bench_tests {
     #[test]
     fn all_checks_run_in_order_with_live_last() {
         assert_eq!(Step::ALL, [Step::Lint, Step::Schema, Step::Download, Step::Package, Step::DryRun, Step::Live]);
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn small_windows_get_a_scrolled_layout_at_the_minimum_size() {
+        let min = egui::vec2(1100.0, 680.0);
+        assert_eq!(scroll_layout(egui::vec2(1400.0, 900.0), min, 10.0), None);
+        assert_eq!(scroll_layout(egui::vec2(1100.0, 680.0), min, 10.0), None);
+        // Too narrow: scrolls sideways, and the bar takes some height.
+        assert_eq!(scroll_layout(egui::vec2(900.0, 900.0), min, 10.0), Some(egui::vec2(1100.0, 890.0)));
+        // Too short: scrolls down; the layout is as wide as is left beside the bar.
+        assert_eq!(scroll_layout(egui::vec2(1400.0, 500.0), min, 10.0), Some(egui::vec2(1390.0, 680.0)));
+        assert_eq!(scroll_layout(egui::vec2(700.0, 450.0), min, 10.0), Some(egui::vec2(1100.0, 680.0)));
+        // A bar that appears can make the other direction necessary too.
+        assert_eq!(scroll_layout(egui::vec2(1105.0, 500.0), min, 10.0), Some(egui::vec2(1100.0, 680.0)));
+        assert_eq!(scroll_layout(egui::vec2(1500.0, 675.0), min, 10.0), Some(egui::vec2(1490.0, 680.0)));
     }
 }

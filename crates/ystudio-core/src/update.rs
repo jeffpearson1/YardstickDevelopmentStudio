@@ -47,11 +47,7 @@ pub fn parse_release(json: &str) -> Result<Release> {
         .flatten()
         .find(|a| a["name"].as_str().is_some_and(|n| n.to_ascii_lowercase().ends_with("-x64.msi")))
         .ok_or_else(|| anyhow!("release {tag} has no x64 MSI"))?;
-    let sha256 = asset["digest"]
-        .as_str()
-        .and_then(|d| d.strip_prefix("sha256:"))
-        .map(str::to_ascii_lowercase)
-        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()));
+    let sha256 = asset_sha256(asset);
     Ok(Release {
         version: tag.trim_start_matches(['v', 'V']).to_string(),
         notes: v["body"].as_str().unwrap_or_default().to_string(),
@@ -61,6 +57,15 @@ pub fn parse_release(json: &str) -> Result<Release> {
         size: asset["size"].as_u64().unwrap_or(0),
         sha256,
     })
+}
+
+/// Lower-case hex SHA-256 from a release asset's `digest` field.
+pub(crate) fn asset_sha256(asset: &serde_json::Value) -> Option<String> {
+    asset["digest"]
+        .as_str()
+        .and_then(|d| d.strip_prefix("sha256:"))
+        .map(str::to_ascii_lowercase)
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Numeric `major.minor.patch` comparison. A pre-release suffix (`1.2.0-rc1`)
@@ -101,14 +106,15 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
+/// A GitHub API response body.
+pub(crate) fn get_text(url: &str) -> Result<String> {
+    let mut resp = agent().get(url).header("Accept", "application/vnd.github+json").call().map_err(|e| anyhow!("{e}"))?;
+    resp.body_mut().with_config().limit(4 * 1024 * 1024).read_to_string().map_err(|e| anyhow!("{e}"))
+}
+
 /// The latest release, if it is newer than `current`.
 pub fn check(current: &str) -> Result<Option<Release>> {
-    let mut resp = agent()
-        .get(LATEST_RELEASE_API)
-        .header("Accept", "application/vnd.github+json")
-        .call()
-        .map_err(|e| anyhow!("checking for updates: {e}"))?;
-    let body = resp.body_mut().with_config().limit(4 * 1024 * 1024).read_to_string().map_err(|e| anyhow!("checking for updates: {e}"))?;
+    let body = get_text(LATEST_RELEASE_API).map_err(|e| anyhow!("checking for updates: {e}"))?;
     let release = parse_release(&body)?;
     Ok(is_newer(&release.version, current).then_some(release))
 }
@@ -120,15 +126,21 @@ pub fn download_dir() -> PathBuf {
 /// Downloads the MSI into `dir`, reporting bytes received through `progress`,
 /// and verifies its size and SHA-256. Returns the verified file.
 pub fn download(release: &Release, dir: &Path, progress: &AtomicU64) -> Result<PathBuf> {
+    download_verified(release, "msi", dir, progress)
+}
+
+/// Downloads a release asset ending in `.<ext>` into `dir` and verifies its
+/// size and SHA-256. Returns the verified file.
+pub fn download_verified(release: &Release, ext: &str, dir: &Path, progress: &AtomicU64) -> Result<PathBuf> {
     let Some(expected) = &release.sha256 else {
-        bail!("Release {} publishes no SHA-256 digest for its MSI, so it cannot be verified.", release.version);
+        bail!("Release {} publishes no SHA-256 digest for {}, so it cannot be verified.", release.version, release.asset_name);
     };
-    if release.asset_name.contains(['/', '\\']) || !release.asset_name.to_ascii_lowercase().ends_with(".msi") {
-        bail!("Unexpected installer name '{}'.", release.asset_name);
+    if release.asset_name.contains(['/', '\\']) || !release.asset_name.to_ascii_lowercase().ends_with(&format!(".{ext}")) {
+        bail!("Unexpected download name '{}'.", release.asset_name);
     }
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let dest = dir.join(&release.asset_name);
-    let partial = dest.with_extension("msi.part");
+    let partial = dest.with_extension(format!("{ext}.part"));
     let mut resp = agent().get(&release.asset_url).call().map_err(|e| anyhow!("downloading {}: {e}", release.asset_name))?;
     let mut reader = resp.body_mut().with_config().limit(512 * 1024 * 1024).reader();
     let mut file = std::fs::File::create(&partial).with_context(|| format!("creating {}", partial.display()))?;
@@ -150,7 +162,7 @@ pub fn download(release: &Release, dir: &Path, progress: &AtomicU64) -> Result<P
     let actual: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
     if (release.size != 0 && total != release.size) || actual != *expected {
         let _ = std::fs::remove_file(&partial);
-        bail!("The downloaded installer failed verification (SHA-256 {actual}, expected {expected}). Nothing was installed.");
+        bail!("The download of {} failed verification (SHA-256 {actual}, expected {expected}). Nothing was installed.", release.asset_name);
     }
     let _ = std::fs::remove_file(&dest);
     std::fs::rename(&partial, &dest).with_context(|| format!("saving {}", dest.display()))?;

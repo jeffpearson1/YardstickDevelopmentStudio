@@ -49,7 +49,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     super::production_banner(app, ui);
     let writable = app.writable();
     ui.horizontal(|ui| {
-        theme::page_title(ui, "Recipe library");
+        theme::page_title(ui, "Recipe Library");
         ui.add_space(12.0);
         if ui.add_enabled(writable, egui::Button::new("\u{E710}  New recipe")).clicked() {
             app.library.new_open = true;
@@ -201,7 +201,7 @@ fn selection_bar(lib: &mut LibraryState, ui: &mut Ui, shown: &[String]) -> bool 
         );
         ui.horizontal(|ui| {
             create = theme::primary(ui, n > 0, format!("\u{E8C3}  Make a request for {n} recipe(s)"))
-                .on_hover_text("Opens them under Requests, where you can re-test them, repair the failures, or have the agent update them.")
+                .on_hover_text("Opens them in Recipe Builder, where you can re-test them, repair the failures, or have the agent update them.")
                 .clicked();
             if ui.button("Cancel").clicked() {
                 lib.selecting = false;
@@ -271,7 +271,7 @@ fn new_recipe_window(app: &mut StudioApp, ctx: &egui::Context) {
         let resp = theme::primary(ui, ready && can_agent, format!("\u{E99A}  Write it with {agent_name}"));
         if !can_agent {
             resp.on_disabled_hover_text("Needs a writable development folder with the yardstick-recipes skill.");
-        } else if resp.on_hover_text("The agent researches the vendor and writes the recipe; the Studio then tests and repairs it. Follow it under Requests.").clicked() {
+        } else if resp.on_hover_text("The agent researches the vendor and writes the recipe; the Studio then tests and repairs it. Follow it in Recipe Builder.").clicked() {
             with_agent = true;
         }
         ui.add_space(4.0);

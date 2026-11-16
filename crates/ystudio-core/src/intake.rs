@@ -537,7 +537,7 @@ impl BatchItem {
             AgentTask::Fix { id, evidence, notes } => BatchItem { evidence: evidence.clone(), ..existing(id, RequestKind::Update, ItemAction::Fix, notes) },
             AgentTask::Review { id } => existing(id, RequestKind::Existing, ItemAction::Review, ""),
             AgentTask::Update { id, notes } => existing(id, RequestKind::Update, ItemAction::Update, notes),
-            AgentTask::Freeform { prompt } => existing(recipe, RequestKind::Existing, ItemAction::Freeform, prompt),
+            AgentTask::Freeform { prompt, .. } => existing(recipe, RequestKind::Existing, ItemAction::Freeform, prompt),
         }
     }
 
@@ -551,7 +551,7 @@ impl BatchItem {
             ItemAction::Fix => AgentTask::Fix { id, evidence: self.evidence.clone(), notes: self.notes.clone() },
             ItemAction::Review => AgentTask::Review { id },
             ItemAction::Update => AgentTask::Update { id, notes: self.notes.clone() },
-            ItemAction::Freeform => AgentTask::Freeform { prompt: self.notes.clone() },
+            ItemAction::Freeform => AgentTask::Freeform { prompt: self.notes.clone(), recipe: Some(id).filter(|id| !id.is_empty()) },
         })
     }
 
@@ -1406,7 +1406,7 @@ mod tests {
             AgentTask::Fix { id: "7zip".into(), evidence: "MSI 1603".into(), notes: "use the x64 MSI".into() },
             AgentTask::Review { id: "7zip".into() },
             AgentTask::Update { id: "7zip".into(), notes: "new download page".into() },
-            AgentTask::Freeform { prompt: "explain the detection".into() },
+            AgentTask::Freeform { prompt: "explain the detection".into(), recipe: Some("7zip".into()) },
         ] {
             let item = BatchItem::for_task(&task, "7zip", "7-Zip");
             assert_eq!(item.explicit_task().as_ref(), Some(&task));
