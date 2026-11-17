@@ -176,7 +176,7 @@ fn launcher(app: &mut StudioApp, ui: &mut Ui) {
                 }
                 _ => {
                     if theme::primary(ui, app.writable(), "\u{E710}  New recipe…").clicked() {
-                        app.library.new_open = true;
+                        super::batch::show_new_recipe(app);
                     }
                 }
             }

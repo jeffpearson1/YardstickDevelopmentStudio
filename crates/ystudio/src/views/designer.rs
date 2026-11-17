@@ -42,7 +42,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         Ok(d) => d,
         Err(e) => {
             theme::banner(ui, theme::red(), |ui| {
-                ui.label(RichText::new("The YAML does not parse, so the Designer cannot show it.").semibold());
+                ui.label(RichText::new("The YAML does not parse, so Design cannot show it.").semibold());
                 ui.label(&e);
                 if ui.button("Fix it in the YAML editor").clicked() {
                     goto = Some(View::Editor);
@@ -65,9 +65,9 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     if has_comments && !r.accept_comment_loss && !r.read_only {
         theme::banner(ui, theme::amber(), |ui| {
             ui.label(RichText::new("This recipe contains comments").semibold().color(theme::amber()));
-            ui.label("The Designer rewrites the YAML from its fields, which removes comments. Use the YAML editor to keep them, or continue and lose them.");
+            ui.label("Design rewrites the YAML from its fields, which removes comments. Use the YAML tab to keep them, or continue and lose them.");
             ui.horizontal(|ui| {
-                if ui.button("Edit in the Designer anyway").clicked() {
+                if ui.button("Edit in Design anyway").clicked() {
                     r.accept_comment_loss = true;
                 }
                 if ui.button("Open the YAML editor").clicked() {
@@ -101,7 +101,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     ui.add_space(4.0);
     let section = Section::ALL[r.section.min(Section::ALL.len() - 1)];
 
-    egui::Panel::right("designer-guide").resizable(true).default_size(320.0).show(ui, |ui| {
+    egui::Panel::right("designer-guide").resizable(true).default_size(300.0).frame(theme::pane_frame()).show(ui, |ui| {
         egui::ScrollArea::vertical().id_salt("guide-scroll").show(ui, |ui| {
             theme::section_heading(ui, section.title());
             ui.label(section.guidance());
@@ -130,8 +130,9 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     let mut changed: Vec<String> = Vec::new();
     let assigned = ystudio_core::lint::script_assignments(&doc);
     let editor = EditorOpts { icons: &icons, font_size, dark, line_numbers };
-    egui::ScrollArea::vertical().id_salt(("designer-fields", r.section)).auto_shrink(false).show(ui, |ui| {
-        ui.horizontal(|ui| {
+    theme::pane(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt(("designer-fields", r.section)).auto_shrink(false).show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut r.show_all_fields, "Show all fields in this step");
             ui.checkbox(&mut line_numbers, "Line numbers");
             ui.label(RichText::new("Blank fields are removed so they inherit from preferences.yaml.").small().weak());
@@ -181,6 +182,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             } else if ui.button(RichText::new("\u{E9D5}  Test this recipe →").semibold()).clicked() {
                 goto = Some(View::TestBench);
             }
+        });
         });
     });
 
@@ -322,8 +324,8 @@ fn field_input(ui: &mut Ui, spec: &FieldSpec, buf: &mut String, width: f32, opts
     let mut changed = false;
     match spec.kind {
         FieldKind::Text if spec.name == "iconFile" => {
-            ui.horizontal(|ui| {
-                changed |= ui.add(egui::TextEdit::singleline(buf).desired_width(260.0)).changed();
+            changed |= ui.add(egui::TextEdit::singleline(buf).desired_width(width)).changed();
+            ui.horizontal_wrapped(|ui| {
                 egui::ComboBox::from_id_salt("icon-pick").selected_text("Pick from Icons\\").height(400.0).show_ui(ui, |ui| {
                     for icon in icons {
                         if ui.selectable_label(buf == icon, icon).clicked() {

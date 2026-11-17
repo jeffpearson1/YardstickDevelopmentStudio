@@ -372,11 +372,14 @@ pub fn agent_picker(app: &mut StudioApp, ui: &mut Ui, salt: &str) {
         let models = match available.then(|| app.settings_ui.models(backend, &waker)) {
             Some(Models::Ready(list)) => list.clone(),
             Some(Models::Loading(_)) => {
-                ui.spinner().on_hover_text("Asking the CLI which models it offers…");
+                ui.spinner();
+                ui.label(RichText::new("Loading models…").small().weak())
+                    .on_hover_text("Asking the selected CLI which models it offers");
                 Vec::new()
             }
             Some(Models::Failed(e)) => {
-                ui.label(RichText::new("\u{E7BA}").color(theme::amber())).on_hover_text(format!("Could not list models: {e}"));
+                ui.label(RichText::new("Models unavailable").small().color(theme::amber()))
+                    .on_hover_text(format!("Could not list models: {e}"));
                 Vec::new()
             }
             None => Vec::new(),

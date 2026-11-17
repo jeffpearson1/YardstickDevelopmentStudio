@@ -260,17 +260,19 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     if for_open_recipe {
         super::recipe_header(app, ui);
     } else {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             theme::page_title(ui, "Icon finder");
             ui.label(RichText::new("installer resources · Wikidata · Chocolatey · vendor site · image search").weak());
         });
-        egui::Panel::left("icons-missing").resizable(true).default_size(260.0).show(ui, |ui| missing_panel(app, ui));
+        egui::Panel::left("icons-missing").resizable(true).default_size(260.0).frame(theme::pane_frame()).show(ui, |ui| missing_panel(app, ui));
     }
-    egui::Panel::right("icons-preview").resizable(true).default_size(330.0).show(ui, |ui| preview_panel(app, ui));
-    egui::ScrollArea::vertical().id_salt("icons-main").auto_shrink(false).show(ui, |ui| {
-        query_form(app, ui);
-        ui.separator();
-        candidate_grid(app, ui);
+    egui::Panel::right("icons-preview").resizable(true).default_size(330.0).frame(theme::pane_frame()).show(ui, |ui| preview_panel(app, ui));
+    theme::pane(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("icons-main").auto_shrink(false).show(ui, |ui| {
+            query_form(app, ui);
+            ui.separator();
+            candidate_grid(app, ui);
+        });
     });
 }
 

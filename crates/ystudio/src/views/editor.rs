@@ -21,7 +21,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     let mut jump = None;
     let r = app.recipe.as_mut().unwrap();
 
-    egui::Panel::right("editor-problems").resizable(true).default_size(340.0).show(ui, |ui| {
+    egui::Panel::right("editor-problems").resizable(true).default_size(340.0).frame(theme::pane_frame()).show(ui, |ui| {
         let errors = lint::count(&r.diagnostics, Severity::Error);
         let warnings = lint::count(&r.diagnostics, Severity::Warning);
         let hints = lint::count(&r.diagnostics, Severity::Hint);
@@ -31,11 +31,11 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             theme::badge(ui, warnings.to_string(), theme::amber());
             theme::badge(ui, hints.to_string(), theme::blue());
         });
-        ui.label(RichText::new("Click a problem to open its field in the Designer.").small().weak());
+        ui.label(RichText::new("Click a problem to open its field in Design.").small().weak());
         ui.separator();
         egui::ScrollArea::vertical().id_salt("problems").show(ui, |ui| {
             if r.diagnostics.is_empty() {
-                ui.colored_label(theme::green(), "\u{E73E}  Lint clean. Run schema validation on the Test Bench to confirm.");
+                ui.colored_label(theme::green(), "\u{E73E}  Lint clean. Run schema validation from Test to confirm.");
             }
             for d in &r.diagnostics {
                 let text = format!(
@@ -46,7 +46,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                 );
                 let resp = ui.add(egui::Label::new(RichText::new(text).color(theme::severity_color(d.severity))).sense(egui::Sense::click()));
                 if let Some(section) = d.field.as_deref().and_then(fields::spec_ci).map(|s| s.section)
-                    && resp.on_hover_text("Open in the Designer").clicked()
+                    && resp.on_hover_text("Open in Design").clicked()
                 {
                     jump = Some(section);
                 }
@@ -55,20 +55,22 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         });
     });
 
-    ui.checkbox(&mut line_numbers, "Line numbers");
-    let mut layouter = |ui: &Ui, text: &dyn egui::TextBuffer, wrap: f32| highlight::yaml_galley(ui, text.as_str(), font_size, dark, wrap);
-    egui::ScrollArea::vertical().id_salt("yaml-editor").auto_shrink(false).show(ui, |ui| {
-        let lines = highlight::line_count(&r.text);
-        let edit = egui::TextEdit::multiline(&mut r.text)
-            .code_editor()
-            .interactive(!r.read_only)
-            .desired_width(f32::INFINITY)
-            .desired_rows(40)
-            .lock_focus(true)
-            .layouter(&mut layouter);
-        if highlight::code_edit(ui, edit, line_numbers, lines, font_size).changed() {
-            r.changed();
-        }
+    theme::pane(ui, |ui| {
+        ui.checkbox(&mut line_numbers, "Line numbers");
+        let mut layouter = |ui: &Ui, text: &dyn egui::TextBuffer, wrap: f32| highlight::yaml_galley(ui, text.as_str(), font_size, dark, wrap);
+        egui::ScrollArea::vertical().id_salt("yaml-editor").auto_shrink(false).show(ui, |ui| {
+            let lines = highlight::line_count(&r.text);
+            let edit = egui::TextEdit::multiline(&mut r.text)
+                .code_editor()
+                .interactive(!r.read_only)
+                .desired_width(f32::INFINITY)
+                .desired_rows(40)
+                .lock_focus(true)
+                .layouter(&mut layouter);
+            if highlight::code_edit(ui, edit, line_numbers, lines, font_size).changed() {
+                r.changed();
+            }
+        });
     });
 
     if let Some(section) = jump {

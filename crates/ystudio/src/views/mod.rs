@@ -51,12 +51,12 @@ pub fn need_recipe(app: &mut StudioApp, ui: &mut Ui) -> bool {
     ui.label(RichText::new("No recipe is open.").heading());
     ui.label(RichText::new("Pick one in the library, or start a new one - written by the agent or from a template.").weak());
     ui.add_space(8.0);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if theme::primary(ui, true, format!("{}  Recipe Library", theme::icon::LIBRARY)).clicked() {
             app.view = crate::app::View::Recipes;
         }
         if ui.add_enabled(app.writable(), egui::Button::new("\u{E710}  New recipe…")).clicked() {
-            app.library.new_open = true;
+            batch::show_new_recipe(app);
         }
     });
     false
@@ -119,7 +119,7 @@ pub fn recipe_header(app: &mut StudioApp, ui: &mut Ui) {
     let id = r.id.clone();
     let mut save = false;
     let mut revert = false;
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(&r.id).monospace().size(24.0).strong());
         match &r.location {
             RecipeLocation::Development => theme::badge(ui, "development", theme::amber()),
@@ -141,13 +141,13 @@ pub fn recipe_header(app: &mut StudioApp, ui: &mut Ui) {
             if ui.add_enabled(r.dirty(), egui::Button::new("\u{E7A7}  Revert")).clicked() {
                 revert = true;
             }
-            if ui.small_button("\u{E838}").on_hover_text(format!("Open {} in VS Code / the default editor", r.path.display())).clicked() {
+            if ui.button("\u{E838}").on_hover_text(format!("Open {} in VS Code / the default editor", r.path.display())).clicked() {
                 open_external(&r.path);
             }
         });
     });
     let mut goto = None;
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         for (view, icon, name) in RECIPE_TABS {
             if ui.selectable_label(app.view == view, format!("{icon}  {name}")).clicked() && app.view != view {
                 goto = Some(view);

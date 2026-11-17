@@ -44,7 +44,11 @@
                     Description="Design, test and agentically author Yardstick recipes"
                     WorkingDirectory="INSTALLFOLDER"
                     Icon="AppIcon.ico"
-                    Advertise="yes" />
+                    Advertise="no">
+            <!-- Must match APP_USER_MODEL_ID in crates/ystudio/src/main.rs. -->
+            <ShortcutProperty Key="System.AppUserModel.ID"
+                              Value="YardstickContributors.YardstickDevelopmentStudio" />
+          </Shortcut>
         </File>
       </Component>
       <Component Id="LicenseFile" Bitness="always64">

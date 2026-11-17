@@ -8,7 +8,7 @@ use std::sync::mpsc::{Receiver, channel};
 
 use eframe::egui::{self, RichText, Ui};
 use ystudio_core::process::{ProcessSpec, RunningProcess, Stream};
-use ystudio_core::promote::{self, Evidence, Outcome, Repo};
+use ystudio_core::promote::{self, Evidence, Outcome, PullRequestStatus, Repo, Retirement};
 use ystudio_core::results::{InstallRun, RecipeResult, VALIDATION_PHASES};
 use ystudio_core::validation::Completion;
 use ystudio_core::workspace::RecipeLocation;
@@ -18,6 +18,7 @@ use crate::theme::{self, FluentText as _};
 
 /// Each recipe's id and what promoting it produced.
 type Results = Vec<(String, Result<Outcome, String>)>;
+type PullRequestResults = Result<(Vec<PullRequestStatus>, Vec<Retirement>), String>;
 
 #[derive(Default)]
 pub struct PromoteState {
@@ -33,6 +34,12 @@ pub struct PromoteState {
     pub(crate) repo: Option<(PathBuf, Result<Repo, String>, Option<PathBuf>)>,
     /// The open recipe last pre-selected, so unticking it sticks.
     followed: Option<String>,
+    /// Open Studio PRs and the background refresh that populates them.
+    pub(crate) pull_requests: Vec<PullRequestStatus>,
+    retirements: Vec<Retirement>,
+    pull_requests_rx: Option<Receiver<PullRequestResults>>,
+    pull_requests_error: Option<String>,
+    pub(crate) pull_requests_loaded: bool,
 }
 
 impl PromoteState {
@@ -48,6 +55,11 @@ fn repo(app: &mut StudioApp) -> Option<(Result<Repo, String>, Option<PathBuf>)> 
         let repo = promote::repo(app.ws.as_ref()?).map_err(|e| format!("{e:#}"));
         let gh = ystudio_core::process::find_program("gh", &[]);
         app.promote.repo = Some((root, repo, gh));
+        app.promote.pull_requests.clear();
+        app.promote.retirements.clear();
+        app.promote.pull_requests_error = None;
+        app.promote.pull_requests_loaded = false;
+        app.promote.pull_requests_rx = None;
     }
     app.promote.repo.as_ref().map(|(_, r, gh)| (r.clone(), gh.clone()))
 }
@@ -83,6 +95,10 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     ).weak());
     ui.add_space(6.0);
     let repo = repo(app);
+    poll_pull_requests(app);
+    if !app.promote.pull_requests_loaded && app.promote.pull_requests_rx.is_none() {
+        refresh_pull_requests(app);
+    }
     let share = app.ws.as_ref().and_then(|w| w.shared_icons.clone());
     theme::card(ui, |ui| {
         match &repo {
@@ -123,7 +139,8 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         app.promote.followed = open_id;
     }
     app.promote.selected.retain(|id| dev.contains(id));
-    egui::Panel::left("promote-list").resizable(true).default_size(420.0).show(ui, |ui| {
+    let list_width = (ui.available_width() * 0.34).clamp(220.0, 420.0);
+    egui::Panel::left("promote-list").resizable(true).default_size(list_width).frame(theme::pane_frame()).show(ui, |ui| {
         ui.label(RichText::new(format!("Development recipes ({})", dev.len())).semibold());
         if dev.is_empty() {
             ui.weak("Nothing in Recipes\\Development yet.");
@@ -147,6 +164,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         });
     });
 
+    theme::pane(ui, |ui| {
     let ids: Vec<String> = app.promote.selected.iter().cloned().collect();
     let running = app.promote.running();
     let repo_ok = matches!(repo, Some((Ok(_), _)));
@@ -175,12 +193,205 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             ));
         });
     }
+    ui.add_space(10.0);
+    pull_request_monitor(app, ui);
     ui.add_space(4.0);
     // The console already shows this job; a second copy only takes space.
     let in_console = app.console_open && app.console_job.is_some() && app.console_job == app.promote.job;
     if !in_console && let Some(job) = app.promote.job.and_then(|j| app.job_mut(j)) {
         job_log(ui, &mut job.proc, "promote");
     }
+    });
+}
+
+fn refresh_pull_requests(app: &mut StudioApp) {
+    if app.promote.pull_requests_rx.is_some() {
+        return;
+    }
+    let Some(ws) = app.ws.clone() else { return };
+    let root = ws.root.clone();
+    let Some((repo_result, gh)) = repo(app) else { return };
+    let Ok(repo) = repo_result else {
+        app.promote.pull_requests_loaded = true;
+        return;
+    };
+    let Some(gh) = gh else {
+        app.promote.pull_requests_loaded = true;
+        app.promote.pull_requests_error = Some("Install and sign in to GitHub CLI to monitor pull requests here.".into());
+        return;
+    };
+    app.promote.pull_requests_error = None;
+    let (tx, rx) = channel();
+    let waker = app.waker.clone();
+    std::thread::spawn(move || {
+        let result = promote::pull_requests(&root, &repo, &gh)
+            .map(|prs| {
+                let retirements = promote::retire_merged_recipes(&ws, &repo, &prs);
+                (prs, retirements)
+            })
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(result);
+        waker();
+    });
+    app.promote.pull_requests_rx = Some(rx);
+}
+
+fn poll_pull_requests(app: &mut StudioApp) {
+    let Some(result) = app.promote.pull_requests_rx.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
+    app.promote.pull_requests_rx = None;
+    app.promote.pull_requests_loaded = true;
+    match result {
+        Ok((prs, retirements)) => {
+            app.promote.pull_requests = prs;
+            let retired = retirements.iter().any(|r| r.retired);
+            app.promote.retirements = retirements;
+            app.promote.pull_requests_error = None;
+            if retired {
+                app.refresh_recipes();
+            }
+        }
+        Err(e) => app.promote.pull_requests_error = Some(e),
+    }
+}
+
+fn pull_request_monitor(app: &mut StudioApp, ui: &mut Ui) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Open pull requests").semibold());
+        if app.promote.pull_requests_rx.is_some() {
+            ui.spinner();
+            ui.label(RichText::new("Refreshing checks and activity…").small().weak());
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.add_enabled(app.promote.pull_requests_rx.is_none(), egui::Button::new("\u{E72C}  Refresh")).clicked() {
+                refresh_pull_requests(app);
+            }
+        });
+    });
+    ui.label(RichText::new("CI/CD checks, reviews and comments for pull requests opened from studio/<recipe> branches.").small().weak());
+    for retirement in &app.promote.retirements {
+        let color = if retirement.retired { theme::green() } else { theme::amber() };
+        theme::banner(ui, color, |ui| {
+            ui.label(RichText::new(if retirement.retired { "Development copy retired" } else { "Development copy kept" }).semibold().color(color));
+            ui.label(&retirement.message);
+        });
+        ui.add_space(4.0);
+    }
+    if let Some(error) = &app.promote.pull_requests_error {
+        theme::banner(ui, theme::red(), |ui| {
+            ui.label(error);
+            ui.label(RichText::new("Use Refresh after GitHub CLI is signed in or the connection is restored.").small());
+        });
+        return;
+    }
+    let prs: Vec<PullRequestStatus> = app
+        .promote
+        .pull_requests
+        .iter()
+        .filter(|pr| pr.state.eq_ignore_ascii_case("OPEN") || pr.state.is_empty())
+        .cloned()
+        .collect();
+    if app.promote.pull_requests_loaded && prs.is_empty() {
+        ui.weak("No open Recipe Builder pull requests.");
+        return;
+    }
+
+    egui::ScrollArea::vertical().id_salt("open-pr-monitor").max_height(420.0).show(ui, |ui| {
+        for (index, pr) in prs.into_iter().enumerate() {
+            let checks = check_summary(&pr);
+            let header = format!("{}  ·  PR #{}  ·  {}", pr.recipe_id, pr.number, checks);
+            egui::CollapsingHeader::new(RichText::new(header).strong()).id_salt(("pull-request", pr.number)).default_open(index == 0).show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if pr.draft { theme::badge(ui, "draft", theme::grey()); }
+                    if !pr.review_decision.is_empty() { theme::badge(ui, readable_state(&pr.review_decision), state_color(&pr.review_decision)); }
+                    if !pr.merge_state.is_empty() { theme::badge(ui, readable_state(&pr.merge_state), state_color(&pr.merge_state)); }
+                    ui.hyperlink_to("Open on GitHub", &pr.url);
+                });
+                if !pr.title.is_empty() {
+                    ui.label(&pr.title);
+                }
+                if !pr.updated_at.is_empty() {
+                    ui.label(RichText::new(format!("Updated {}", readable_time(&pr.updated_at))).small().weak());
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new(format!("Checks ({})", pr.checks.len())).small().strong());
+                if pr.checks.is_empty() {
+                    ui.weak("No CI/CD checks have reported yet.");
+                }
+                for check in &pr.checks {
+                    ui.horizontal_wrapped(|ui| {
+                        theme::badge(ui, readable_state(&check.state), state_color(&check.state));
+                        let label = if check.workflow.is_empty() { check.name.clone() } else { format!("{} · {}", check.workflow, check.name) };
+                        if check.url.is_empty() { ui.label(label); } else { ui.hyperlink_to(label, &check.url); }
+                    });
+                }
+                ui.add_space(6.0);
+                ui.label(RichText::new(format!("Activity ({})", pr.activity.len())).small().strong());
+                if pr.activity.is_empty() {
+                    ui.weak("No comments or reviews yet.");
+                }
+                for item in &pr.activity {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(if item.author.is_empty() { "Unknown" } else { &item.author }).strong());
+                        if item.author.to_ascii_lowercase().contains("copilot") {
+                            theme::badge(ui, "Copilot", theme::blue());
+                        }
+                        ui.label(RichText::new(&item.kind).small().weak());
+                        if !item.at.is_empty() { ui.label(RichText::new(readable_time(&item.at)).small().weak()); }
+                    });
+                    if !item.body.trim().is_empty() {
+                        let summary = truncate_text(item.body.trim(), 280);
+                        if item.url.is_empty() { ui.label(summary); } else { ui.hyperlink_to(summary, &item.url); }
+                    }
+                    ui.add_space(4.0);
+                }
+            });
+            ui.separator();
+        }
+    });
+}
+
+fn check_summary(pr: &PullRequestStatus) -> String {
+    if pr.checks.is_empty() {
+        return "checks pending".into();
+    }
+    let failed = pr.checks.iter().filter(|c| is_failed(&c.state)).count();
+    let running = pr.checks.iter().filter(|c| is_running(&c.state)).count();
+    if failed > 0 { format!("{failed} failed") } else if running > 0 { format!("{running} running") } else { format!("{} passed", pr.checks.len()) }
+}
+
+fn is_failed(state: &str) -> bool {
+    matches!(state.to_ascii_uppercase().as_str(), "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED")
+}
+
+fn is_running(state: &str) -> bool {
+    matches!(state.to_ascii_uppercase().as_str(), "" | "EXPECTED" | "PENDING" | "QUEUED" | "IN_PROGRESS" | "WAITING" | "REQUESTED")
+}
+
+fn state_color(state: &str) -> egui::Color32 {
+    let state = state.to_ascii_uppercase();
+    if is_failed(&state) || matches!(state.as_str(), "DIRTY" | "CHANGES_REQUESTED") {
+        theme::red()
+    } else if is_running(&state) || matches!(state.as_str(), "BLOCKED" | "BEHIND" | "UNKNOWN" | "REVIEW_REQUIRED") {
+        theme::amber()
+    } else {
+        theme::green()
+    }
+}
+
+fn readable_state(state: &str) -> String {
+    let words = state.replace('_', " ").to_ascii_lowercase();
+    let mut chars = words.chars();
+    chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()
+}
+
+fn readable_time(time: &str) -> String {
+    time.trim_end_matches('Z').replace('T', " ")
+}
+
+fn truncate_text(text: &str, max: usize) -> String {
+    let mut chars = text.chars();
+    let shortened: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() { shortened + "…" } else { shortened }
 }
 
 /// Pushes a branch per recipe in the background, streaming git's output to the console.
@@ -239,6 +450,7 @@ pub(crate) fn poll(app: &mut StudioApp) {
     if !failed.is_empty() {
         app.error(format!("Could not publish {}", failed.join("; ")));
     }
+    refresh_pull_requests(app);
 }
 
 /// The confirmation before pushing, and the browser prompts after.

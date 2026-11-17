@@ -63,8 +63,8 @@ pub enum View {
 }
 
 impl View {
-    /// The sidebar. The open recipe's pages (Designer, YAML, Test Bench,
-    /// Icons, Agent) are tabs under Recipe Library. Plugin tabs follow Publish
+    /// The sidebar. The open recipe's pages (Design, YAML, Test, Icon,
+    /// Agent) are tabs inside Recipe Builder. Plugin tabs follow Publish
     /// ([`View::NAV_PLUGINS_AT`]).
     pub const NAV: [(View, &'static str, &'static str); 7] = [
         (View::Home, theme::icon::HOME, "Home"),
@@ -134,6 +134,8 @@ pub enum JobKind {
     /// An agent reading a request list into batch items.
     BatchExtract { batch_id: String, backend: String },
     Clone { dest: PathBuf },
+    /// A plugin-owned development clone; it never replaces the open workspace.
+    PluginClone { plugin: String, setting: String, dest: PathBuf },
     /// Branches pushed and pull requests opened for promoted recipes.
     PullRequests,
     GitFetch,
@@ -1084,6 +1086,17 @@ impl StudioApp {
                     self.error("git clone failed - see the console.");
                 }
             }
+            JobKind::PluginClone { plugin, setting, dest } => {
+                if ok {
+                    self.settings.plugins.entry(plugin.clone()).or_default().values.insert(setting, dest.display().to_string());
+                    self.save_settings();
+                    self.notify(format!("Private Yardstick clone ready for {}.", self.plugins.get(&plugin).map(|p| p.manifest.name.as_str()).unwrap_or(&plugin)));
+                } else {
+                    self.console_job = Some(id);
+                    self.console_open = true;
+                    self.error("Could not create the plugin's private Yardstick clone - see the console.");
+                }
+            }
             // Outcomes arrive through the Publish view, which offers to open them.
             JobKind::PullRequests => {}
             JobKind::GitFetch => {
@@ -1270,10 +1283,17 @@ impl StudioApp {
         });
         ui.add_space(14.0);
         ui.spacing_mut().item_spacing.y = 0.0;
-        // Recipe pages belong to Recipe Library; the icon finder to Recipe Builder when it works for a batch item.
+        // Recipe editing is part of the unified Recipe Builder. The standalone
+        // icon finder still belongs to the Library unless it is working on a
+        // Builder item.
         let section = match self.view {
-            View::Designer | View::Editor | View::TestBench | View::Agent => View::Recipes,
+            View::Designer | View::Editor | View::TestBench | View::Agent => View::Batch,
             View::Icons if self.icons.batch_item.is_some() => View::Batch,
+            View::Icons
+                if self.recipe.as_ref().is_some_and(|r| self.icons.recipe_id.as_deref() == Some(r.id.as_str())) =>
+            {
+                View::Batch
+            }
             View::Icons => View::Recipes,
             v => v,
         };
@@ -1300,12 +1320,15 @@ impl StudioApp {
                 }
             }
             let busy = match view {
-                View::Recipes => {
-                    self.jobs.iter().any(|j| matches!(j.kind, JobKind::Agent { batch_item: None, .. }) && j.proc.is_running())
-                        || self.icons.searching()
+                View::Recipes => self.icons.searching(),
+                View::Batch => {
+                    self.workflow.busy()
+                        || self.jobs.iter().any(|j| {
+                            matches!(j.kind, JobKind::BatchExtract { .. } | JobKind::Agent { batch_item: None, .. }) && j.proc.is_running()
+                        })
                         || self.bench.last_job.and_then(|id| self.job(id)).is_some_and(|j| j.proc.is_running())
+                        || !self.batch.queue.is_empty()
                 }
-                View::Batch => self.workflow.busy() || self.jobs.iter().any(|j| matches!(j.kind, JobKind::BatchExtract { .. }) && j.proc.is_running()) || !self.batch.queue.is_empty(),
                 View::Settings => self.update.badge_version(&self.settings.skipped_update).is_some(),
                 _ => false,
             };
@@ -1506,7 +1529,13 @@ pub fn job_log(ui: &mut Ui, proc: &mut RunningProcess, salt: &str) {
                     Stream::Stderr => stderr_color,
                     Stream::Studio => theme::blue(),
                 };
-                ui.label(RichText::new(&line.text).monospace().color(color));
+                // `show_rows` requires every child to have exactly `row_h` height.
+                // Keep process output on one line so long commands scroll sideways
+                // instead of changing the virtual row geometry between repaints.
+                ui.add(
+                    egui::Label::new(RichText::new(&line.text).monospace().color(color))
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                );
             }
         });
 }
@@ -1569,6 +1598,7 @@ impl StudioApp {
         self.pending_modal(&ctx);
         views::recipes::windows(self, &ctx);
         views::batch::paste_window(self, &ctx);
+        views::batch::modals(self, &ctx);
         views::testbench::live_modal(self, &ctx);
         views::promote::modals(self, &ctx);
         crate::workflow::modal(self, &ctx);
@@ -1609,11 +1639,14 @@ impl StudioApp {
             match self.view {
                 View::Home => views::home::show(self, ui),
                 View::Recipes => views::recipes::show(self, ui),
-                View::Designer => views::designer::show(self, ui),
-                View::Editor => views::editor::show(self, ui),
-                View::TestBench => views::testbench::show(self, ui),
-                View::Agent => views::agent::show(self, ui),
+                View::Designer | View::Editor | View::TestBench | View::Agent => views::batch::show_recipe(self, ui),
                 View::Batch => views::batch::show(self, ui),
+                View::Icons
+                    if self.icons.batch_item.is_none()
+                        && self.recipe.as_ref().is_some_and(|r| self.icons.recipe_id.as_deref() == Some(r.id.as_str())) =>
+                {
+                    views::batch::show_recipe(self, ui)
+                }
                 View::Icons => views::icons::show(self, ui),
                 View::Runs => views::runs::show(self, ui),
                 View::Docs => views::docs::show(self, ui),
@@ -1667,6 +1700,22 @@ mod bench_tests {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
+    #[test]
+    fn long_console_lines_keep_the_virtual_row_height() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            ui.set_max_width(120.0);
+            let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+            let response = ui.add(
+                egui::Label::new(RichText::new("a long console line that must scroll horizontally instead of wrapping").monospace())
+                    .wrap_mode(egui::TextWrapMode::Extend),
+            );
+            assert!(response.rect.height() <= row_h);
+        });
+        assert!(!output.shapes.is_empty());
+        output.textures_delta.clear();
+    }
 
     #[test]
     fn small_windows_get_a_scrolled_layout_at_the_minimum_size() {

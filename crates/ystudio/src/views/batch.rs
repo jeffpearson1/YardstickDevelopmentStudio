@@ -2,16 +2,38 @@
 //! pull out the software to package with a quick scan or an agent, then work
 //! through the items - agent runs, icons, recipe matches - and report back.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, RichText, Ui};
 use ystudio_core::agent::{self, AgentTask, Snapshot};
 use ystudio_core::icons;
 use ystudio_core::intake::{self, Batch, BatchCheck, BatchItem, ItemAction, ItemStatus, RequestKind};
+use ystudio_core::recipe::{self, RecipeDoc};
 
 use crate::app::{JobKind, StudioApp, View, job_log};
 use crate::theme::{self, FluentText as _};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum AddAction { Existing, #[default] New, Import, Paste }
+
+#[derive(Clone)]
+enum RemoveScope {
+    Selected(Vec<usize>),
+    Clear,
+}
+
+#[derive(Default)]
+pub struct NewRecipeDraft {
+    pub display: String,
+    pub publisher: String,
+    pub id: String,
+    pub id_touched: bool,
+    pub vendor: String,
+    pub notes: String,
+    template: usize,
+    templates: Option<Vec<PathBuf>>,
+}
 
 #[derive(Default)]
 pub struct BatchState {
@@ -26,12 +48,104 @@ pub struct BatchState {
     verification: Option<crate::workflow::Options>,
     /// Text being pasted as a new request list; `Some` while the window is open.
     pub paste: Option<String>,
+    pub(crate) selected_items: BTreeSet<usize>,
+    composing: bool,
+    pub new_recipe: NewRecipeDraft,
+    last_add: AddAction,
+    dirty: bool,
+    pending_remove: Option<RemoveScope>,
+    pending_batch: Option<Batch>,
+    save_as: Option<String>,
 }
 
 impl BatchState {
     pub fn busy(&self, app_jobs: &StudioApp) -> bool {
         crate::workflow::busy(app_jobs) || !self.queue.is_empty()
     }
+}
+
+pub fn show_new_recipe(app: &mut StudioApp) {
+    app.batch.composing = true;
+    app.batch.last_add = AddAction::New;
+    app.view = View::Batch;
+}
+
+pub fn contains_recipe(app: &StudioApp, id: &str) -> bool {
+    app.batch.batch.as_ref().is_some_and(|b| b.items.iter().any(|it| {
+        it.existing_recipe.eq_ignore_ascii_case(id) || it.suggested_id.eq_ignore_ascii_case(id)
+            || it.recipes.iter().any(|r| r.eq_ignore_ascii_case(id))
+    }))
+}
+
+pub fn add_existing_recipe(app: &mut StudioApp, id: &str) {
+    if contains_recipe(app, id) {
+        app.notify(format!("{id} is already in the Recipe Builder list."));
+        return;
+    }
+    let name = app.recipes.iter().find(|r| r.id.eq_ignore_ascii_case(id))
+        .map(|r| r.meta.display_name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| id.to_string());
+    append_items(app, vec![BatchItem { app: name, existing_recipe: id.to_string(), request: RequestKind::Existing, ..Default::default() }]);
+    app.notify(format!("Added {id} to Recipe Builder."));
+}
+
+fn append_items(app: &mut StudioApp, items: Vec<BatchItem>) -> Vec<usize> {
+    if app.batch.batch.is_none() {
+        app.batch.batch = Some(Batch::from_items("recipe builder", Vec::new()));
+    }
+    let batch = app.batch.batch.as_mut().unwrap();
+    let mut added = Vec::new();
+    let mut changed = false;
+    for mut item in items {
+        let key = item_key(&item);
+        if let Some(existing) = batch.items.iter_mut().find(|it| !key.is_empty() && item_key(it).eq_ignore_ascii_case(&key)) {
+            if !item.notes.trim().is_empty() && !existing.notes.contains(item.notes.trim()) {
+                if !existing.notes.is_empty() { existing.notes.push_str("\n\n"); }
+                existing.notes.push_str(item.notes.trim());
+                changed = true;
+            }
+            continue;
+        }
+        let n = batch.items.len();
+        if item.source.is_empty() {
+            item.source = format!("#{}", n + 1);
+        }
+        item.include = true;
+        batch.records.push(intake::Record { reference: item.source.clone(), title: item.app.clone(), body: item.notes.clone(), fields: Vec::new() });
+        batch.items.push(item);
+        added.push(n);
+    }
+    if let Some(&n) = added.last() { app.batch.selected = Some(n); }
+    if changed || !added.is_empty() {
+        app.batch.dirty = true;
+        save(app);
+    }
+    added
+}
+
+/// Brings a plugin work item back into the reusable-recipe workflow.
+pub fn add_plugin_work_item(app: &mut StudioApp, title: &str, reference: &str, notes: &str) -> bool {
+    let added = append_items(app, vec![BatchItem {
+        source: reference.to_string(),
+        app: title.to_string(),
+        notes: notes.to_string(),
+        request: RequestKind::New,
+        include: true,
+        ..Default::default()
+    }]);
+    if added.is_empty() {
+        app.notify(format!("{title} is already in Recipe Builder."));
+        false
+    } else {
+        app.view = View::Batch;
+        app.notify(format!("Added {title} to Recipe Builder with its plugin context."));
+        true
+    }
+}
+
+fn item_key(item: &BatchItem) -> String {
+    if !item.existing_recipe.trim().is_empty() { item.existing_recipe.trim().to_string() }
+    else if !item.suggested_id.trim().is_empty() { item.suggested_id.trim().to_string() }
+    else { item.recipe_id() }
 }
 
 fn status_badge(ui: &mut Ui, s: ItemStatus) {
@@ -51,6 +165,10 @@ fn status_badge(ui: &mut Ui, s: ItemStatus) {
 fn item_status_badge(app: &StudioApp, ui: &mut Ui, it: &BatchItem) {
     if it.status != ItemStatus::Done {
         return status_badge(ui, it.status);
+    }
+    if !it.is_recipe_work() {
+        theme::badge(ui, "sent to plugin", theme::green()).on_hover_text("This request is now a plugin work item and is excluded from Recipe Builder batch actions.");
+        return;
     }
     match it.action {
         ItemAction::Review => {
@@ -103,17 +221,31 @@ pub fn open_file(app: &mut StudioApp, path: &Path) {
             let format = doc.format.clone();
             let batch = Batch::new(doc, &app.recipes);
             let items = batch.items.len();
-            app.batch.batch = Some(batch);
-            app.batch.selected = None;
-            app.batch.saved = None;
-            save(app);
+            offer_batch(app, batch);
             app.notify(format!("Read {n} request(s) from {} ({format}); the quick scan found {items} item(s).", path.display()));
         }
         Err(e) => app.error(format!("Could not read {}: {e:#}", path.display())),
     }
 }
 
+fn set_batch(app: &mut StudioApp, batch: Batch) {
+    app.batch.batch = Some(batch);
+    app.batch.selected = None;
+    app.batch.selected_items.clear();
+    app.batch.saved = None;
+    app.batch.composing = false;
+    app.batch.dirty = false;
+    save(app);
+}
+
+fn offer_batch(app: &mut StudioApp, batch: Batch) {
+    if app.batch.batch.as_ref().is_some_and(|b| !b.items.is_empty()) { app.batch.pending_batch = Some(batch); }
+    else { set_batch(app, batch); }
+    app.view = View::Batch;
+}
+
 /// Opens a request made in the Studio (see [`Batch::from_items`]) in Recipe Builder.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn open_made(app: &mut StudioApp, batch: Batch) -> bool {
     if app.batch.busy(app) {
         app.error("Finish or cancel the active batch/agent/test run first.");
@@ -121,7 +253,9 @@ pub(crate) fn open_made(app: &mut StudioApp, batch: Batch) -> bool {
     }
     app.batch.batch = Some(batch);
     app.batch.selected = None;
+    app.batch.selected_items.clear();
     app.batch.saved = None;
+    app.batch.composing = false;
     save(app);
     app.view = View::Batch;
     true
@@ -130,23 +264,30 @@ pub(crate) fn open_made(app: &mut StudioApp, batch: Batch) -> bool {
 /// A new recipe as a one-item request: the agent writes it, then the Studio
 /// tests and repairs it, exactly like an item from an imported list.
 pub fn start_new_recipe(app: &mut StudioApp, item: BatchItem) -> bool {
-    let name = format!("new {}", item.app);
-    if !open_made(app, Batch::from_items(&name, vec![item])) {
+    if app.batch.busy(app) {
+        app.error("Finish or cancel the active batch/agent/test run first.");
         return false;
     }
-    crate::workflow::request(app, crate::workflow::Request::BatchAuthor(vec![0]));
+    let added = append_items(app, vec![item]);
+    let Some(&n) = added.first() else { return false };
+    app.batch.composing = false;
+    app.view = View::Batch;
+    crate::workflow::request(app, crate::workflow::Request::BatchAuthor(vec![n]));
     true
 }
 
 /// Existing recipes as one request, to re-test, repair or update together.
 pub fn start_update_request(app: &mut StudioApp, ids: &[String], notes: &str) -> bool {
     let items = update_items(app, ids, notes);
-    let name = if ids.len() == 1 { format!("update {}", ids[0]) } else { format!("update {} recipes", ids.len()) };
-    let ok = open_made(app, Batch::from_items(&name, items));
-    if ok {
+    if app.batch.busy(app) {
+        app.error("Finish or cancel the active batch/agent/test run first.");
+        false
+    } else {
+        append_items(app, items);
+        app.view = View::Batch;
         app.notify("Choose what to do with them: test them, repair failures with the agent, or have the agent update them.");
+        true
     }
-    ok
 }
 
 pub(crate) fn update_items(app: &StudioApp, ids: &[String], notes: &str) -> Vec<BatchItem> {
@@ -197,6 +338,219 @@ pub fn paste_window(app: &mut StudioApp, ctx: &egui::Context) {
     }
 }
 
+fn item_contains_recipe(item: &BatchItem, id: &str) -> bool {
+    item.existing_recipe.eq_ignore_ascii_case(id)
+        || item.suggested_id.eq_ignore_ascii_case(id)
+        || item.recipes.iter().any(|recipe| recipe.eq_ignore_ascii_case(id))
+        || item.recipe_id().eq_ignore_ascii_case(id)
+}
+
+fn removal_indices(app: &StudioApp, scope: &RemoveScope) -> Vec<usize> {
+    match scope {
+        RemoveScope::Selected(indices) => indices.clone(),
+        RemoveScope::Clear => (0..app.batch.batch.as_ref().map_or(0, |batch| batch.items.len())).collect(),
+    }
+}
+
+fn open_recipe_in_scope(app: &StudioApp, scope: &RemoveScope) -> Option<String> {
+    let id = app.recipe.as_ref()?.id.clone();
+    let batch = app.batch.batch.as_ref()?;
+    removal_indices(app, scope)
+        .into_iter()
+        .any(|index| batch.items.get(index).is_some_and(|item| item_contains_recipe(item, &id)))
+        .then_some(id)
+}
+
+fn request_removal(app: &mut StudioApp, scope: RemoveScope) {
+    // Clearing always asks for confirmation. Removing selected entries only
+    // interrupts when it also affects the recipe open in the editor.
+    if matches!(scope, RemoveScope::Clear) || open_recipe_in_scope(app, &scope).is_some() {
+        app.batch.pending_remove = Some(scope);
+    } else {
+        apply_removal(app, &scope, false);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn prompt_clear_for_tests(app: &mut StudioApp) {
+    request_removal(app, RemoveScope::Clear);
+}
+
+#[cfg(test)]
+pub(crate) fn dismiss_removal_for_tests(app: &mut StudioApp) {
+    app.batch.pending_remove = None;
+}
+
+fn apply_removal(app: &mut StudioApp, scope: &RemoveScope, keep_editor: bool) {
+    let removed_open = open_recipe_in_scope(app, scope);
+    let mut indices = removal_indices(app, scope);
+    indices.sort_unstable();
+    indices.dedup();
+    indices.sort_unstable_by(|a, b| b.cmp(a));
+    if let Some(batch) = &mut app.batch.batch {
+        for index in indices {
+            if index < batch.items.len() {
+                batch.items.remove(index);
+            }
+        }
+        let retained_sources: BTreeSet<String> = batch.items.iter().map(|item| item.source.clone()).collect();
+        batch.records.retain(|record| retained_sources.contains(&record.reference));
+    }
+    app.batch.selected_items.clear();
+    app.batch.selected = None;
+    app.batch.dirty = true;
+    save(app);
+
+    if !keep_editor
+        && let Some(id) = removed_open
+    {
+        let recipe_tab = matches!(app.view, View::Designer | View::Editor | View::TestBench | View::Agent)
+            || (app.view == View::Icons && app.icons.batch_item.is_none() && app.icons.recipe_id.as_deref() == Some(id.as_str()));
+        app.recipe = None;
+        if recipe_tab {
+            app.view = View::Batch;
+        }
+    }
+}
+
+pub fn modals(app: &mut StudioApp, ctx: &egui::Context) {
+    if let Some(scope) = app.batch.pending_remove.clone() {
+        let open = open_recipe_in_scope(app, &scope);
+        let dirty = open.as_ref().is_some_and(|_| app.recipe.as_ref().is_some_and(|recipe| recipe.dirty()));
+        let mut choice = None;
+        egui::Modal::new(egui::Id::unique("builder-remove-recipes")).show(ctx, |ui| {
+            ui.set_max_width(620.0);
+            let clearing = matches!(scope, RemoveScope::Clear);
+            ui.label(RichText::new(if clearing { "Clear the working list?" } else { "Remove selected recipes?" }).heading());
+            if let Some(id) = &open {
+                if dirty {
+                    ui.label(format!("'{id}' is open in the editor and has unsaved changes."));
+                } else {
+                    ui.label(format!("'{id}' is open in the editor and is included in this removal."));
+                }
+                ui.label(RichText::new("Recipe files on disk are not deleted.").small().weak());
+                ui.horizontal_wrapped(|ui| {
+                    if dirty && theme::primary(ui, true, "\u{E74E}  Save and remove").clicked() { choice = Some(0); }
+                    if dirty && ui.button("Discard edits and remove").clicked() { choice = Some(1); }
+                    if !dirty && theme::primary(ui, true, if clearing { "Clear list" } else { "Remove selected" }).clicked() { choice = Some(1); }
+                    if ui.button("Keep in editor").on_hover_text("Remove the list entries but leave this recipe open in the editor").clicked() { choice = Some(2); }
+                    if ui.button("Cancel").clicked() { choice = Some(3); }
+                });
+            } else {
+                ui.label(if clearing {
+                    "This removes every entry from Recipe Builder. Recipe files on disk are not deleted."
+                } else {
+                    "This removes the selected entries from Recipe Builder. Recipe files on disk are not deleted."
+                });
+                ui.horizontal(|ui| {
+                    if theme::primary(ui, true, if clearing { "Clear list" } else { "Remove selected" }).clicked() { choice = Some(1); }
+                    if ui.button("Cancel").clicked() { choice = Some(3); }
+                });
+            }
+        });
+        match choice {
+            Some(0) => {
+                if app.save_recipe() {
+                    apply_removal(app, &scope, false);
+                    app.batch.pending_remove = None;
+                }
+            }
+            Some(1) => {
+                apply_removal(app, &scope, false);
+                app.batch.pending_remove = None;
+            }
+            Some(2) => {
+                apply_removal(app, &scope, true);
+                app.batch.pending_remove = None;
+            }
+            Some(3) => app.batch.pending_remove = None,
+            _ => {}
+        }
+    }
+
+    if app.batch.pending_batch.is_some() {
+        let current = app.batch.batch.as_ref().map_or(0, |b| b.items.len());
+        let incoming = app.batch.pending_batch.as_ref().map_or(0, |b| b.items.len());
+        let mut choice = None;
+        egui::Modal::new(egui::Id::unique("builder-open-conflict")).show(ctx, |ui| {
+            ui.set_max_width(540.0);
+            ui.label(RichText::new("Add to or replace the working list?").heading());
+            ui.label(format!("Recipe Builder already has {current} item(s). The list you opened contains {incoming}."));
+            ui.horizontal_wrapped(|ui| {
+                if theme::primary(ui, true, "Append").on_hover_text("Keep the current list and add every incoming batch item at the end.").clicked() { choice = Some(0); }
+                if ui.button("Save and replace").clicked() { choice = Some(1); }
+                if ui.button("Replace without saving").clicked() { choice = Some(2); }
+                if ui.button("Cancel").clicked() { choice = Some(3); }
+            });
+            if app.batch.dirty { ui.label(RichText::new("The current list has unsaved changes.").small().color(theme::amber())); }
+        });
+        match choice {
+            Some(0) => { let incoming = app.batch.pending_batch.take().unwrap(); append_batch(app, incoming); }
+            Some(1) => {
+                save(app);
+                let incoming = app.batch.pending_batch.take().unwrap();
+                set_batch(app, incoming);
+                app.notify("Saved the previous list and opened the new one.");
+            }
+            Some(2) => { let incoming = app.batch.pending_batch.take().unwrap(); set_batch(app, incoming); }
+            Some(3) => app.batch.pending_batch = None,
+            _ => {}
+        }
+    }
+
+    if let Some(name) = &mut app.batch.save_as {
+        let (mut do_save, mut cancel) = (false, false);
+        egui::Modal::new(egui::Id::unique("builder-save-as")).show(ctx, |ui| {
+            ui.set_max_width(440.0);
+            ui.label(RichText::new("Save working list as").heading());
+            ui.label("Give this Recipe Builder session a recognizable name.");
+            ui.add(egui::TextEdit::singleline(name).hint_text("e.g. November application requests").desired_width(f32::INFINITY));
+            ui.horizontal(|ui| {
+                do_save = theme::primary(ui, !name.trim().is_empty(), "Save").clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if do_save {
+            let name = app.batch.save_as.take().unwrap();
+            if let Some(batch) = &mut app.batch.batch {
+                let stem: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+                batch.id = format!("{}-{}", intake::timestamp().replace([':', ' ', '-'], ""), stem.trim_matches('-').chars().take(40).collect::<String>());
+                batch.source = PathBuf::from(name.trim());
+                batch.format = "saved Recipe Builder list".into();
+            }
+            save(app);
+            app.batch.saved = None;
+            app.batch.dirty = false;
+            app.notify("Recipe Builder list saved.");
+        } else if cancel { app.batch.save_as = None; }
+    }
+}
+
+fn append_batch(app: &mut StudioApp, incoming: Batch) {
+    if app.batch.batch.is_none() { set_batch(app, incoming); return; }
+    let current = app.batch.batch.as_mut().unwrap();
+    let mut added = 0;
+    for mut item in incoming.items {
+        let old_source = item.source.clone();
+        let mut source = old_source.clone();
+        let mut suffix = 2;
+        while current.records.iter().any(|r| r.reference == source) { source = format!("{old_source} ({suffix})"); suffix += 1; }
+        if let Some(mut record) = incoming.records.iter().find(|r| r.reference == old_source).cloned() {
+            record.reference = source.clone();
+            current.records.push(record);
+        } else {
+            current.records.push(intake::Record { reference: source.clone(), title: item.app.clone(), body: item.notes.clone(), fields: Vec::new() });
+        }
+        item.source = source;
+        current.items.push(item);
+        added += 1;
+    }
+    app.batch.dirty = added > 0;
+    app.batch.selected = current.items.len().checked_sub(1);
+    save(app);
+    app.notify(format!("Appended {added} recipe{} to the working list.", if added == 1 { "" } else { "s" }));
+}
+
 pub fn open_saved(app: &mut StudioApp, dir: &Path) {
     match Batch::load(dir) {
         Ok(mut b) => {
@@ -209,8 +563,7 @@ pub fn open_saved(app: &mut StudioApp, dir: &Path) {
                     }
                 }
             }
-            app.batch.batch = Some(b);
-            app.batch.selected = None;
+            offer_batch(app, b);
         }
         Err(e) => app.error(format!("Could not open the batch: {e:#}")),
     }
@@ -236,6 +589,9 @@ fn icon_state(app: &StudioApp, it: &BatchItem) -> (String, egui::Color32) {
 
 pub(crate) fn task_for(app: &StudioApp, b: &Batch, idx: usize) -> Option<AgentTask> {
     let it = b.items.get(idx)?;
+    if !it.is_recipe_work() {
+        return None;
+    }
     // Runs started from a recipe's Agent tab repeat exactly what was asked.
     if let Some(task) = it.explicit_task() {
         return Some(task);
@@ -438,7 +794,7 @@ pub fn checks_progress(app: &mut StudioApp, items: &[(String, usize)], note: &st
 
 fn test_targets(batch: &Batch) -> Vec<crate::workflow::Target> {
     let mut targets: Vec<crate::workflow::Target> = Vec::new();
-    for (idx, item) in batch.items.iter().enumerate().filter(|(_, i)| i.include && i.request != RequestKind::NotSoftware) {
+    for (idx, item) in batch.items.iter().enumerate().filter(|(_, i)| i.include && i.is_recipe_work() && i.request != RequestKind::NotSoftware) {
         let ids = if item.recipes.is_empty() { vec![item.recipe_id()] } else { item.recipes.clone() };
         for id in ids {
             if let Some(target) = targets.iter_mut().find(|t| t.id.eq_ignore_ascii_case(&id)) {
@@ -468,8 +824,9 @@ fn repair_targets(app: &StudioApp, batch: &Batch) -> Vec<crate::workflow::Target
 /// Called by the app when an extraction agent ends.
 pub fn extract_finished(app: &mut StudioApp, batch_id: &str, ok: bool, backend: &str) {
     let recipes = app.recipes.clone();
+    let plugin_ids: Vec<String> = app.plugins.registry.plugins.iter().map(|p| p.manifest.id.clone()).collect();
     let mut result = Err(anyhow::anyhow!("batch not found"));
-    with_batch(app, batch_id, |b| result = b.load_agent_items(&b.dir(), &recipes, backend));
+    with_batch(app, batch_id, |b| result = b.load_agent_items(&b.dir(), &recipes, &plugin_ids, backend));
     match result {
         Ok(n) => {
             app.batch.selected = None;
@@ -489,7 +846,7 @@ pub fn icon_saved(app: &mut StudioApp, batch_id: &str, idx: usize, file: &str) {
 }
 
 pub fn show(app: &mut StudioApp, ui: &mut Ui) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         theme::page_title(ui, "Recipe Builder");
         ui.label(RichText::new("new recipes, imported request lists and recipe updates - written, tested and repaired together").weak());
     });
@@ -501,70 +858,281 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         open_file(app, &p);
     }
 
-    toolbar(app, ui);
-    ui.separator();
+    egui::Panel::left("builder-working-list")
+        .resizable(true)
+        .default_size(250.0)
+        .size_range(210.0..=380.0)
+        .frame(theme::pane_frame())
+        .show(ui, |ui| working_list(app, ui));
+    if app.batch.composing {
+        theme::pane(ui, |ui| new_recipe_form(app, ui));
+        return;
+    }
+    theme::pane(ui, |ui| {
+        toolbar(app, ui);
+        ui.separator();
+    });
     if app.batch.batch.is_none() {
-        start_page(app, ui);
+        theme::pane(ui, |ui| start_page(app, ui));
         return;
     }
     if app.batch.selected.is_some() {
-        egui::Panel::right("batch-detail").resizable(true).default_size(380.0).show(ui, |ui| detail(app, ui));
+        egui::Panel::right("batch-detail")
+            .resizable(true)
+            .default_size(380.0)
+            .frame(theme::pane_frame())
+            .show(ui, |ui| detail(app, ui));
     }
-    items_header(app, ui);
-    let show_log = app.batch.show_log;
-    let log_job = if app.workflow.busy() { app.workflow.last_job } else { app.batch.run_job.or(app.batch.extract_job) };
-    // The console already shows this job; a second copy only takes space.
-    let in_console = app.console_open && app.console_job.is_some() && app.console_job == log_job;
-    // Below the header, and only when the table keeps room for its rows; the
-    // Jobs console shows the same output in a short window.
-    let room = ui.available_height() - TABLE_MIN_HEIGHT;
-    if show_log && !in_console && room >= LOG_MIN_HEIGHT && let Some(id) = log_job {
-        egui::Panel::bottom("batch-log").resizable(true).default_size(220.0).size_range(LOG_MIN_HEIGHT..=room).show(ui, |ui| {
-            if let Some(job) = app.job_mut(id) {
-                job_log(ui, &mut job.proc, "batch");
-            }
-        });
+    theme::pane(ui, |ui| {
+        items_header(app, ui);
+        let show_log = app.batch.show_log;
+        let log_job = if app.workflow.busy() { app.workflow.last_job } else { app.batch.run_job.or(app.batch.extract_job) };
+        // The console already shows this job; a second copy only takes space.
+        let in_console = app.console_open && app.console_job.is_some() && app.console_job == log_job;
+        // Below the header, and only when the table keeps room for its rows; the
+        // Jobs console shows the same output in a short window.
+        let room = ui.available_height() - TABLE_MIN_HEIGHT;
+        if show_log && !in_console && room >= LOG_MIN_HEIGHT && let Some(id) = log_job {
+            egui::Panel::bottom("batch-log").resizable(true).default_size(220.0).size_range(LOG_MIN_HEIGHT..=room).show(ui, |ui| {
+                if let Some(job) = app.job_mut(id) {
+                    job_log(ui, &mut job.proc, "batch");
+                }
+            });
+        }
+        items_rows(app, ui);
+    });
+}
+
+/// The single-recipe tools inside the unified Recipe Builder. The current
+/// recipe page remains in `app.view`, so the existing tab routing, shortcuts,
+/// and per-page state continue to work while the Builder list stays visible.
+pub fn show_recipe(app: &mut StudioApp, ui: &mut Ui) {
+    let remaining = app.batch.batch.as_ref().map_or(0, |batch| {
+        batch.items.iter().filter(|item| item.include && item.is_recipe_work() && item.request != RequestKind::NotSoftware && item.status != ItemStatus::Done).count()
+    });
+    let running = app.batch.busy(app);
+    let mut back = false;
+    ui.horizontal_wrapped(|ui| {
+        theme::page_title(ui, "Recipe Builder");
+        ui.label(RichText::new("edit and validate one recipe without leaving the working list").weak());
+        if running {
+            theme::badge(ui, "batch running", theme::blue());
+        } else if remaining > 0 {
+            theme::badge(ui, format!("{remaining} remaining"), theme::amber());
+        }
+        back = ui.button("\u{E72B}  Batch overview").on_hover_text("Return to the batch controls; this recipe and all batch progress stay open").clicked();
+    });
+    egui::Panel::left("builder-recipe-working-list")
+        .resizable(true)
+        .default_size(210.0)
+        .size_range(180.0..=320.0)
+        .frame(theme::pane_frame())
+        .show(ui, |ui| working_list(app, ui));
+    theme::pane(ui, |ui| match app.view {
+        View::Designer => super::designer::show(app, ui),
+        View::Editor => super::editor::show(app, ui),
+        View::TestBench => super::testbench::show(app, ui),
+        View::Icons => super::icons::show(app, ui),
+        View::Agent => super::agent::show(app, ui),
+        _ => {}
+    });
+    if back {
+        app.view = View::Batch;
     }
-    items_rows(app, ui);
 }
 
 /// Room kept for the table's header and a few rows.
 const TABLE_MIN_HEIGHT: f32 = 140.0;
 const LOG_MIN_HEIGHT: f32 = 90.0;
 
+fn working_list(app: &mut StudioApp, ui: &mut Ui) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Working list").heading());
+        if app.batch.dirty { theme::badge(ui, "unsaved", theme::amber()); }
+    });
+    ui.add_space(4.0);
+    let count = app.batch.batch.as_ref().map_or(0, |b| b.items.len());
+    let picked = app.batch.selected_items.len();
+    let summary = if picked == 0 {
+        format!("{count} recipe{}", if count == 1 { "" } else { "s" })
+    } else {
+        format!("{count} recipes · {picked} selected")
+    };
+    ui.label(RichText::new(summary).small().weak());
+    ui.separator();
+    let rows: Vec<(usize, BatchItem)> = app.batch.batch.as_ref().map(|b| b.items.iter().cloned().enumerate().collect()).unwrap_or_default();
+    let busy = app.batch.busy(app);
+    let mut active = None;
+    let list_height = (ui.available_height() - 74.0).max(120.0);
+    egui::ScrollArea::vertical().id_salt("builder-working-items").max_height(list_height).auto_shrink(false).show(ui, |ui| {
+        for (n, item) in rows {
+            let mut checked = app.batch.selected_items.contains(&n);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!busy, egui::Checkbox::without_text(&mut checked))
+                    .on_hover_text("Select this recipe for batch actions")
+                    .changed()
+                {
+                    if checked { app.batch.selected_items.insert(n); } else { app.batch.selected_items.remove(&n); }
+                }
+                let title = if item.app.trim().is_empty() { item_key(&item) } else { item.app.clone() };
+                let selected = !app.batch.composing && app.batch.selected == Some(n);
+                if ui.add(egui::Button::selectable(selected, RichText::new(title).semibold())).clicked() { active = Some(n); }
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(28.0);
+                let id = item_key(&item);
+                if !id.is_empty() { ui.label(RichText::new(id).small().monospace().weak()); }
+                item_status_badge(app, ui, &item);
+            });
+            ui.add_space(2.0);
+        }
+        if count == 0 {
+            ui.add_space(12.0);
+            ui.label(RichText::new("Add an existing recipe, create a new one, or import a request list.").weak());
+        }
+    });
+    if let Some(n) = active {
+        app.batch.selected = Some(n);
+        app.batch.composing = false;
+        let id = app.batch.batch.as_ref().and_then(|b| b.items.get(n)).and_then(|item| existing(app, item)).map(|r| r.id.clone());
+        if let Some(id) = id
+            && app.open_recipe_by_id(&id)
+        {
+            app.view = View::Designer;
+        }
+    }
+    ui.separator();
+    let mut action = None;
+    ui.horizontal(|ui| {
+        if ui.add_enabled(!busy, egui::Button::new("\u{E710}")).on_hover_text("Repeat the last Add action").clicked() { action = Some(app.batch.last_add); }
+        ui.menu_button("\u{E70D}", |ui| {
+            if ui.button("Add existing recipe…").clicked() { action = Some(AddAction::Existing); ui.close(); }
+            if ui.button("Create new recipe…").clicked() { action = Some(AddAction::New); ui.close(); }
+            ui.separator();
+            if ui.button("Import request list…").clicked() { action = Some(AddAction::Import); ui.close(); }
+            if ui.button("Paste request list…").clicked() { action = Some(AddAction::Paste); ui.close(); }
+        }).response.on_hover_text("Choose what to add");
+        if ui.add_enabled(!busy && !app.batch.selected_items.is_empty(), egui::Button::new("\u{E738}"))
+            .on_hover_text("Remove selected recipes from this list").clicked()
+        {
+            let indices = app.batch.selected_items.iter().copied().collect();
+            request_removal(app, RemoveScope::Selected(indices));
+        }
+        if ui.add_enabled(!busy && count > 0, egui::Button::new("Clear list")).clicked() { request_removal(app, RemoveScope::Clear); }
+    });
+    if let Some(action) = action {
+        app.batch.last_add = action;
+        match action {
+            AddAction::Existing => { app.library.adding_to_builder = true; app.view = View::Recipes; }
+            AddAction::New => show_new_recipe(app),
+            AddAction::Import => if let Some(path) = rfd::FileDialog::new().add_filter("Request lists", intake::EXTENSIONS).add_filter("All files", &["*"]).pick_file() { open_file(app, &path); },
+            AddAction::Paste => app.batch.paste = Some(String::new()),
+        }
+    }
+}
+
+fn new_recipe_form(app: &mut StudioApp, ui: &mut Ui) {
+    let Some(ws) = app.ws.clone() else { super::need_workspace(app, ui); return };
+    let templates = app.batch.new_recipe.templates.get_or_insert_with(|| ws.templates()).clone();
+    let can_agent = app.writable() && app.ws_cache.has_skill;
+    let agent_name = app.settings.agent_backend.label();
+    theme::section_heading(ui, "Create a recipe");
+    ui.label(RichText::new("Add one application to the working list, or start from a template and edit it yourself.").weak());
+    ui.add_space(12.0);
+    let (mut with_agent, mut create) = (false, false);
+    theme::card(ui, |ui| {
+        let draft = &mut app.batch.new_recipe;
+        egui::Grid::new("builder-new-recipe-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+            ui.label("Application");
+            if ui.add(egui::TextEdit::singleline(&mut draft.display).hint_text("e.g. Notepad++").desired_width(360.0)).changed() && !draft.id_touched { draft.id = recipe::suggest_id(&draft.display); }
+            ui.end_row();
+            ui.label("Publisher"); ui.add(egui::TextEdit::singleline(&mut draft.publisher).hint_text("optional").desired_width(360.0)); ui.end_row();
+            ui.label("Vendor page"); ui.add(egui::TextEdit::singleline(&mut draft.vendor).hint_text("optional - where research starts").desired_width(360.0)); ui.end_row();
+            ui.label("Recipe id"); if ui.add(egui::TextEdit::singleline(&mut draft.id).desired_width(360.0)).changed() { draft.id_touched = true; } ui.end_row();
+            ui.label("Notes"); ui.add(egui::TextEdit::multiline(&mut draft.notes).hint_text("optional - licensing, architecture, quirks…").desired_rows(3).desired_width(360.0)); ui.end_row();
+        });
+        let id = draft.id.trim();
+        let valid = recipe::is_valid_id(id);
+        let development_exists = app.recipes.iter().any(|r| r.id.eq_ignore_ascii_case(id) && r.location == ystudio_core::workspace::RecipeLocation::Development);
+        let shipped_exists = app.recipes.iter().any(|r| r.id.eq_ignore_ascii_case(id) && r.location != ystudio_core::workspace::RecipeLocation::Development);
+        if !id.is_empty() && !valid { ui.colored_label(theme::red(), "Ids use lowercase letters, digits, dots, dashes, or underscores."); }
+        else if development_exists { ui.colored_label(theme::red(), "A development recipe with this id already exists."); }
+        else if shipped_exists { ui.colored_label(theme::amber(), "A shipped recipe has this id; the development copy will take precedence."); }
+        let ready = valid && !development_exists && !draft.display.trim().is_empty();
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            with_agent = theme::primary(ui, ready && can_agent, format!("\u{E99A}  Write with {agent_name}")).clicked();
+            ui.separator();
+            ui.label("Start from template");
+            let template_name = |i: usize| templates.get(i).and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "(blank)".into());
+            egui::ComboBox::from_id_salt("builder-template").selected_text(template_name(draft.template)).show_ui(ui, |ui| {
+                for i in 0..templates.len() { ui.selectable_value(&mut draft.template, i, template_name(i)); }
+                ui.selectable_value(&mut draft.template, templates.len(), "(blank)");
+            });
+            create = ui.add_enabled(ready, egui::Button::new("Create and open")).clicked();
+        });
+    });
+    if with_agent {
+        let d = std::mem::take(&mut app.batch.new_recipe);
+        start_new_recipe(app, BatchItem { app: d.display.trim().to_string(), publisher: d.publisher.trim().to_string(), vendor_url: d.vendor.trim().to_string(), suggested_id: d.id.trim().to_string(), notes: d.notes.trim().to_string(), ..Default::default() });
+    } else if create { create_from_template(app, &ws, &templates); }
+}
+
+fn create_from_template(app: &mut StudioApp, ws: &ystudio_core::workspace::Workspace, templates: &[PathBuf]) {
+    let d = &app.batch.new_recipe;
+    let id = d.id.trim().to_string();
+    let result = (|| -> anyhow::Result<PathBuf> {
+        ws.ensure_writable("create recipes")?;
+        let path = ws.development_recipe_path(&id);
+        anyhow::ensure!(!path.exists(), "{} already exists.", path.display());
+        let doc = match templates.get(d.template) {
+            Some(template) => recipe::new_from_template(&ystudio_core::read_text(template)?, &id, d.display.trim(), d.publisher.trim())?,
+            None => { let mut doc = RecipeDoc::default(); doc.set_from_text("id", &id); doc.set_from_text("displayName", d.display.trim()); doc.set_from_text("publisher", d.publisher.trim()); doc }
+        };
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(&path, doc.to_yaml())?;
+        Ok(path)
+    })();
+    match result {
+        Ok(path) => {
+            app.batch.new_recipe = NewRecipeDraft::default();
+            app.batch.composing = false;
+            app.refresh_recipes();
+            add_existing_recipe(app, &id);
+            app.request_open_recipe(path);
+            app.view = View::Designer;
+            app.notify(format!("Created {id}. Walk through each step, then test it."));
+        }
+        Err(error) => app.error(format!("Could not create recipe: {error:#}")),
+    }
+}
+
 fn toolbar(app: &mut StudioApp, ui: &mut Ui) {
     let busy = app.batch.busy(app);
     ui.horizontal_wrapped(|ui| {
-        if ui.add_enabled(!busy, egui::Button::new("\u{E838}  Open request list…")).clicked()
-            && let Some(p) = rfd::FileDialog::new().add_filter("Request lists", intake::EXTENSIONS).add_filter("All files", &["*"]).pick_file()
-        {
-            open_file(app, &p);
+        if ui.add_enabled(!busy && app.batch.batch.is_some(), egui::Button::new("\u{E74E}  Save")).clicked() {
+            save(app);
+            app.batch.dirty = false;
+            app.notify("Recipe Builder list saved.");
         }
-        if ui.add_enabled(!busy, egui::Button::new("\u{E77F}  Paste text…")).clicked() {
-            app.batch.paste = Some(String::new());
-        }
-        if ui.add_enabled(!busy && app.writable(), egui::Button::new("\u{E710}  New recipe…")).clicked() {
-            app.library.new_open = true;
-        }
+        if ui.add_enabled(!busy && app.batch.batch.is_some(), egui::Button::new("Save as…")).clicked() { app.batch.save_as = Some(String::new()); }
         let saved = app.batch.saved.get_or_insert_with(Batch::list).clone();
-        let current = app.batch.batch.as_ref().map(|b| b.id.clone());
-        let current_label = app.batch.batch.as_ref().map(super::home::request_label);
         ui.add_enabled_ui(!busy, |ui| {
-            egui::ComboBox::from_id_salt("batch-saved")
-                .selected_text(current_label.unwrap_or_else(|| format!("Earlier requests ({})", saved.len())))
-                .height(400.0)
-                .show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("batch-saved").selected_text(format!("Load… ({})", saved.len())).height(400.0).show_ui(ui, |ui| {
                     for (name, dir) in &saved {
-                        if ui.selectable_label(current.as_deref() == Some(name.as_str()), name).clicked() {
+                        if ui.selectable_label(false, name).clicked() {
                             open_saved(app, dir);
+                            ui.close();
                         }
                     }
                     if saved.is_empty() {
-                        ui.label(RichText::new("none yet").weak());
+                        ui.label(RichText::new("No saved lists yet.").weak());
                     }
                 });
         });
-        if ui.small_button("\u{E72C}").on_hover_text("Rescan earlier requests").clicked() {
+        if ui.button("\u{E72C}").on_hover_text("Refresh saved lists").clicked() {
             app.batch.saved = None;
         }
         if let Some(b) = &app.batch.batch {
@@ -574,7 +1142,7 @@ fn toolbar(app: &mut StudioApp, ui: &mut Ui) {
                 ui.ctx().copy_text(r);
                 app.notify("Report copied to the clipboard.");
             }
-            if ui.button("\u{E8B7}  Request folder").clicked() {
+            if ui.button("\u{E8B7}  List folder").on_hover_text("Open this list's files in Explorer").clicked() {
                 super::open_in_explorer(&dir);
             }
         }
@@ -595,8 +1163,8 @@ fn start_page(app: &mut StudioApp, ui: &mut Ui) {
         ui.label("1. The Studio reads the file and strips the noise (HTML, signatures, approval boilerplate).");
         ui.label("2. A quick scan lists the software it can see and matches it against existing recipes.");
         ui.label("3. For messy tickets, “Extract with agent” has your agent read every request and return a clean list.");
-        ui.label("4. Review the list, then queue agent runs that write (or update) one recipe per item and find icons.");
-        ui.label("5. Studio tests and repairs each recipe. Use Test selected to recheck them all, then copy the report.");
+        ui.label("4. Complete every remaining recipe together, select a subset, or open one recipe and finish it individually.");
+        ui.label("5. Pause after the active recipe whenever you need to inspect or edit one, then resume the remaining work.");
     });
     if app.ws.is_none() {
         ui.label(RichText::new("Tip: open a Yardstick folder first so items can be matched to existing recipes.").small().weak());
@@ -613,18 +1181,32 @@ fn items_header(app: &mut StudioApp, ui: &mut Ui) {
     let backend = app.settings.agent_backend.label();
     let b = app.batch.batch.as_ref().unwrap();
     let software = b.items.iter().filter(|i| i.request != RequestKind::NotSoftware).count();
-    let included = b.items.iter().filter(|i| i.include && i.request != RequestKind::NotSoftware).count();
-    let pending = b.items.iter().filter(|i| i.include && i.request != RequestKind::NotSoftware && i.status != ItemStatus::Done).count();
+    let included = b.items.iter().filter(|i| i.include && i.is_recipe_work() && i.request != RequestKind::NotSoftware).count();
+    let pending = b.items.iter().filter(|i| i.include && i.is_recipe_work() && i.request != RequestKind::NotSoftware && i.status != ItemStatus::Done).count();
+    let selected_pending = app
+        .batch
+        .selected_items
+        .iter()
+        .filter(|&&n| b.items.get(n).is_some_and(|i| i.include && i.is_recipe_work() && i.request != RequestKind::NotSoftware && i.status != ItemStatus::Done))
+        .count();
+    let has_selection = !app.batch.selected_items.is_empty();
     let repairable = repair_targets(app, b).len();
     let file = b.source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let summary = format!("{} request(s) · {software} software item(s) · extracted by {}", b.records.len(), b.extracted_by);
+    let requests = b.records.len();
+    let summary = format!(
+        "{requests} request{} · {software} software item{} · extracted by {}",
+        if requests == 1 { "" } else { "s" },
+        if software == 1 { "" } else { "s" },
+        b.extracted_by,
+    );
     // Requests made in the Studio are already a clean list.
     let extractable = b.extracted_by != "Studio";
     let format = b.format.clone();
 
     // Header.
     let mut extract = false;
-    let mut queue = false;
+    let mut queue_all = false;
+    let mut queue_selected = false;
     let mut stop = false;
     let mut cancel = false;
     let mut test = false;
@@ -646,7 +1228,7 @@ fn items_header(app: &mut StudioApp, ui: &mut Ui) {
                     }
                 } else if ui
                     .add_enabled(!busy, egui::Button::new("\u{E99A}  Extract with agent"))
-                    .on_hover_text(format!("{backend} reads every request and returns a structured list (replaces the current items)."))
+                    .on_hover_text(format!("{backend} reads every request, matches recipes, and routes specialist work to installed plugins (replaces the current items)."))
                     .clicked()
                 {
                     extract = true;
@@ -655,8 +1237,8 @@ fn items_header(app: &mut StudioApp, ui: &mut Ui) {
             }
             if running_items {
                 ui.spinner();
-                ui.label(format!("Working · {queued} queued"));
-                if ui.button("\u{E769}  Stop after this item").clicked() {
+                ui.label(format!("Running batch · {queued} waiting"));
+                if ui.button("\u{E769}  Pause after this recipe").on_hover_text("Finish the active recipe, then leave the remaining recipes pending so you can inspect or edit one").clicked() {
                     stop = true;
                 }
                 if ui.button("\u{E711}  Cancel now").clicked() {
@@ -664,17 +1246,32 @@ fn items_header(app: &mut StudioApp, ui: &mut Ui) {
                     cancel = true;
                 }
             } else {
-                let resp = theme::primary(ui, can_agent && pending > 0 && !busy, RichText::new(format!("\u{E768}  Run agent on {pending} selected")));
+                let (complete_count, selected_action) = if has_selection { (selected_pending, true) } else { (pending, false) };
+                let label = if selected_action {
+                    format!("\u{E768}  Complete {complete_count} selected")
+                } else {
+                    format!("\u{E768}  Complete all {complete_count} remaining")
+                };
+                let resp = theme::primary(ui, can_agent && complete_count > 0 && !busy, RichText::new(label));
                 if !can_agent {
-                    resp.on_hover_text("Needs a writable development folder with the yardstick-recipes skill.");
+                    resp.on_disabled_hover_text("Needs a writable development folder with the yardstick-recipes skill.");
+                } else if complete_count == 0 {
+                    resp.on_disabled_hover_text(if selected_action { "The selected recipes are already complete or excluded." } else { "Every included recipe is complete." });
+                } else if busy {
+                    resp.on_disabled_hover_text("Finish or cancel the active run first.");
                 } else if resp.clicked() {
-                    queue = true;
+                    if selected_action { queue_selected = true; } else { queue_all = true; }
+                }
+                if has_selection
+                    && ui.add_enabled(can_agent && pending > 0 && !busy, egui::Button::new(format!("Complete all {pending} remaining"))).clicked()
+                {
+                    queue_all = true;
                 }
             }
-            if ui.add_enabled(can_test && included > 0 && !busy, egui::Button::new("Test selected")).clicked() {
+            if ui.add_enabled(can_test && included > 0 && !busy, egui::Button::new(format!("Test all {included} included"))).clicked() {
                 test = true;
             }
-            let resp = ui.add_enabled(can_agent && repairable > 0 && !busy, egui::Button::new(format!("\u{E90F}  Repair {repairable} with agent")));
+            let resp = ui.add_enabled(can_agent && repairable > 0 && !busy, egui::Button::new(format!("\u{E90F}  Repair {repairable} unfinished")));
             repair = resp.clicked();
             if !can_agent {
                 resp.on_disabled_hover_text("Needs a writable development folder with the yardstick-recipes skill.");
@@ -692,7 +1289,7 @@ fn items_header(app: &mut StudioApp, ui: &mut Ui) {
         });
     });
     ui.add_enabled_ui(!busy, |ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Agent");
             super::settings::agent_picker(app, ui, "requests");
         });
@@ -700,7 +1297,7 @@ fn items_header(app: &mut StudioApp, ui: &mut Ui) {
         crate::workflow::configure(&mut app.workflow.options, ui, true);
     });
     let ids: Vec<String> = app.batch.batch.as_ref().unwrap().items.iter()
-        .filter(|i| i.include && i.request != RequestKind::NotSoftware)
+        .filter(|i| i.include && i.is_recipe_work() && i.request != RequestKind::NotSoftware)
         .flat_map(|i| if i.recipes.is_empty() { vec![i.recipe_id()] } else { i.recipes.clone() })
         .collect();
     super::dropbox_banner(app, ui, &ids);
@@ -708,13 +1305,19 @@ fn items_header(app: &mut StudioApp, ui: &mut Ui) {
     if extract {
         start_extract(app);
     }
-    if queue {
+    if queue_all || queue_selected {
         let b = app.batch.batch.as_ref().unwrap();
         let indices = b
             .items
             .iter()
             .enumerate()
-            .filter(|(_, i)| i.include && i.request != RequestKind::NotSoftware && i.status != ItemStatus::Done)
+            .filter(|(n, i)| {
+                i.include
+                    && i.is_recipe_work()
+                    && i.request != RequestKind::NotSoftware
+                    && i.status != ItemStatus::Done
+                    && (!queue_selected || app.batch.selected_items.contains(n))
+            })
             .map(|(n, _)| n)
             .collect();
         crate::workflow::request(app, crate::workflow::Request::BatchAuthor(indices));
@@ -763,14 +1366,18 @@ fn items_rows(app: &mut StudioApp, ui: &mut Ui) {
     let mut icon_for = None;
     let mut open = None;
     egui::ScrollArea::both().id_salt("batch-items").auto_shrink(false).show(ui, |ui| {
-        egui::Grid::new("batch-grid").striped(true).num_columns(9).spacing([12.0, 6.0]).min_row_height(24.0).show(ui, |ui| {
-            for h in ["", "Ticket", "Software", "Version", "Request", "Status", "Icon", "Recipe", "Credits"] {
+        egui::Grid::new("batch-grid").striped(true).num_columns(10).spacing([12.0, 6.0]).min_row_height(24.0).show(ui, |ui| {
+            for h in ["", "Ticket", "Software", "Version", "Request", "Destination", "Status", "Icon", "Recipe", "Credits"] {
                 ui.label(RichText::new(h).semibold());
             }
             ui.end_row();
             for (n, it, (icon_text, icon_color), exists) in &rows {
                 let mut inc = it.include;
-                if ui.add_enabled(it.request != RequestKind::NotSoftware && !busy, egui::Checkbox::without_text(&mut inc)).changed() {
+                if ui
+                    .add_enabled(it.request != RequestKind::NotSoftware && it.is_recipe_work() && !busy, egui::Checkbox::without_text(&mut inc))
+                    .on_hover_text("Include this request in Recipe Builder batch actions")
+                    .changed()
+                {
                     toggles.push((*n, inc));
                 }
                 let sel = app.batch.selected == Some(*n);
@@ -784,6 +1391,12 @@ fn items_rows(app: &mut StudioApp, ui: &mut Ui) {
                 }
                 ui.label(&it.version);
                 ui.label(RichText::new(it.request.label()).color(request_color(it.request)));
+                let destination = if it.is_recipe_work() {
+                    "Recipe Builder".to_string()
+                } else {
+                    app.plugins.get(&it.handler).map(|p| p.manifest.name.clone()).unwrap_or_else(|| it.handler.clone())
+                };
+                theme::badge(ui, destination, if it.is_recipe_work() { theme::blue() } else { theme::amber() });
                 ui.horizontal(|ui| {
                     item_status_badge(app, ui, it);
                     if !it.status_note.is_empty() {
@@ -794,7 +1407,7 @@ fn items_rows(app: &mut StudioApp, ui: &mut Ui) {
                     }
                 });
                 ui.horizontal(|ui| {
-                    if it.request != RequestKind::NotSoftware {
+                    if it.request != RequestKind::NotSoftware && it.is_recipe_work() {
                         if ui.small_button("\u{E91B}").on_hover_text("Find an icon").clicked() {
                             icon_for = Some(*n);
                         }
@@ -803,10 +1416,10 @@ fn items_rows(app: &mut StudioApp, ui: &mut Ui) {
                 });
                 ui.horizontal(|ui| {
                     let id = if it.recipes.is_empty() { it.recipe_id() } else { it.recipes.join(", ") };
-                    if it.request == RequestKind::NotSoftware {
+                    if it.request == RequestKind::NotSoftware || !it.is_recipe_work() {
                         ui.label("");
                     } else if *exists {
-                        if ui.link(RichText::new(&id).monospace()).on_hover_text("Open in the Designer").clicked() {
+                        if ui.link(RichText::new(&id).monospace()).on_hover_text("Open in Design").clicked() {
                             open = Some(id.split(", ").next().unwrap_or_default().to_string());
                         }
                     } else {
@@ -853,7 +1466,15 @@ fn start_extract(app: &mut StudioApp) {
     let Some(b) = &app.batch.batch else { return };
     let dir = b.dir();
     let batch_id = b.id.clone();
-    if let Err(e) = b.prepare_agent(&dir, &app.recipes) {
+    let handlers: Vec<(String, String, String)> = app
+        .plugins
+        .registry
+        .plugins
+        .iter()
+        .filter(|p| p.manifest.page.kind == ystudio_core::plugin::PageKind::Workitems)
+        .map(|p| (p.manifest.id.clone(), p.manifest.name.clone(), p.manifest.description.clone()))
+        .collect();
+    if let Err(e) = b.prepare_agent(&dir, &app.recipes, &handlers) {
         app.error(format!("Could not prepare the batch: {e:#}"));
         return;
     }
@@ -891,6 +1512,14 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
     let busy = app.batch.busy(app);
     let can_agent = app.writable() && app.ws_cache.has_skill && !busy;
     let ids: Vec<String> = app.recipes.iter().map(|r| r.id.clone()).collect();
+    let handlers: Vec<(String, String)> = app
+        .plugins
+        .registry
+        .plugins
+        .iter()
+        .filter(|p| p.manifest.page.kind == ystudio_core::plugin::PageKind::Workitems)
+        .map(|p| (p.manifest.id.clone(), p.manifest.name.clone()))
+        .collect();
     let Some(b) = app.batch.batch.as_mut() else { return };
     let Some(it) = b.items.get(n).cloned() else {
         app.batch.selected = None;
@@ -899,7 +1528,10 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
     let record = b.record(&it.source).cloned();
     let mut edit = it.clone();
     let mut run = false;
+    let mut open_recipe = false;
     let mut icon = false;
+    let mut handoff = false;
+    let mut open_handoff = false;
     let mut matches_for = None;
     let mut close = false;
     ui.add_enabled_ui(!busy, |ui| {
@@ -935,6 +1567,19 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
             egui::ComboBox::from_id_salt("batch-req").selected_text(edit.request.label()).show_ui(ui, |ui| {
                 for k in RequestKind::ALL {
                     ui.selectable_value(&mut edit.request, k, k.label());
+                }
+            });
+            ui.end_row();
+            ui.label("Destination");
+            let destination = if edit.is_recipe_work() {
+                "Recipe Builder".to_string()
+            } else {
+                handlers.iter().find(|(id, _)| id == &edit.handler).map(|(_, name)| name.clone()).unwrap_or_else(|| edit.handler.clone())
+            };
+            egui::ComboBox::from_id_salt("batch-handler").selected_text(destination).show_ui(ui, |ui| {
+                ui.selectable_value(&mut edit.handler, String::new(), "Recipe Builder · reusable recipe");
+                for (id, name) in &handlers {
+                    ui.selectable_value(&mut edit.handler, id.clone(), name);
                 }
             });
             ui.end_row();
@@ -975,11 +1620,30 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
             ui.label(RichText::new(format!("Extractor confidence {:.0}%", edit.confidence * 100.0)).small().weak());
         }
         ui.horizontal_wrapped(|ui| {
-            let can_run = can_agent && edit.request != RequestKind::NotSoftware;
-            if ui.add_enabled(can_run, egui::Button::new("\u{E99A}  Run agent on this")).clicked() {
+            let can_run = can_agent && edit.is_recipe_work() && edit.request != RequestKind::NotSoftware;
+            if edit.is_recipe_work()
+                && theme::primary(ui, can_run, "\u{E768}  Complete this recipe")
+                    .on_disabled_hover_text("Needs a writable development folder, the recipe skill, and no other active run.")
+                    .clicked()
+            {
                 run = true;
             }
-            if ui.add_enabled(edit.request != RequestKind::NotSoftware, egui::Button::new("\u{E91B}  Find icon")).clicked() {
+            if !edit.is_recipe_work() {
+                let name = handlers.iter().find(|(id, _)| id == &edit.handler).map(|(_, name)| name.as_str()).unwrap_or("selected plugin");
+                if edit.handler_item.as_ref().is_some_and(|path| path.is_dir()) {
+                    if ui.button(format!("\u{E8A5}  Open in {name}")).clicked() {
+                        open_handoff = true;
+                    }
+                } else if ui.button(format!("\u{E72A}  Send to {name}")).on_hover_text("Creates a plugin work item with the original request and extracted details.").clicked() {
+                    handoff = true;
+                }
+            }
+            if existing(app, &edit).is_some()
+                && ui.button("\u{E70F}  Open recipe").on_hover_text("Inspect or edit this recipe, then return to the batch overview to continue").clicked()
+            {
+                open_recipe = true;
+            }
+            if ui.add_enabled(edit.request != RequestKind::NotSoftware && edit.is_recipe_work(), egui::Button::new("\u{E91B}  Find icon")).clicked() {
                 icon = true;
             }
             if edit.status == ItemStatus::Skipped {
@@ -1014,6 +1678,10 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
         edit.existing_recipe = m.id;
     }
     if edit != it {
+        if edit.handler != it.handler {
+            edit.handler_item = None;
+            edit.include = edit.is_recipe_work() && matches!(edit.request, RequestKind::New | RequestKind::Update);
+        }
         if edit.app != it.app || edit.version != it.version || edit.existing_recipe != it.existing_recipe
             || edit.suggested_id != it.suggested_id || edit.vendor_url != it.vendor_url
             || edit.notes != it.notes || edit.publisher != it.publisher
@@ -1023,7 +1691,7 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
             edit.status = ItemStatus::Pending;
             edit.status_note.clear();
         }
-        app.batch.batch.as_mut().unwrap().items[n] = edit;
+        app.batch.batch.as_mut().unwrap().items[n] = edit.clone();
         save(app);
     }
     if close {
@@ -1032,14 +1700,135 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
     if run {
         crate::workflow::request(app, crate::workflow::Request::BatchAuthor(vec![n]));
     }
+    if open_recipe
+        && let Some(id) = existing(app, &it).map(|recipe| recipe.id.clone())
+        && app.open_recipe_by_id(&id)
+    {
+        app.view = View::Designer;
+    }
     if icon {
         find_icon(app, n);
+    }
+    if handoff {
+        let current = app.batch.batch.as_ref().and_then(|b| b.items.get(n)).cloned();
+        let batch_id = app.batch.batch.as_ref().map(|b| b.id.clone()).unwrap_or_default();
+        if let Some(current) = current {
+            let text = current.agent_notes(record.as_ref());
+            match crate::views::plugin_page::create_from_recipe_builder(
+                app,
+                &current.handler,
+                &current.app,
+                &current.source,
+                &text,
+                &format!("{batch_id}:{n}"),
+            ) {
+                Ok(path) => {
+                    if let Some(item) = app.batch.batch.as_mut().and_then(|b| b.items.get_mut(n)) {
+                        item.handler_item = Some(path);
+                        item.status = ItemStatus::Done;
+                        item.status_note = "sent to plugin".into();
+                    }
+                    save(app);
+                }
+                Err(e) => app.error(format!("Could not send the request: {e:#}")),
+            }
+        }
+    } else if open_handoff
+        && let Some(current) = app.batch.batch.as_ref().and_then(|b| b.items.get(n)).cloned()
+        && let Some(view) = app.plugins.view_of(&current.handler)
+    {
+        if let Some(path) = current.handler_item {
+            app.plugins.page(&current.handler).selected = Some(path);
+        }
+        app.view = view;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn working_list_deduplicates_library_but_appends_every_batch_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("Yardstick.Project.psd1"), "@{\nRuntimeRoot = '.'\nRecipesPath = 'Recipes'\nDevelopmentRecipes = 'Recipes\\Development'\n}\n").unwrap();
+        std::fs::write(root.join("Yardstick.ps1"), "# never executed").unwrap();
+        std::fs::create_dir_all(root.join(r"Recipes\Development")).unwrap();
+        std::fs::write(root.join(r"Recipes\Development\one.yaml"), "id: one\ndisplayName: One\n").unwrap();
+        let ws = ystudio_core::workspace::Workspace::open(root, &[], &[]).unwrap();
+        let mut app = StudioApp::isolated_for_tests(ws);
+        let mut working = Batch::from_items("working", Vec::new());
+        working.id = root.join("working-list").to_string_lossy().into_owned();
+        app.batch.batch = Some(working);
+
+        add_existing_recipe(&mut app, "one");
+        add_existing_recipe(&mut app, "ONE");
+        assert_eq!(app.batch.batch.as_ref().unwrap().items.len(), 1);
+
+        let incoming = Batch::from_items("incoming", vec![
+            BatchItem { app: "One again".into(), existing_recipe: "one".into(), ..Default::default() },
+            BatchItem { app: "Two".into(), suggested_id: "two".into(), ..Default::default() },
+        ]);
+        append_batch(&mut app, incoming);
+        let items = &app.batch.batch.as_ref().unwrap().items;
+        assert_eq!(items.len(), 3);
+        assert_eq!(item_key(&items[1]), "one");
+        assert_eq!(item_key(&items[2]), "two");
+        assert!(app.batch.dirty);
+    }
+
+    #[test]
+    fn removing_an_open_recipe_can_keep_or_close_the_editor_without_losing_other_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("Yardstick.Project.psd1"), "@{\nRuntimeRoot = '.'\nRecipesPath = 'Recipes'\nDevelopmentRecipes = 'Recipes\\Development'\n}\n").unwrap();
+        std::fs::write(root.join("Yardstick.ps1"), "# never executed").unwrap();
+        std::fs::create_dir_all(root.join(r"Recipes\Development")).unwrap();
+        for id in ["one", "two"] {
+            std::fs::write(root.join(format!(r"Recipes\Development\{id}.yaml")), format!("id: {id}\ndisplayName: {id}\n")).unwrap();
+        }
+        let ws = ystudio_core::workspace::Workspace::open(root, &[], &[]).unwrap();
+        let mut app = StudioApp::isolated_for_tests(ws);
+        let mut batch = Batch::from_items("working", vec![
+            BatchItem { app: "One".into(), existing_recipe: "one".into(), ..Default::default() },
+            BatchItem { app: "Two".into(), existing_recipe: "two".into(), ..Default::default() },
+        ]);
+        batch.id = root.join("working-list").to_string_lossy().into_owned();
+        app.batch.batch = Some(batch);
+        assert!(app.open_recipe_by_id("one"));
+        app.view = View::Designer;
+        app.recipe.as_mut().unwrap().text.push_str("description: unsaved\n");
+
+        let remove_one = RemoveScope::Selected(vec![0]);
+        request_removal(&mut app, remove_one.clone());
+        assert!(app.batch.pending_remove.is_some(), "an open dirty recipe must prompt");
+        apply_removal(&mut app, &remove_one, true);
+        app.batch.pending_remove = None;
+        assert_eq!(app.batch.batch.as_ref().unwrap().items.iter().map(item_key).collect::<Vec<_>>(), ["two"]);
+        assert!(app.recipe.as_ref().is_some_and(|recipe| recipe.id == "one" && recipe.dirty()));
+        assert_eq!(app.view, View::Designer);
+
+        add_existing_recipe(&mut app, "one");
+        let one = app.batch.batch.as_ref().unwrap().items.iter().position(|item| item_contains_recipe(item, "one")).unwrap();
+        let recipe = app.recipe.as_mut().unwrap();
+        recipe.text.clone_from(&recipe.saved);
+        apply_removal(&mut app, &RemoveScope::Selected(vec![one]), false);
+        assert!(app.recipe.is_none());
+        assert_eq!(app.view, View::Batch);
+        assert_eq!(app.batch.batch.as_ref().unwrap().items.iter().map(item_key).collect::<Vec<_>>(), ["two"]);
+
+        add_existing_recipe(&mut app, "one");
+        assert!(app.open_recipe_by_id("one"));
+        app.view = View::Designer;
+        request_removal(&mut app, RemoveScope::Clear);
+        assert!(app.batch.pending_remove.is_some(), "clearing the list must always ask for confirmation");
+        apply_removal(&mut app, &RemoveScope::Clear, false);
+        app.batch.pending_remove = None;
+        assert!(app.batch.batch.as_ref().unwrap().items.is_empty());
+        assert!(app.recipe.is_none());
+        assert_eq!(app.view, View::Batch);
+    }
 
     #[test]
     fn batch_testing_deduplicates_recipes_and_preserves_ticket_associations() {

@@ -468,8 +468,8 @@ fn done_step(app: &mut StudioApp, ui: &mut Ui) {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if theme::primary(ui, app.writable(), "\u{E710}  New recipe…").clicked() {
-                finish(app, View::Home);
-                app.library.new_open = true;
+                finish(app, View::Batch);
+                super::batch::show_new_recipe(app);
             }
             if ui.button("\u{E8C3}  Import requests").clicked() {
                 finish(app, View::Batch);

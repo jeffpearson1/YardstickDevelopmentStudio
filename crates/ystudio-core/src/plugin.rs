@@ -136,6 +136,9 @@ pub struct SettingDef {
     pub help: String,
     #[serde(default)]
     pub choices: Vec<String>,
+    /// Offer a Studio-managed private clone for this folder setting.
+    #[serde(default)]
+    pub clone_repository: bool,
 }
 
 impl SettingDef {
@@ -549,6 +552,9 @@ impl Manifest {
             }
             if s.kind == SettingKind::Choice && s.choices.is_empty() {
                 p(format!("setting '{}' is a choice with no choices", s.key));
+            }
+            if s.clone_repository && s.kind != SettingKind::Folder {
+                p(format!("setting '{}' can clone a repository only when its type is folder", s.key));
             }
         }
         if !self.settings.iter().any(|s| s.key == WORK_ROOT_KEY && s.kind == SettingKind::Folder) {

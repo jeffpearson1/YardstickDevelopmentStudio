@@ -149,7 +149,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     let running = crate::workflow::busy(app) || !app.batch.queue.is_empty();
     let open_id = app.recipe.as_ref().map(|r| r.id.clone()).unwrap_or_default();
 
-    egui::Panel::left("agent-form").resizable(true).default_size(430.0).show(ui, |ui| {
+    egui::Panel::left("agent-form").resizable(true).default_size(430.0).frame(theme::pane_frame()).show(ui, |ui| {
         egui::ScrollArea::vertical().id_salt("agent-form-scroll").show(ui, |ui| {
             let st = &mut app.agent;
             // The tab always works on the open recipe.
@@ -222,6 +222,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         });
     });
 
+    theme::pane(ui, |ui| {
     crate::workflow::progress(app, ui);
     // Output, changes and next steps.
     if !app.agent.changes.is_empty() || !app.agent.reported.is_empty() {
@@ -232,7 +233,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             for id in &app.agent.reported {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(id).monospace().strong());
-                    if ui.button("Open in Designer").clicked() {
+                    if ui.button("Open in Design").clicked() {
                         open = Some(id.clone());
                     }
                     if ui.button("\u{E9D5}  Test it").clicked() {
@@ -298,4 +299,5 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             });
         }
     }
+    });
 }

@@ -59,7 +59,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         app.refresh_runs();
         app.runs_ui.loaded = true;
     }
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         theme::page_title(ui, "History");
         if ui.button("\u{E72C}  Refresh").clicked() {
             app.refresh_runs();
@@ -73,10 +73,10 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     egui::CollapsingHeader::new("Agent credits by model").id_salt("runs-usage").default_open(true).show(ui, |ui| super::usage::card(app, ui));
     ui.separator();
 
-    egui::Panel::left("runs-list").resizable(true).default_size(330.0).show(ui, |ui| {
+    egui::Panel::left("runs-list").resizable(true).default_size(330.0).frame(theme::pane_frame()).show(ui, |ui| {
         egui::ScrollArea::vertical().id_salt("runs-list-scroll").show(ui, |ui| {
             if app.runs.is_empty() {
-                ui.weak("No install tests yet. Run a dry run from the Test Bench.");
+                ui.weak("No install tests yet. Run a dry run from the recipe's Test tab.");
             }
             for run in &app.runs {
                 let selected = app.runs_ui.selected.as_ref() == Some(&run.dir);
@@ -118,6 +118,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     let Some(run) = app.runs_ui.selected.as_ref().and_then(|d| app.runs.iter().find(|r| &r.dir == d)).cloned() else {
         return;
     };
+    theme::pane(ui, |ui| {
     ui.horizontal(|ui| {
         ui.label(RichText::new(&run.timestamp).strong().monospace());
         if let Some(s) = &run.summary {
@@ -131,7 +132,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         if let Some(e) = &run.error {
             ui.colored_label(theme::amber(), e);
         }
-        if ui.small_button("\u{E838}").clicked() {
+        if ui.button("\u{E838}").on_hover_text("Open this run's folder in Explorer").clicked() {
             super::open_in_explorer(&run.dir);
         }
     });
@@ -244,4 +245,5 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             app.view = View::Agent;
         }
     }
+    });
 }

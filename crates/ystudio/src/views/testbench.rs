@@ -29,7 +29,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         });
     }
 
-    egui::Panel::left("bench-steps").resizable(true).default_size(420.0).show(ui, |ui| {
+    egui::Panel::left("bench-steps").resizable(true).default_size(420.0).frame(theme::pane_frame()).show(ui, |ui| {
         egui::ScrollArea::vertical().id_salt("bench-steps-scroll").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if theme::primary(ui, writable && !busy, RichText::new("\u{E768}  Run all checks"))
@@ -96,6 +96,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         });
     });
 
+    theme::pane(ui, |ui| {
     // Results and log.
     let result = app
         .bench
@@ -151,6 +152,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             });
         }
     }
+    });
 }
 
 /// The consent dialog in front of a live install test.

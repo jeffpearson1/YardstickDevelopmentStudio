@@ -312,8 +312,10 @@ pub fn settings_form(app: &mut StudioApp, ui: &mut Ui, id: &str) {
     let Some(p) = app.plugins.get(id).cloned() else { return };
     let ws = dev_workspace(app);
     let mut save = false;
+    let mut clone_setting = None;
     egui::Grid::new(("plugin-settings-grid", id)).num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
         for def in &p.manifest.settings {
+            let private_ready = def.clone_repository && crate::views::plugin_page::has_private_workspace(app, id);
             let resp = ui.label(def.label());
             if !def.help.is_empty() {
                 resp.on_hover_text(&def.help);
@@ -352,6 +354,19 @@ pub fn settings_form(app: &mut StudioApp, ui: &mut Ui, id: &str) {
                         *value = path.display().to_string();
                         save = true;
                     }
+                    if def.clone_repository {
+                        let cloning = app.jobs.iter().any(|j| {
+                            j.proc.is_running() && matches!(&j.kind, crate::app::JobKind::PluginClone { plugin, setting, .. } if plugin == id && setting == &def.key)
+                        });
+                        if cloning {
+                            ui.spinner();
+                            ui.label("Cloning…");
+                        } else if private_ready {
+                            theme::badge(ui, "Private copy ready", theme::green());
+                        } else if ui.button("Clone private copy").on_hover_text("Creates a Studio-managed Yardstick clone used only by this plugin.").clicked() {
+                            clone_setting = Some(def.key.clone());
+                        }
+                    }
                 }
             });
             ui.end_row();
@@ -359,6 +374,28 @@ pub fn settings_form(app: &mut StudioApp, ui: &mut Ui, id: &str) {
     });
     if save {
         app.save_settings();
+    }
+    if let Some(setting) = clone_setting {
+        let dest = app
+            .plugins
+            .dir
+            .parent()
+            .unwrap_or(&app.plugins.dir)
+            .join("plugin-workspaces")
+            .join(id)
+            .join("YardstickDev");
+        if ystudio_core::git::is_repo(&dest) {
+            app.settings.plugins.entry(id.to_string()).or_default().values.insert(setting, dest.display().to_string());
+            app.save_settings();
+            app.notify(format!("{} is using its private Yardstick clone.", p.manifest.name));
+        } else {
+            match ystudio_core::git::clone(&app.settings.repo_url, &dest) {
+                Ok(spec) => {
+                    app.start_job(spec, crate::app::JobKind::PluginClone { plugin: id.to_string(), setting, dest });
+                }
+                Err(e) => app.error(format!("Could not start the private clone: {e:#}")),
+            }
+        }
     }
     let values = app.settings.plugins.get(id).map(|p| p.values.clone()).unwrap_or_default();
     if let Err(problems) = plugin::resolve_settings(&p.manifest, &values, ws.as_deref()) {

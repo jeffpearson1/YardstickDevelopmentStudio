@@ -104,9 +104,10 @@ is `Pass`; it has not tested uninstall, post-uninstall detection or residue.
 
 1. **Read.** The file is converted into `Record`s (title, description, ticket id, requester, and the remaining fields). The format is detected from the extension and the content: ServiceNow exports (`records`/`result` arrays, `number`/`short_description` keys), generic JSON/JSONL/YAML arrays, CSV/TSV with delimiter sniffing, spreadsheets via `calamine`, `docx` paragraphs, HTML with tags stripped, and plain text or email split into blocks. Header guessing handles columns such as "Short description", "Software" and "Product".
 2. **Quick scan.** Each record is split into software items: one per product line, bullet, or "X and Y" list. The scan strips request boilerplate ("Intune - Package", "please install", version numbers, licence noise), picks up versions and vendor URLs, and flags records that aren't software (meetings, group or device administration).
-3. **Agent extraction (optional).** The batch folder receives `digest.md` (the condensed records) and `recipes.md` (the existing recipe ids and names). The agent writes `agent-items.json`, which replaces the quick-scan items. The extract prompt allows writes only inside the batch folder.
+3. **Agent extraction (optional).** The batch folder receives `digest.md` (the condensed records), `recipes.md` (the existing recipe ids and names), and `plugins.md` (installed work-item plugins and their declared purpose). The agent writes `agent-items.json`, which replaces the quick-scan items. Each item names Recipe Builder or an installed plugin as its handler; unknown handler ids are rejected back to Recipe Builder. The extract prompt allows writes only inside the batch folder.
 4. **Match.** Item names are normalised and compared with recipe ids and display names (`RecipeMeta`), to tell an *Update* or *Already packaged* item from a *New* one. The match also records whether the recipe's `iconFile` exists.
 5. **Run.** Selected items are queued. Each one becomes an `AgentTask::Create` or `AgentTask::Update` with the ticket context; if an icon was already saved, the agent is told to use it. Status, changed recipes and the log tail are stored on the item. The batch (`batch.json`) is saved after every change, and Running items are reset to Pending when a batch is loaded again.
+   Items routed to a work-item plugin are excluded from recipe authoring and test counts. Sending one creates the plugin item with its ticket and extracted context; plugin items can be returned to Recipe Builder as reusable-recipe requests without deleting the original work item.
 6. **Test and repair (`workflow.rs`).** Studio runs Lint, Schema, Download, Package,
    DryRun and optionally Live for each authored Development recipe. A recipe failure is
    returned to an `AgentTask::Fix`, then all checks restart. The default limit is five
@@ -231,9 +232,16 @@ Enforcement:
   install tests it rebuilds itself and talks only to the Studio that launched it. It never
   outlives the run or the Studio.
 - **Publishing by pull request.** The Studio never copies into a production folder. It
-  pushes a `studio/<id>` branch cut from the upstream default branch, in a temporary
-  worktree so the user's checkout is untouched, and opens a pull request; production pulls
-  merged work. Icons go to the shared icon folder, not git. Recipes that are not *complete*
+  uses a `studio/<id>` branch in a temporary worktree so the user's checkout is untouched,
+  and opens a pull request; production pulls merged work. When the branch already has an
+  open pull request, the Studio builds on that remote branch and appends a commit instead
+  of replacing its history or opening a duplicate. Publish monitors open Studio pull
+  requests in place: check runs, review decisions, comments, and reviews from people or
+  GitHub Copilot refresh in the background with loading and recovery states. Refreshing
+  Publish also reconciles merged Studio pull requests: a matching
+  `Recipes\Development` file is moved to `Artifacts\PublishedRecipes` only when its hash
+  still matches the recipe on the fetched remote default branch; newer local edits are
+  kept. Icons go to the shared icon folder, not git. Recipes that are not *complete*
   (no passing live test of their current contents) show their recorded checks first, and
   the pull request says they are not validated. Nothing opens in the browser without asking.
 - **Merge gate.** Each pull request commits `Tests/RecipeEvidence/<id>.json`: the verdict,
@@ -272,15 +280,22 @@ Enforcement:
 2. **Test.** The recipe's Test tab → *Run safe checks* (Lint → Schema → install-test dry run). Then,
    optionally: Lab download/package, and a live install test after consent. History shows
    the history and per-phase results.
-3. **Agentic.** *New recipe* → *Write it with the agent* makes a one-item request that is
-   written, tested and repaired like any other; or the open recipe's Agent tab (Fix with the
+3. **Agentic.** *New recipe* opens Recipe Builder's inline composer; *Write with agent* adds it
+   to the working list and runs the same author, test and repair pipeline as any other item;
+   or the open recipe's Agent tab (Fix with the
    latest failing run, Review, Update, Freeform) → stream → back to Test.
 4. **Publish.** Publish → select complete Development recipes → *Open pull requests…* →
    confirm → open the pull request (or GitHub's compare page) in the browser.
-5. **Recipe Builder.** Import a ticket export or paste a list → review the extracted items
+5. **Recipe Builder.** Its persistent left-hand working list holds existing recipes, new recipe
+   drafts and every software item from imported batches. Add existing recipes through the
+   Library, compose one inline, or import/paste a request list; opening another list offers
+   append or save/replace. Selecting an existing recipe keeps the working list visible and opens
+   its Design, YAML, Test, Icon and Agent tabs in the right pane; *Batch overview* returns without
+   losing progress. Complete all remaining recipes, a checked subset, or one recipe, and pause a
+   running batch after its active recipe to inspect or repair work manually. Removing the open
+   recipe closes its editor; dirty edits require Save, Discard, Keep in editor, or Cancel. Save and Load preserve the complete session. Review extracted items
    (optionally *Extract with agent*) → find missing icons → *Run agent on N selected* →
-   publish the recipes it produced. *Update several recipes* makes a request from library
-   recipes to re-test, repair or update together.
+   publish the recipes it produced.
 
 ## Platform notes
 
@@ -305,6 +320,10 @@ Enforcement:
   WinUI signal colours for success, caution, critical and informational states. Colours
   come from `theme::palette()`; call `theme::green()`/`red()`/`amber()`/`blue()`/`grey()`
   rather than hard-coding values, because they differ between light and dark.
+- **Split panes.** Every sibling beside a resizable divider uses `theme::pane_frame()` or
+  `theme::pane()`. Their 12 px horizontal inset corrects egui's asymmetric side-panel and
+  center-panel defaults, keeping controls, cards and scroll content equally clear of the
+  divider. Page-level margins remain 24 px and card gaps remain 16 px.
 - **Branding.** The accent is Yardstick orange: `#FE700A` in dark mode and `#C15101`
   (buttons) / `#AD4901` (text) in light mode, the same hue darkened so white button text
   and orange text on light surfaces stay above 4.5:1. The artwork in `assets/branding`
@@ -348,7 +367,7 @@ new page type needs one (`studio.hostApi` in the manifest says which kit it expe
 - **`catalog` pages** probe a connection, search an outside system (a step whose `rows`
   fill a table) and offer per-row actions: run a step, start a work item in another plugin
   (`handoff.workitem`, which copies files into its `intake` folder), or pre-fill the New
-  recipe dialog (`handoff.recipe`).
+  Recipe Builder form (`handoff.recipe`).
 - **Steps** run as `pwsh -File <script> -StudioInput <input.json> -StudioResult <result.json>`.
   Only those paths are on the command line; settings, parameters, the Studio's version and
   workspace, and any approval go in `input.json`, and the script reports `status`, `summary`,
@@ -378,7 +397,7 @@ approval check) and `OneOffPackager.psm1` (inventory, packaging, change set and 
 change, with every tenant, group and path coming in as a setting or from the work item).
 **SCCM App Migration** is a `catalog` plugin: a connection check, a search whose rows fill the table,
 and per-row steps (export, copy content) and handoffs (`handoff.workitem` to the One-Off Packager,
-`handoff.recipe` into the New recipe dialog). A handoff's `files` may end in `?` for "if present", and
+`handoff.recipe` into Recipe Builder's new-recipe form). A handoff's `files` may end in `?` for "if present", and
 folders are hard-linked where possible. The SCCM scripts only ever `SELECT`: a test fails the build if
 one calls a cmdlet that could change the site. Each plugin is a self-contained package, so
 `StudioPlugin.psm1` is duplicated, and a test checks the copies are identical.
@@ -406,6 +425,7 @@ Plugin safety, in addition to the model above:
   a prompt and a prefix deny list, not a sandbox: a shell can still be asked for anything,
   so tenant-writing steps rely on the user's approval, not on the agent's restraint. The
   agent's changes are listed from a snapshot that ignores the Studio's own files.
+- **Private plugin clones.** A plugin folder setting may offer a Studio-managed repository clone. One-Off Packager uses this for `yardstickDevPath`; with a real private clone selected, its file-only agent tasks may run beside Recipe Builder agents and checks because the two workflows cannot edit the same checkout. Local-install and tenant-writing steps keep their existing serialization and approval gates.
 - No elevated worker for plugins: a plugin that installs software does it in the user's
   session and asks the user's consent.
 

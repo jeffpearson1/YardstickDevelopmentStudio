@@ -509,7 +509,8 @@ pub fn extract_prompt(batch_dir: &Path) -> String {
         "You are helping an Intune packaging team triage a list of requests exported from a ticketing system.\n\n\
          Files in `{dir}`:\n\
          - `digest.md`: every request (ticket number, title, description, useful fields).\n\
-         - `recipes.md`: the software the team already packages (Yardstick recipe ids).\n\n\
+         - `recipes.md`: the software the team already packages (Yardstick recipe ids).\n\
+         - `plugins.md`: the handlers installed in the Studio and the work each is designed for.\n\n\
          For every request, list each separate piece of software that needs to be packaged or updated. One ticket \
          can ask for many apps (bulleted lists, bare lists of names, \"X with Y\"), and some tickets are not about \
          software at all (meetings, group changes, device tags, onboarding) - record those once with \
@@ -521,6 +522,7 @@ pub fn extract_prompt(batch_dir: &Path) -> String {
          (Dropbox, OneDrive, Box) in `notes` as fallback media only. Find the authoritative vendor product/download \
          page for `vendorUrl` whenever possible; do not assume a shared link requires manualDownload. Put licensing, \
          architecture, prerequisites and anything a packager should know in `notes`.\n\n\
+         Choose `recipe-builder` as `handler` unless an installed handler in `plugins.md` is clearly a better fit. A one-off packager is appropriate for licensed or request-supplied media, a one-time deployment, or software that should not become a maintained reusable recipe. Do not name handlers that are not in `plugins.md`.\n\n\
          Write the result as JSON to `{out}` in exactly this shape (the comments explain the fields; do not write \
          comments in the file):\n```\n{schema}\n```\n\
          Only create that one file. Do not modify any other file. When done, reply with a one-line summary.\n",
@@ -1258,9 +1260,9 @@ mod tests {
     #[test]
     fn extract_prompt_names_files_and_schema() {
         let p = extract_prompt(Path::new(r"C:\b\1"));
-        assert!(p.contains("digest.md") && p.contains("recipes.md"));
+        assert!(p.contains("digest.md") && p.contains("recipes.md") && p.contains("plugins.md"));
         assert!(p.contains(r"C:\b\1\agent-items.json"));
-        assert!(p.contains("\"existingRecipe\"") && p.contains("not-software"));
+        assert!(p.contains("\"existingRecipe\"") && p.contains("\"handler\"") && p.contains("not-software"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 schema: 1
 id: oneoff-packager
 name: One-Off Packager
-version: 1.0.1
+version: 1.1.0
 publisher: Yardstick contributors
 description: Packages one-off software requests that don't suit Yardstick. An agent triages the ticket and drafts the recipe; tests, packaging and the Intune upload run as separate steps, and anything that installs software or changes the tenant waits for your approval of the exact file it acts on.
 icon: E7B8
@@ -20,7 +20,8 @@ settings:
     label: YardstickDev folder
     type: folder
     default: "{workspace}"
-    help: A clean git checkout of YardstickDev. Each ticket gets a private copy of its runtime; this folder is never changed.
+    cloneRepository: true
+    help: A clean git checkout of YardstickDev. Clone a private copy here so One-Off Packager work can continue independently of Recipe Builder runs.
   - key: tenantId
     label: Tenant ID
     type: guid

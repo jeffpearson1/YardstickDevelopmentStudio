@@ -17,6 +17,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::process::{Output, ProcessSpec, run_bytes, run_output};
 use crate::results::RecipeResult;
@@ -173,6 +174,59 @@ pub struct Repo {
     pub base: String,
 }
 
+/// One open pull request created by the Studio, including the GitHub state
+/// needed by the Publish page. Strings intentionally preserve GitHub's
+/// vocabulary so newer check and review states remain visible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestStatus {
+    pub number: u64,
+    pub recipe_id: String,
+    pub title: String,
+    pub url: String,
+    /// `OPEN`, `MERGED`, or `CLOSED` from GitHub.
+    pub state: String,
+    pub merged_at: String,
+    pub draft: bool,
+    pub merge_state: String,
+    pub review_decision: String,
+    pub updated_at: String,
+    pub checks: Vec<PullCheck>,
+    pub activity: Vec<PullActivity>,
+}
+
+/// What happened when a merged pull request was reconciled with its local
+/// Development recipe. A successful retirement is recoverable from `archive`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Retirement {
+    pub recipe_id: String,
+    pub retired: bool,
+    pub archive: Option<PathBuf>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullCheck {
+    pub name: String,
+    pub workflow: String,
+    pub state: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullActivity {
+    pub author: String,
+    pub kind: String,
+    pub body: String,
+    pub at: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenPullRequest {
+    number: u64,
+    url: String,
+}
+
 fn git(git: &Path, cwd: &Path, args: &[&str]) -> ProcessSpec {
     // Never block on a credential prompt nobody can see.
     ProcessSpec::new("git", git, cwd).args(args.iter().copied()).env("GIT_TERMINAL_PROMPT", "0")
@@ -288,6 +342,226 @@ impl Drop for Worktree<'_> {
     }
 }
 
+fn repo_slug(repo: &Repo) -> &str {
+    let slug = repo.web_url.trim_start_matches("https://");
+    slug.strip_prefix("github.com/").unwrap_or(slug)
+}
+
+fn gh_output(repo_root: &Path, gh: &Path, args: &[&str]) -> Result<Output> {
+    let spec = crate::prereqs::with_user_env(
+        ProcessSpec::new("gh", gh, repo_root)
+            .args(args.iter().copied())
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("NO_COLOR", "1"),
+    );
+    run_output(&spec)
+}
+
+fn find_open_pull_request(root: &Path, repo: &Repo, gh_exe: &Path, branch: &str) -> Result<Option<OpenPullRequest>> {
+    let out = gh_output(
+        root,
+        gh_exe,
+        &["pr", "list", "--repo", repo_slug(repo), "--state", "open", "--head", branch, "--limit", "1", "--json", "number,url"],
+    )?;
+    if !out.success {
+        bail!("gh could not check for an existing pull request: {}", last_line(&out));
+    }
+    let rows: Value = serde_json::from_str(&out.stdout).context("reading GitHub's pull request list")?;
+    Ok(rows.as_array().and_then(|a| a.first()).and_then(|v| {
+        Some(OpenPullRequest { number: v.get("number")?.as_u64()?, url: v.get("url")?.as_str()?.to_string() })
+    }))
+}
+
+/// Lists Studio pull requests with their checks, comments and reviews. Merged
+/// requests are included so the caller can retire their Development copies.
+/// The caller should run this off the UI thread because `gh` contacts GitHub.
+pub fn pull_requests(root: &Path, repo: &Repo, gh_exe: &Path) -> Result<Vec<PullRequestStatus>> {
+    let fields = "number,title,url,headRefName,state,mergedAt,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup,comments,reviews,updatedAt";
+    let out = gh_output(root, gh_exe, &["pr", "list", "--repo", repo_slug(repo), "--state", "all", "--limit", "100", "--json", fields])?;
+    if !out.success {
+        bail!("GitHub pull requests could not be refreshed: {}", last_line(&out));
+    }
+    parse_pull_requests(&out.stdout)
+}
+
+fn parse_pull_requests(json: &str) -> Result<Vec<PullRequestStatus>> {
+    let rows: Value = serde_json::from_str(json).context("reading GitHub's pull request status")?;
+    let mut prs = Vec::new();
+    for row in rows.as_array().ok_or_else(|| anyhow!("GitHub returned an unexpected pull request list"))? {
+        let branch = text_field(row, "headRefName");
+        let Some(recipe_id) = branch.strip_prefix(BRANCH_PREFIX).filter(|id| !id.is_empty()) else { continue };
+        let mut activity = Vec::new();
+        for comment in array_field(row, "comments") {
+            activity.push(PullActivity {
+                author: nested_text(comment, "author", "login"),
+                kind: "Comment".into(),
+                body: text_field(comment, "body"),
+                at: text_field(comment, "createdAt"),
+                url: text_field(comment, "url"),
+            });
+        }
+        for review in array_field(row, "reviews") {
+            let state = text_field(review, "state");
+            activity.push(PullActivity {
+                author: nested_text(review, "author", "login"),
+                kind: if state.is_empty() { "Review".into() } else { format!("Review · {state}") },
+                body: text_field(review, "body"),
+                at: text_field(review, "submittedAt"),
+                url: text_field(review, "url"),
+            });
+        }
+        activity.sort_by(|a, b| b.at.cmp(&a.at));
+        let checks = array_field(row, "statusCheckRollup")
+            .iter()
+            .map(|check| {
+                let typename = text_field(check, "__typename");
+                let (name, state, url) = if typename == "StatusContext" {
+                    (text_field(check, "context"), text_field(check, "state"), text_field(check, "targetUrl"))
+                } else {
+                    let conclusion = text_field(check, "conclusion");
+                    let status = text_field(check, "status");
+                    (text_field(check, "name"), if conclusion.is_empty() { status } else { conclusion }, text_field(check, "detailsUrl"))
+                };
+                PullCheck { name, workflow: text_field(check, "workflowName"), state, url }
+            })
+            .collect();
+        prs.push(PullRequestStatus {
+            number: row.get("number").and_then(Value::as_u64).unwrap_or_default(),
+            recipe_id: recipe_id.to_string(),
+            title: text_field(row, "title"),
+            url: text_field(row, "url"),
+            state: text_field(row, "state"),
+            merged_at: text_field(row, "mergedAt"),
+            draft: row.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
+            merge_state: text_field(row, "mergeStateStatus"),
+            review_decision: text_field(row, "reviewDecision"),
+            updated_at: text_field(row, "updatedAt"),
+            checks,
+            activity,
+        });
+    }
+    Ok(prs)
+}
+
+/// Archives Development recipes whose pull requests are merged and whose
+/// contents still exactly match the recipe on the remote default branch.
+/// Changed local work is never moved. The caller should run this off the UI
+/// thread because it fetches the remote default branch.
+pub fn retire_merged_recipes(ws: &Workspace, repo: &Repo, prs: &[PullRequestStatus]) -> Vec<Retirement> {
+    let merged: Vec<&PullRequestStatus> = prs
+        .iter()
+        .filter(|pr| pr.state.eq_ignore_ascii_case("MERGED") && ws.development_recipe_path(&pr.recipe_id).is_file())
+        .collect();
+    if merged.is_empty() {
+        return Vec::new();
+    }
+    let git_exe = match crate::git::git_exe() {
+        Ok(git) => git,
+        Err(error) => {
+            return merged
+                .into_iter()
+                .map(|pr| Retirement {
+                    recipe_id: pr.recipe_id.clone(),
+                    retired: false,
+                    archive: None,
+                    message: format!("Could not verify the merged recipe because git is unavailable: {error:#}"),
+                })
+                .collect();
+        }
+    };
+    let fetch = run_output(&git(&git_exe, &ws.root, &["fetch", "--prune", "origin", &repo.base]));
+    if let Err(error) = fetch.as_ref() {
+        return merged
+            .into_iter()
+            .map(|pr| Retirement {
+                recipe_id: pr.recipe_id.clone(),
+                retired: false,
+                archive: None,
+                message: format!("Could not refresh origin/{} before cleanup: {error:#}", repo.base),
+            })
+            .collect();
+    }
+    if let Ok(output) = fetch
+        && !output.success
+    {
+        let detail = last_line(&output);
+        return merged
+            .into_iter()
+            .map(|pr| Retirement {
+                recipe_id: pr.recipe_id.clone(),
+                retired: false,
+                archive: None,
+                message: format!("Could not refresh origin/{} before cleanup: {detail}", repo.base),
+            })
+            .collect();
+    }
+
+    merged.into_iter().map(|pr| retire_merged_recipe(ws, repo, &git_exe, pr)).collect()
+}
+
+fn retire_merged_recipe(ws: &Workspace, repo: &Repo, git_exe: &Path, pr: &PullRequestStatus) -> Retirement {
+    let unchanged = || Retirement { recipe_id: pr.recipe_id.clone(), retired: false, archive: None, message: String::new() };
+    let plan = match plan(ws, &pr.recipe_id) {
+        Ok(plan) => plan,
+        Err(error) => return Retirement { message: format!("Could not prepare merged-recipe cleanup: {error:#}"), ..unchanged() },
+    };
+    let remote_path = plan.dest.iter().map(|part| part.to_string_lossy()).collect::<Vec<_>>().join("/");
+    let object = format!("origin/{}:{remote_path}", repo.base);
+    let remote = match run_output(&git(git_exe, &ws.root, &["rev-parse", &object])) {
+        Ok(output) => output,
+        Err(error) => return Retirement { message: format!("Could not identify the merged recipe at {object}: {error:#}"), ..unchanged() },
+    };
+    if !remote.success {
+        return Retirement { message: format!("The pull request is merged, but {object} is not available: {}", last_line(&remote)), ..unchanged() };
+    }
+    // `--filters --path` applies the same clean filters used during promotion,
+    // so secrets scrubbed by git do not look like later local edits.
+    let source = plan.source.to_string_lossy().into_owned();
+    let path_arg = format!("--path={remote_path}");
+    let local = match run_output(&git(git_exe, &ws.root, &["hash-object", "--filters", &path_arg, &source])) {
+        Ok(output) => output,
+        Err(error) => return Retirement { message: format!("Could not hash the Development recipe through git filters: {error:#}"), ..unchanged() },
+    };
+    if !local.success {
+        return Retirement { message: format!("Could not hash the Development recipe through git filters: {}", last_line(&local)), ..unchanged() };
+    }
+    if local.stdout.trim() != remote.stdout.trim() {
+        return Retirement {
+            message: "Merged on GitHub, but the Development recipe has changed since it was published; keeping the newer local work.".into(),
+            ..unchanged()
+        };
+    }
+    let archive_dir = ws.layout.artifacts.join("PublishedRecipes");
+    if let Err(error) = std::fs::create_dir_all(&archive_dir) {
+        return Retirement { message: format!("Could not create {}: {error}", archive_dir.display()), ..unchanged() };
+    }
+    let archive = archive_dir.join(format!("{}-pr-{}.yaml", pr.recipe_id, pr.number));
+    if archive.exists() {
+        return Retirement { message: format!("Archive {} already exists; keeping the Development copy.", archive.display()), ..unchanged() };
+    }
+    match std::fs::rename(&plan.source, &archive) {
+        Ok(()) => Retirement {
+            recipe_id: pr.recipe_id.clone(),
+            retired: true,
+            archive: Some(archive.clone()),
+            message: format!("Merged PR #{}; moved the matching Development copy to {}.", pr.number, archive.display()),
+        },
+        Err(error) => Retirement { message: format!("Could not archive {}: {error}", plan.source.display()), ..unchanged() },
+    }
+}
+
+fn text_field(value: &Value, field: &str) -> String {
+    value.get(field).and_then(Value::as_str).unwrap_or_default().to_string()
+}
+
+fn nested_text(value: &Value, object: &str, field: &str) -> String {
+    value.get(object).map(|v| text_field(v, field)).unwrap_or_default()
+}
+
+fn array_field<'a>(value: &'a Value, field: &str) -> &'a [Value] {
+    value.get(field).and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default()
+}
+
 /// Commits `plan` on its branch from `origin/<base>`, pushes it, copies the
 /// icon to the shared folder, and opens a pull request with `gh` when it is
 /// given (falling back to GitHub's compare page). `evidence` goes in the
@@ -296,12 +570,24 @@ pub fn open_pull_request(ws: &Workspace, plan: &Plan, repo: &Repo, gh: Option<&P
     ws.ensure_writable("open a pull request from")?;
     let git_exe = crate::git::git_exe()?;
     let root = &ws.root;
+    let existing = match gh {
+        Some(exe) => find_open_pull_request(root, repo, exe, &plan.branch)?,
+        None => None,
+    };
     run(&git_exe, root, &["fetch", "origin", &repo.base], log)?;
+    if existing.is_some() {
+        run(
+            &git_exe,
+            root,
+            &["fetch", "origin", &format!("refs/heads/{}:refs/remotes/origin/{}", plan.branch, plan.branch)],
+            log,
+        )?;
+    }
 
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
     let dir = std::env::temp_dir().join(format!("ystudio-pr-{}-{stamp}", plan.id));
     let dir_s = dir.to_string_lossy().into_owned();
-    let base_ref = format!("origin/{}", repo.base);
+    let base_ref = existing.as_ref().map_or_else(|| format!("origin/{}", repo.base), |_| format!("origin/{}", plan.branch));
     run(&git_exe, root, &["worktree", "add", "--force", "-B", &plan.branch, &dir_s, &base_ref], log)?;
     let _cleanup = Worktree { git: &git_exe, repo: root, dir: dir.clone(), branch: plan.branch.clone() };
 
@@ -311,10 +597,6 @@ pub fn open_pull_request(ws: &Workspace, plan: &Plan, repo: &Repo, gh: Option<&P
     std::fs::copy(&plan.source, &dest).with_context(|| format!("copying {} into the branch", plan.source.display()))?;
     let dest_s = plan.dest.to_string_lossy().replace('\\', "/");
     run(&git_exe, &dir, &["add", "--", &dest_s], log)?;
-    if run_output(&git(&git_exe, &dir, &["diff", "--cached", "--quiet", "--", &dest_s]))?.success {
-        bail!("{} is already identical on {}; there is nothing to promote.", plan.dest.display(), repo.base);
-    }
-
     // Hash what git commits: a clean filter (Yardstick's cleanSecrets) may
     // rewrite the recipe, and the check hashes the committed version.
     let blob = run_bytes(&git(&git_exe, &dir, &["cat-file", "blob", &format!(":{dest_s}")]))?;
@@ -329,6 +611,10 @@ pub fn open_pull_request(ws: &Workspace, plan: &Plan, repo: &Repo, gh: Option<&P
     std::fs::create_dir_all(evidence_path.parent().unwrap_or(&dir)).with_context(|| format!("creating {EVIDENCE_DIR}"))?;
     std::fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)? + "\n").with_context(|| format!("writing {evidence_rel}"))?;
     run(&git_exe, &dir, &["add", "--", &evidence_rel], log)?;
+    if run_output(&git(&git_exe, &dir, &["diff", "--cached", "--quiet"]))?.success {
+        let target = existing.as_ref().map_or(repo.base.as_str(), |_| plan.branch.as_str());
+        bail!("{} and its evidence are already identical on {target}; there is nothing to promote.", plan.dest.display());
+    }
     if !evidence.validated {
         log(&format!("{}: not validated, so Yardstick's Recipe evidence check will fail until it is tested or the pull request is labelled evidence-waived.", plan.id));
     }
@@ -340,7 +626,12 @@ pub fn open_pull_request(ws: &Workspace, plan: &Plan, repo: &Repo, gh: Option<&P
         plan.id
     );
     run(&git_exe, &dir, &["commit", "-m", &title, "-m", &body], log)?;
-    run(&git_exe, &dir, &["push", "--force-with-lease", "origin", &format!("HEAD:refs/heads/{}", plan.branch)], log)?;
+    let destination = format!("HEAD:refs/heads/{}", plan.branch);
+    if existing.is_some() {
+        run(&git_exe, &dir, &["push", "origin", &destination], log)?;
+    } else {
+        run(&git_exe, &dir, &["push", "--force-with-lease", "origin", &destination], log)?;
+    }
 
     copy_icon(plan, log);
 
@@ -349,16 +640,19 @@ pub fn open_pull_request(ws: &Workspace, plan: &Plan, repo: &Repo, gh: Option<&P
         log("gh is not installed; the pull request is created from GitHub's compare page.");
         return Ok(Outcome::Compare { url: compare });
     };
-    let slug = repo.web_url.trim_start_matches("https://");
-    let slug = slug.strip_prefix("github.com/").unwrap_or(slug);
+    let slug = repo_slug(repo);
+    if let Some(existing) = existing {
+        log(&format!("A pull request for {} is already open; appending the new commit to PR #{}.", plan.id, existing.number));
+        let number = existing.number.to_string();
+        match gh_output(root, gh, &["pr", "edit", &number, "--repo", slug, "--title", &title, "--body", &body]) {
+            Ok(out) if !out.success => log(&format!("The commit was appended, but the pull request description could not be refreshed ({}).", last_line(&out))),
+            Err(e) => log(&format!("The commit was appended, but the pull request description could not be refreshed ({e:#}).")),
+            _ => {}
+        }
+        return Ok(Outcome::PullRequest { url: existing.url, existing: true });
+    }
     log(&format!("> gh pr create --repo {slug} --base {} --head {}", repo.base, plan.branch));
-    let spec = crate::prereqs::with_user_env(
-        ProcessSpec::new("gh", gh, root)
-            .args(["pr", "create", "--repo", slug, "--base", &repo.base, "--head", &plan.branch, "--title", &title, "--body", &body])
-            .env("GH_PROMPT_DISABLED", "1")
-            .env("NO_COLOR", "1"),
-    );
-    let out = run_output(&spec)?;
+    let out = gh_output(root, gh, &["pr", "create", "--repo", slug, "--base", &repo.base, "--head", &plan.branch, "--title", &title, "--body", &body])?;
     if out.success
         && let Some(url) = pull_url(&out.stdout)
     {
@@ -422,6 +716,38 @@ mod tests {
         let err = "a pull request for branch \"studio/x\" into branch \"main\" already exists:\nhttps://github.com/o/r/pull/7";
         assert_eq!(pull_url(err).as_deref(), Some("https://github.com/o/r/pull/7"));
         assert_eq!(pull_url("https://github.com/o/r/compare/main...x"), None);
+    }
+
+    #[test]
+    fn parses_studio_pull_requests_with_checks_and_activity() {
+        let json = r#"[
+          {
+            "number": 42,
+            "title": "Update recipe: brave",
+            "url": "https://github.com/o/r/pull/42",
+            "headRefName": "studio/brave",
+            "state": "OPEN",
+            "mergedAt": null,
+            "isDraft": false,
+            "mergeStateStatus": "BLOCKED",
+            "reviewDecision": "CHANGES_REQUESTED",
+            "updatedAt": "2026-11-16T12:30:00Z",
+            "statusCheckRollup": [
+              {"__typename":"CheckRun","name":"test","workflowName":"CI","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://example/check"},
+              {"__typename":"StatusContext","context":"policy","state":"PENDING","targetUrl":"https://example/policy"}
+            ],
+            "comments": [{"author":{"login":"copilot-pull-request-reviewer[bot]"},"body":"Consider an edge case.","createdAt":"2026-11-16T12:00:00Z","url":"https://example/comment"}],
+            "reviews": [{"author":{"login":"octocat"},"body":"Please update the test.","state":"CHANGES_REQUESTED","submittedAt":"2026-11-16T12:10:00Z","url":"https://example/review"}]
+          },
+          {"number": 7, "headRefName": "feature/not-studio"}
+        ]"#;
+        let prs = parse_pull_requests(json).unwrap();
+        assert_eq!(prs.len(), 1);
+        assert_eq!((prs[0].recipe_id.as_str(), prs[0].number), ("brave", 42));
+        assert_eq!(prs[0].state, "OPEN");
+        assert_eq!(prs[0].checks.iter().map(|c| c.state.as_str()).collect::<Vec<_>>(), ["SUCCESS", "PENDING"]);
+        assert_eq!(prs[0].activity[0].author, "octocat");
+        assert!(prs[0].activity.iter().any(|a| a.author.contains("copilot")));
     }
 
     #[test]
@@ -522,7 +848,7 @@ mod tests {
         assert!(g(root, &["worktree", "list"]).lines().count() == 1);
 
         // Promoting again rebuilds the branch from main and updates it.
-        std::fs::write(root.join(r"Recipes\Development\brave.yaml"), "id: brave\niconFile: brave.png\nversion: 2\n").unwrap();
+        std::fs::write(root.join(r"Recipes\Development\brave.yaml"), "id: brave\niconFile: brave.png\nversion: 2\nurl: https://secret.example/brave.msi\n").unwrap();
         let changed = Evidence::new("brave", &Completion::NotValidated, None, None);
         let mut lines = Vec::new();
         open_pull_request(&ws, &p, &repo, None, &changed, &mut |l| lines.push(l.to_string())).unwrap();
@@ -537,5 +863,35 @@ mod tests {
         g(origin.path(), &["update-ref", "refs/heads/main", "refs/heads/studio/brave"]);
         let err = open_pull_request(&ws, &p, &repo, None, &changed, &mut |_| {}).unwrap_err();
         assert!(err.to_string().contains("already identical"), "{err:#}");
+
+        let merged = PullRequestStatus {
+            number: 42,
+            recipe_id: "brave".into(),
+            title: "Add brave".into(),
+            url: "https://github.com/o/r/pull/42".into(),
+            state: "MERGED".into(),
+            merged_at: "2026-11-16T12:00:00Z".into(),
+            draft: false,
+            merge_state: String::new(),
+            review_decision: String::new(),
+            updated_at: String::new(),
+            checks: Vec::new(),
+            activity: Vec::new(),
+        };
+        let retired = retire_merged_recipes(&ws, &repo, std::slice::from_ref(&merged));
+        assert_eq!(retired.len(), 1);
+        assert!(retired[0].retired, "{:?}", retired[0]);
+        assert!(!dev_recipe.exists());
+        assert_eq!(
+            std::fs::read_to_string(retired[0].archive.as_ref().unwrap()).unwrap(),
+            "id: brave\niconFile: brave.png\nversion: 2\nurl: https://secret.example/brave.msi\n"
+        );
+
+        // Work added after publication is never retired by an older merge.
+        std::fs::write(&dev_recipe, "id: brave\niconFile: brave.png\nversion: 3\n").unwrap();
+        let kept = retire_merged_recipes(&ws, &repo, &[PullRequestStatus { number: 43, ..merged }]);
+        assert_eq!(kept.len(), 1);
+        assert!(!kept[0].retired && kept[0].message.contains("changed since it was published"));
+        assert!(dev_recipe.exists());
     }
 }

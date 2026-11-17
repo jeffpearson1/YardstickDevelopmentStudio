@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use eframe::egui::{self, RichText, Ui};
-use ystudio_core::recipe::{self, RecipeDoc};
+use ystudio_core::recipe;
 use ystudio_core::workspace::{RecipeEntry, RecipeLocation};
 
 use crate::app::{StudioApp, View};
@@ -23,14 +23,8 @@ pub struct LibraryState {
     pub filter: String,
     pub location: LocationFilter,
     pub group: Option<String>,
-    pub new_open: bool,
-    pub new_template: usize,
-    pub new_display: String,
-    pub new_publisher: String,
-    pub new_id: String,
-    pub new_id_touched: bool,
-    pub new_vendor: String,
-    pub new_notes: String,
+    /// Recipe Builder opened the library to add existing recipes to its list.
+    pub adding_to_builder: bool,
     pub duplicate_of: Option<(String, PathBuf)>,
     pub duplicate_id: String,
     /// "Update several recipes": rows get checkboxes, and the picked recipes
@@ -38,8 +32,6 @@ pub struct LibraryState {
     pub selecting: bool,
     pub picked: BTreeSet<String>,
     pub update_notes: String,
-    /// Templates listed when the New recipe window opened.
-    templates: Option<Vec<PathBuf>>,
 }
 
 pub fn show(app: &mut StudioApp, ui: &mut Ui) {
@@ -48,11 +40,11 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     }
     super::production_banner(app, ui);
     let writable = app.writable();
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         theme::page_title(ui, "Recipe Library");
         ui.add_space(12.0);
         if ui.add_enabled(writable, egui::Button::new("\u{E710}  New recipe")).clicked() {
-            app.library.new_open = true;
+            super::batch::show_new_recipe(app);
         }
         if ui
             .add_enabled(writable, egui::Button::selectable(app.library.selecting, "\u{E762}  Update several…"))
@@ -72,6 +64,18 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             app.refresh_remote(false);
         }
     });
+    if app.library.adding_to_builder {
+        theme::card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Add recipes to Recipe Builder").semibold());
+                ui.label(RichText::new("Click recipes below; added recipes stay highlighted.").weak());
+                if theme::primary(ui, true, "Done - return to Recipe Builder").clicked() {
+                    app.library.adding_to_builder = false;
+                    app.view = View::Batch;
+                }
+            });
+        });
+    }
     super::git_bar(app, ui);
     ui.horizontal(|ui| {
         ui.add(egui::TextEdit::singleline(&mut app.library.filter).hint_text("Filter by id…").desired_width(240.0));
@@ -110,7 +114,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     let selecting = app.library.selecting;
     let mut toggle = None;
     let open_path = app.recipe.as_ref().map(|o| o.path.as_path());
-    let mut open = None;
+    let mut add_to_builder = None;
     let mut duplicate = None;
     let row_h = 26.0;
     egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, row_h, rows.len(), |ui, range| {
@@ -125,8 +129,13 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                 }
                 // Both paths come from the same directory listing, so a plain comparison suffices.
                 let is_open = open_path == Some(r.path.as_path());
-                if ui.selectable_label(is_open, RichText::new(&r.id).monospace().strong()).clicked() {
-                    open = Some(r.path.clone());
+                let in_builder = super::batch::contains_recipe(app, &r.id);
+                if ui.selectable_label(is_open || in_builder, RichText::new(&r.id).monospace().strong()).clicked() {
+                    if selecting {
+                        toggle = Some((r.id.clone(), !app.library.picked.contains(&r.id)));
+                    } else {
+                        add_to_builder = Some(r.id.clone());
+                    }
                 }
                 match &r.location {
                     RecipeLocation::Development => theme::badge(ui, "development", theme::amber()),
@@ -145,8 +154,14 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                     {
                         duplicate = Some((r.id.clone(), r.path.clone()));
                     }
-                    if ui.small_button("Open").clicked() {
-                        open = Some(r.path.clone());
+                    if app.library.adding_to_builder {
+                        if in_builder {
+                            theme::badge(ui, "added", theme::green());
+                        } else if ui.small_button("Add").clicked() {
+                            add_to_builder = Some(r.id.clone());
+                        }
+                    } else if ui.small_button("Open in Builder").clicked() {
+                        add_to_builder = Some(r.id.clone());
                     }
                 });
             });
@@ -169,13 +184,22 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             app.library.picked.remove(&id);
         }
     }
-    if let Some(p) = open {
-        app.request_open_recipe(p);
-        app.view = View::Designer;
+    if let Some(id) = add_to_builder {
+        open_in_builder(app, &id);
     }
     if let Some((id, path)) = duplicate {
         app.library.duplicate_id = id.clone();
         app.library.duplicate_of = Some((id, path));
+    }
+}
+
+fn open_in_builder(app: &mut StudioApp, id: &str) {
+    super::batch::add_existing_recipe(app, id);
+    app.library.adding_to_builder = false;
+    if app.open_recipe_by_id(id) {
+        app.view = View::Designer;
+    } else {
+        app.view = View::Batch;
     }
 }
 
@@ -212,135 +236,9 @@ fn selection_bar(lib: &mut LibraryState, ui: &mut Ui, shown: &[String]) -> bool 
     create
 }
 
-/// The library's dialogs; drawn every frame so Home can open them too.
+/// The library's dialogs.
 pub fn windows(app: &mut StudioApp, ctx: &egui::Context) {
-    new_recipe_window(app, ctx);
     duplicate_window(app, ctx);
-}
-
-fn new_recipe_window(app: &mut StudioApp, ctx: &egui::Context) {
-    if !app.library.new_open {
-        return;
-    }
-    let Some(ws) = app.ws.clone() else { return };
-    let templates = app.library.templates.get_or_insert_with(|| ws.templates()).clone();
-    let known = |id: &str, dev: bool| {
-        app.recipes.iter().any(|r| r.id.eq_ignore_ascii_case(id) && (r.location == RecipeLocation::Development) == dev)
-    };
-    let can_agent = app.writable() && app.ws_cache.has_skill;
-    let agent_name = app.settings.agent_backend.label();
-    let mut open = true;
-    let mut create = false;
-    let mut with_agent = false;
-    egui::Window::new("New recipe").open(&mut open).collapsible(false).default_width(500.0).pivot(egui::Align2::CENTER_CENTER).default_pos(ctx.content_rect().center()).show(ctx, |ui| {
-        let st = &mut app.library;
-        egui::Grid::new("new-grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-            ui.label("Application");
-            if ui.add(egui::TextEdit::singleline(&mut st.new_display).hint_text("e.g. Notepad++").desired_width(320.0)).changed() && !st.new_id_touched {
-                st.new_id = recipe::suggest_id(&st.new_display);
-            }
-            ui.end_row();
-            ui.label("Publisher");
-            ui.add(egui::TextEdit::singleline(&mut st.new_publisher).hint_text("optional").desired_width(320.0));
-            ui.end_row();
-            ui.label("Vendor page");
-            ui.add(egui::TextEdit::singleline(&mut st.new_vendor).hint_text("optional - where the agent starts its research").desired_width(320.0));
-            ui.end_row();
-            ui.label("Recipe id");
-            if ui.add(egui::TextEdit::singleline(&mut st.new_id).desired_width(320.0)).changed() {
-                st.new_id_touched = true;
-            }
-            ui.end_row();
-            ui.label("Notes");
-            ui.add(egui::TextEdit::multiline(&mut st.new_notes).hint_text("optional - licensing, architecture, quirks…").desired_rows(2).desired_width(320.0));
-            ui.end_row();
-        });
-        let id = st.new_id.trim().to_string();
-        let target = ws.development_recipe_path(&id);
-        let valid = recipe::is_valid_id(&id);
-        let exists = known(&id, true);
-        if !id.is_empty() && !valid {
-            ui.colored_label(theme::red(), "Ids are lowercase letters, digits, dots, dashes or underscores.");
-        } else if exists {
-            ui.colored_label(theme::red(), format!("{} already exists.", target.display()));
-        } else if known(&id, false) {
-            ui.colored_label(theme::amber(), "A shipped recipe with this id exists - the development copy will take precedence.");
-        }
-        let ready = valid && !exists && !st.new_display.trim().is_empty();
-        ui.add_space(6.0);
-        let resp = theme::primary(ui, ready && can_agent, format!("\u{E99A}  Write it with {agent_name}"));
-        if !can_agent {
-            resp.on_disabled_hover_text("Needs a writable development folder with the yardstick-recipes skill.");
-        } else if resp.on_hover_text("The agent researches the vendor and writes the recipe; the Studio then tests and repairs it. Follow it in Recipe Builder.").clicked() {
-            with_agent = true;
-        }
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label("or start from a template yourself:");
-            let name = |i: usize| templates.get(i).and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "(blank)".into());
-            egui::ComboBox::from_id_salt("tpl").selected_text(name(st.new_template)).show_ui(ui, |ui| {
-                for i in 0..templates.len() {
-                    ui.selectable_value(&mut st.new_template, i, name(i));
-                }
-                ui.selectable_value(&mut st.new_template, templates.len(), "(blank)");
-            });
-            if ui.add_enabled(ready, egui::Button::new("Create")).on_hover_text(format!("Creates {} and opens it in the Designer.", target.display())).clicked() {
-                create = true;
-            }
-        });
-    });
-    if with_agent {
-        let st = &app.library;
-        let item = ystudio_core::intake::BatchItem {
-            app: st.new_display.trim().to_string(),
-            publisher: st.new_publisher.trim().to_string(),
-            vendor_url: st.new_vendor.trim().to_string(),
-            suggested_id: st.new_id.trim().to_string(),
-            notes: st.new_notes.trim().to_string(),
-            ..Default::default()
-        };
-        if super::batch::start_new_recipe(app, item) {
-            app.library = LibraryState::default();
-        }
-        return;
-    }
-    if create {
-        let st = &app.library;
-        let id = st.new_id.trim().to_string();
-        let result = (|| -> anyhow::Result<PathBuf> {
-            ws.ensure_writable("create recipes")?;
-            let path = ws.development_recipe_path(&id);
-            anyhow::ensure!(!path.exists(), "{} already exists.", path.display());
-            let doc = match templates.get(st.new_template) {
-                Some(t) => recipe::new_from_template(&ystudio_core::read_text(t)?, &id, st.new_display.trim(), st.new_publisher.trim())?,
-                None => {
-                    let mut d = RecipeDoc::default();
-                    d.set_from_text("id", &id);
-                    d.set_from_text("displayName", st.new_display.trim());
-                    d.set_from_text("publisher", st.new_publisher.trim());
-                    d
-                }
-            };
-            std::fs::create_dir_all(path.parent().unwrap())?;
-            std::fs::write(&path, doc.to_yaml())?;
-            Ok(path)
-        })();
-        match result {
-            Ok(path) => {
-                app.library = LibraryState::default();
-                app.refresh_recipes();
-                app.request_open_recipe(path);
-                app.view = View::Designer;
-                app.notify(format!("Created {id}. Walk through each step, then test it."));
-            }
-            Err(e) => app.error(format!("{e:#}")),
-        }
-        return;
-    }
-    if !open {
-        app.library.new_open = false;
-        app.library.templates = None;
-    }
 }
 
 fn duplicate_window(app: &mut StudioApp, ctx: &egui::Context) {
@@ -372,6 +270,7 @@ fn duplicate_window(app: &mut StudioApp, ctx: &egui::Context) {
         match result {
             Ok(dest) => {
                 app.refresh_recipes();
+                super::batch::add_existing_recipe(app, &id);
                 app.request_open_recipe(dest);
                 app.view = View::Designer;
                 app.notify(format!("Copied {src_id} → Recipes\\Development\\{id}.yaml"));
@@ -380,5 +279,23 @@ fn duplicate_window(app: &mut StudioApp, ctx: &egui::Context) {
         }
     } else if !open {
         app.library.duplicate_of = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workflow::tests::fake_app;
+
+    #[test]
+    fn library_recipe_click_routes_to_the_unified_builder() {
+        let (_dir, mut app) = fake_app();
+        app.library.adding_to_builder = true;
+        app.view = View::Recipes;
+        open_in_builder(&mut app, "app");
+        assert_eq!(app.view, View::Designer);
+        assert!(!app.library.adding_to_builder);
+        assert!(super::super::batch::contains_recipe(&app, "app"));
+        assert_eq!(app.recipe.as_ref().map(|r| r.id.as_str()), Some("app"));
     }
 }

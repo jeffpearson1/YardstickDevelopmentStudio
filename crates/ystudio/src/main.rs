@@ -11,12 +11,18 @@ mod workflow;
 
 use eframe::{egui, wgpu};
 
+/// Stable Windows shell identity shared with the installed Start-menu shortcut.
+/// Changing this value would orphan existing taskbar pins.
+const APP_USER_MODEL_ID: &str = "YardstickContributors.YardstickDevelopmentStudio";
+
 fn main() -> anyhow::Result<()> {
     // The hidden elevated worker for live install tests; see ystudio_core::elevation.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some(ystudio_core::elevation::WORKER_ARG) {
         return ystudio_core::elevation::serve_from_args(&args[1..]);
     }
+    set_windows_app_user_model_id();
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Yardstick Development Studio")
         .with_inner_size([1400.0, 900.0])
@@ -49,6 +55,22 @@ fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
+
+/// Tell Explorer that every renderer and launch path belongs to the same app.
+/// This must run before eframe or the software renderer creates a window.
+#[cfg(windows)]
+fn set_windows_app_user_model_id() {
+    use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+
+    let app_id: Vec<u16> = APP_USER_MODEL_ID.encode_utf16().chain(Some(0)).collect();
+    let result = unsafe { SetCurrentProcessExplicitAppUserModelID(app_id.as_ptr()) };
+    if result < 0 {
+        eprintln!("Could not set the Windows AppUserModelID (HRESULT 0x{result:08X}).");
+    }
+}
+
+#[cfg(not(windows))]
+fn set_windows_app_user_model_id() {}
 
 /// Why to paint on the CPU instead of through wgpu, if we should.
 ///

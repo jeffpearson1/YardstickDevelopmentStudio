@@ -25,7 +25,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         app.docs.text = ystudio_core::read_text(p).unwrap_or_default();
         app.docs.selected = Some(p.clone());
     }
-    egui::Panel::left("docs-list").resizable(true).default_size(240.0).show(ui, |ui| {
+    egui::Panel::left("docs-list").resizable(true).default_size(240.0).frame(theme::pane_frame()).show(ui, |ui| {
         theme::page_title(ui, "Docs");
         ui.separator();
         for (label, path) in docs {
@@ -39,16 +39,18 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             ui.weak("No documents found in this folder.");
         }
     });
-    if let Some(p) = &app.docs.selected {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(p.display().to_string()).small().monospace().weak());
-            if ui.small_button("\u{E838}").on_hover_text("Open externally").clicked() {
-                super::open_external(p);
-            }
+    theme::pane(ui, |ui| {
+        if let Some(p) = &app.docs.selected {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(p.display().to_string()).small().monospace().weak());
+                if ui.button("\u{E838}").on_hover_text("Open externally").clicked() {
+                    super::open_external(p);
+                }
+            });
+            ui.separator();
+        }
+        egui::ScrollArea::vertical().id_salt(("doc", app.docs.selected.clone())).auto_shrink(false).show(ui, |ui| {
+            CommonMarkViewer::new().show(ui, &mut app.md_cache, &app.docs.text);
         });
-        ui.separator();
-    }
-    egui::ScrollArea::vertical().id_salt(("doc", app.docs.selected.clone())).auto_shrink(false).show(ui, |ui| {
-        CommonMarkViewer::new().show(ui, &mut app.md_cache, &app.docs.text);
     });
 }

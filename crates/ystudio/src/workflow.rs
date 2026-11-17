@@ -128,7 +128,7 @@ pub fn configure(options: &mut Options, ui: &mut Ui, repairs: bool) {
     options.consent = Consent::None;
     ui.checkbox(&mut options.live, "Include live install/uninstall tests (requires consent)");
     if repairs {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Maximum test-and-fix attempts per recipe");
             ui.add(egui::DragValue::new(&mut options.attempts).range(1..=20));
         });
@@ -137,11 +137,19 @@ pub fn configure(options: &mut Options, ui: &mut Ui, repairs: bool) {
 
 pub fn busy(app: &StudioApp) -> bool {
     app.workflow.busy()
-        || app.jobs.iter().any(|j| j.proc.is_running()
-            && matches!(j.kind, JobKind::Agent { .. } | JobKind::BatchExtract { .. }
-                | JobKind::Harness { .. } | JobKind::WorkflowHarness { .. } | JobKind::WorkflowRepair { .. }
-                | JobKind::PluginAgent { .. }
-                | JobKind::PluginStep { risk: ystudio_core::plugin::Risk::LocalInstall, .. }))
+        || app.jobs.iter().any(|j| {
+            j.proc.is_running()
+                && match &j.kind {
+                    JobKind::Agent { .. }
+                    | JobKind::BatchExtract { .. }
+                    | JobKind::Harness { .. }
+                    | JobKind::WorkflowHarness { .. }
+                    | JobKind::WorkflowRepair { .. }
+                    | JobKind::PluginStep { risk: ystudio_core::plugin::Risk::LocalInstall, .. } => true,
+                    JobKind::PluginAgent { plugin, .. } => !crate::views::plugin_page::has_private_workspace(app, plugin),
+                    _ => false,
+                }
+        })
         || !app.bench.queue.is_empty() || app.bench.live_modal
 }
 
@@ -214,7 +222,7 @@ pub fn modal(app: &mut StudioApp, ctx: &egui::Context) {
         Request::BatchAuthor(indices) => ("Create, test and repair recipes",
             indices.iter().filter_map(|&i| app.batch.batch.as_ref()?.items.get(i))
                 .map(|it| format!("{} ({})", it.app, it.recipe_id())).collect(), true),
-        Request::BatchTests(targets) => ("Test selected batch recipes", targets.iter().map(|t| t.id.clone()).collect(), false),
+        Request::BatchTests(targets) => ("Test batch recipes", targets.iter().map(|t| t.id.clone()).collect(), false),
         Request::BatchRepair(targets) => ("Repair batch recipes with agent", targets.iter().map(|t| if shipped_only(&t.id) {
             format!("{} (shipped recipe; copied into Recipes\\Development first)", t.id)
         } else { t.id.clone() }).collect(), true),
@@ -1054,6 +1062,12 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         }];
         app.batch.batch = Some(batch);
         render(&mut app, "batch-wide", 1400, 900);
+        app.batch.selected_items.insert(0);
+        render(&mut app, "batch-selected-controls", 1400, 900);
+        app.batch.selected_items.clear();
+        app.batch.selected = Some(0);
+        render(&mut app, "batch-single-recipe-controls", 1400, 900);
+        app.batch.selected = None;
         request(&mut app, Request::BatchRepair(vec![Target { id: "app".into(), items: Vec::new() }]));
         render(&mut app, "batch-repair-consent", 1400, 900);
         app.workflow.request = None;
@@ -1066,6 +1080,12 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         app.open_recipe_by_id("app");
         app.view = crate::app::View::Agent;
         render(&mut app, "agent-narrow", 900, 600);
+        app.recipe.as_mut().unwrap().text.push_str("description: unsaved edit\n");
+        crate::views::batch::prompt_clear_for_tests(&mut app);
+        render(&mut app, "batch-clear-open-dirty", 1400, 900);
+        crate::views::batch::dismiss_removal_for_tests(&mut app);
+        let recipe = app.recipe.as_mut().unwrap();
+        recipe.text.clone_from(&recipe.saved);
         app.view = crate::app::View::Batch;
         app.settings.dark_mode = false;
         render(&mut app, "batch-light", 1400, 900);
@@ -1143,17 +1163,19 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         app.library.selecting = true;
         app.library.picked.extend(["app".to_string(), "user".to_string()]);
         render(&mut app, "library-update-several", 1400, 900);
+        app.library.selecting = false;
+        app.library.adding_to_builder = true;
+        render(&mut app, "library-add-to-builder", 1400, 900);
         let items = crate::views::batch::update_items(&app, &["app".into(), "user".into()], "vendor moved");
         assert_eq!(items[0].app, "App");
         assert!(items.iter().all(|i| i.request == ystudio_core::intake::RequestKind::Update && i.notes == "vendor moved"));
         assert_eq!(items[1].existing_recipe, "user");
 
-        app.library.selecting = false;
-        app.library.new_open = true;
-        app.library.new_display = "Obsidian".into();
-        app.library.new_id = "obsidian".into();
-        render(&mut app, "new-recipe-dialog", 1400, 900);
-        app.library.new_open = false;
+        app.library.adding_to_builder = false;
+        crate::views::batch::show_new_recipe(&mut app);
+        app.batch.new_recipe.display = "Obsidian".into();
+        app.batch.new_recipe.id = "obsidian".into();
+        render(&mut app, "recipe-builder-new-recipe", 1400, 900);
         app.batch.paste = Some("Notepad++\n7-Zip 24.08".into());
         render(&mut app, "paste-requests", 1400, 900);
         app.batch.paste = None;
@@ -1200,7 +1222,30 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
             remote_url: origin.path().to_string_lossy().into_owned(), web_url: "https://github.com/o/r".into(), base: "main".into(),
         }), None));
         app.promote.selected.insert("app".into());
+        app.promote.pull_requests_loaded = true;
+        app.promote.pull_requests = vec![ystudio_core::promote::PullRequestStatus {
+            number: 42,
+            recipe_id: "app".into(),
+            title: "Update recipe: app".into(),
+            url: "https://github.com/o/r/pull/42".into(),
+            state: "OPEN".into(),
+            merged_at: String::new(),
+            draft: false,
+            merge_state: "BLOCKED".into(),
+            review_decision: "CHANGES_REQUESTED".into(),
+            updated_at: "2026-11-16T12:30:00Z".into(),
+            checks: vec![
+                ystudio_core::promote::PullCheck { name: "Recipe evidence".into(), workflow: "CI".into(), state: "SUCCESS".into(), url: "https://github.com/o/r/actions/runs/1".into() },
+                ystudio_core::promote::PullCheck { name: "Windows runner".into(), workflow: "CI".into(), state: "IN_PROGRESS".into(), url: "https://github.com/o/r/actions/runs/2".into() },
+            ],
+            activity: vec![ystudio_core::promote::PullActivity {
+                author: "copilot-pull-request-reviewer[bot]".into(), kind: "Review · COMMENTED".into(),
+                body: "Consider preserving the existing validation evidence when this branch is updated.".into(),
+                at: "2026-11-16T12:10:00Z".into(), url: "https://github.com/o/r/pull/42#pullrequestreview-1".into(),
+            }],
+        }];
         render(&mut app, "publish", 1400, 900);
+        render(&mut app, "publish-narrow", 900, 700);
         app.promote.modal = true;
         render(&mut app, "publish-confirm", 1400, 900);
         app.promote.modal = false;

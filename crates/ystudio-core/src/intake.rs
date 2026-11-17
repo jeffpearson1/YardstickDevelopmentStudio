@@ -475,6 +475,9 @@ pub struct BatchItem {
     pub suggested_id: String,
     pub platform: String,
     pub notes: String,
+    /// `recipe-builder` (or empty for older batches), or an installed plugin id
+    /// chosen to handle this request instead of a reusable Yardstick recipe.
+    pub handler: String,
     /// 0..1, how sure the extractor is.
     pub confidence: f32,
 
@@ -489,6 +492,8 @@ pub struct BatchItem {
     pub action: ItemAction,
     /// The failure evidence a Fix was started with.
     pub evidence: String,
+    /// Work item created in `handler`, when the request has been handed off.
+    pub handler_item: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -514,6 +519,10 @@ impl BatchCheck {
 }
 
 impl BatchItem {
+    pub fn is_recipe_work(&self) -> bool {
+        self.handler.is_empty() || self.handler == "recipe-builder"
+    }
+
     /// An item recording `task` for `recipe` (named `name`), so a run started
     /// from a recipe's Agent tab is tracked, and can be run again, like any other.
     pub fn for_task(task: &crate::agent::AgentTask, recipe: &str, name: &str) -> Self {
@@ -957,6 +966,10 @@ fn flag_duplicates(items: &mut [BatchItem]) {
 
 /// Validates and normalises an agent's `items.json` against the library.
 pub fn parse_agent_items(text: &str, recipes: &[RecipeEntry]) -> Result<Vec<BatchItem>> {
+    parse_agent_items_for(text, recipes, &[])
+}
+
+pub fn parse_agent_items_for(text: &str, recipes: &[RecipeEntry], plugin_ids: &[String]) -> Result<Vec<BatchItem>> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Shape {
@@ -971,6 +984,14 @@ pub fn parse_agent_items(text: &str, recipes: &[RecipeEntry]) -> Result<Vec<Batc
     for it in &mut items {
         it.app = it.app.trim().to_string();
         it.urls.retain(|u| u.starts_with("http"));
+        it.handler = it.handler.trim().to_ascii_lowercase();
+        if it.handler == "recipe-builder" {
+            it.handler.clear();
+        } else if !it.handler.is_empty() && !plugin_ids.iter().any(|id| id.eq_ignore_ascii_case(&it.handler)) {
+            it.notes = format!("{} (Agent suggested unavailable handler '{}'; kept in Recipe Builder.)", it.notes, it.handler).trim().to_string();
+            it.handler.clear();
+        }
+        it.handler_item = None;
         if !it.existing_recipe.is_empty() && !recipes.iter().any(|r| r.id.eq_ignore_ascii_case(&it.existing_recipe)) {
             it.notes = format!("{} (Agent named recipe '{}', which is not in the library.)", it.notes, it.existing_recipe).trim().to_string();
             it.existing_recipe.clear();
@@ -991,7 +1012,7 @@ pub fn parse_agent_items(text: &str, recipes: &[RecipeEntry]) -> Result<Vec<Batc
             it.suggested_id = if it.existing_recipe.is_empty() { crate::recipe::suggest_id(&it.app) } else { it.existing_recipe.clone() };
         }
         it.confidence = if it.confidence > 1.0 { it.confidence / 100.0 } else { it.confidence }.clamp(0.0, 1.0);
-        it.include = matches!(it.request, RequestKind::New | RequestKind::Update);
+        it.include = it.is_recipe_work() && matches!(it.request, RequestKind::New | RequestKind::Update);
         it.status = ItemStatus::Pending;
     }
     items.retain(|i| !i.app.is_empty());
@@ -1015,6 +1036,7 @@ pub const AGENT_SCHEMA: &str = r#"{
       "suggestedId": "qgis",                // lowercase id for a new recipe
       "platform": "Windows",                // Windows | macOS | unknown
       "notes": "Licensed per seat; installer only on the requester's Dropbox.",
+      "handler": "recipe-builder",          // recipe-builder, or an id from plugins.md when that plugin is a better fit
       "confidence": 0.9
     }
   ]
@@ -1099,7 +1121,10 @@ impl Batch {
 
     /// Items still to do: included software that is not done or skipped.
     pub fn open_items(&self) -> usize {
-        self.items.iter().filter(|i| i.include && i.request != RequestKind::NotSoftware && !matches!(i.status, ItemStatus::Done | ItemStatus::Skipped)).count()
+        self.items
+            .iter()
+            .filter(|i| i.include && i.is_recipe_work() && i.request != RequestKind::NotSoftware && !matches!(i.status, ItemStatus::Done | ItemStatus::Skipped))
+            .count()
     }
 
     pub fn save(&self) -> Result<()> {
@@ -1136,7 +1161,7 @@ impl Batch {
 
     /// Writes `digest.md` (the requests) and `recipes.md` (what already exists)
     /// into `dir` (normally [`Batch::dir`]) for an extraction agent, removing stale output.
-    pub fn prepare_agent(&self, dir: &Path, recipes: &[RecipeEntry]) -> Result<()> {
+    pub fn prepare_agent(&self, dir: &Path, recipes: &[RecipeEntry], plugins: &[(String, String, String)]) -> Result<()> {
         std::fs::create_dir_all(dir)?;
         let doc = Document { path: self.source.clone(), format: self.format.clone(), records: self.records.clone() };
         std::fs::write(dir.join("digest.md"), digest(&doc, 600_000))?;
@@ -1148,15 +1173,20 @@ impl Batch {
             }
         }
         std::fs::write(dir.join("recipes.md"), list)?;
+        let mut handlers = String::from("# Available handlers\n\nUse Recipe Builder for software that should become a reusable, maintained Yardstick recipe. Choose a plugin only when the request clearly fits its stated purpose.\n\nid | name | purpose\n---|---|---\nrecipe-builder | Recipe Builder | Reusable Yardstick recipes maintained and published through the normal workflow.\n");
+        for (id, name, purpose) in plugins {
+            handlers += &format!("{} | {} | {}\n", id.replace('|', "/"), name.replace('|', "/"), purpose.replace(['|', '\n'], " "));
+        }
+        std::fs::write(dir.join("plugins.md"), handlers)?;
         let _ = std::fs::remove_file(dir.join(Self::AGENT_OUTPUT));
         Ok(())
     }
 
     /// Replaces the items with the agent's (the caller saves).
-    pub fn load_agent_items(&mut self, dir: &Path, recipes: &[RecipeEntry], backend: &str) -> Result<usize> {
+    pub fn load_agent_items(&mut self, dir: &Path, recipes: &[RecipeEntry], plugin_ids: &[String], backend: &str) -> Result<usize> {
         let path = dir.join(Self::AGENT_OUTPUT);
         let text = crate::read_text(&path).with_context(|| format!("the agent did not write {}", path.display()))?;
-        let items = parse_agent_items(&text, recipes)?;
+        let items = parse_agent_items_for(&text, recipes, plugin_ids)?;
         self.items = items;
         self.extracted_by = backend.to_string();
         Ok(self.items.len())
@@ -1166,7 +1196,9 @@ impl Batch {
     pub fn report(&self) -> String {
         let mut s = String::from("| Ticket | Software | Version | Outcome | Recipe | Notes |\n|---|---|---|---|---|---|\n");
         for it in &self.items {
-            let outcome = if !it.checks.is_empty() {
+            let outcome = if !it.is_recipe_work() {
+                if it.handler_item.is_some() { format!("sent to {}", it.handler) } else { format!("suggested for {}", it.handler) }
+            } else if !it.checks.is_empty() {
                 it.checks.iter().map(|c| format!("{}: {}", c.recipe, c.note)).collect::<Vec<_>>().join("; ")
             } else { match it.status {
                 ItemStatus::Done => "recipe ready for live test".to_string(),
@@ -1174,7 +1206,7 @@ impl Batch {
                 ItemStatus::Skipped => "skipped".to_string(),
                 _ => it.request.label().to_string(),
             }};
-            let recipe = if it.recipes.is_empty() { it.existing_recipe.clone() } else { it.recipes.join(", ") };
+            let recipe = if !it.is_recipe_work() { String::new() } else if it.recipes.is_empty() { it.existing_recipe.clone() } else { it.recipes.join(", ") };
             let cell = |s: &str| s.replace('|', "/").replace('\n', " ");
             s += &format!("| {} | {} | {} | {} | {} | {} |\n", cell(&it.source), cell(&it.app), cell(&it.version), cell(&outcome), cell(&recipe), cell(&it.notes));
         }
@@ -1384,6 +1416,17 @@ mod tests {
         assert!(items[1].existing_recipe.is_empty());
         assert!(items[1].notes.contains("not in the library"));
         assert_eq!(items[1].suggested_id, "foo");
+
+        let routed = parse_agent_items_for(
+            r#"{"items":[{"source":"T3","app":"Licensed App","request":"new","handler":"oneoff-packager"},{"source":"T4","app":"Other","request":"new","handler":"made-up"}]}"#,
+            &lib,
+            &["oneoff-packager".to_string()],
+        )
+        .unwrap();
+        assert_eq!(routed[0].handler, "oneoff-packager");
+        assert!(!routed[0].include && !routed[0].is_recipe_work());
+        assert!(routed[1].handler.is_empty() && routed[1].include);
+        assert!(routed[1].notes.contains("unavailable handler"));
     }
 
     #[test]
@@ -1476,14 +1519,19 @@ mod tests {
         let recipes = vec![recipe("qgis", "QGIS")];
         let mut b = Batch::new(doc, &recipes);
         std::fs::write(d.path().join(Batch::AGENT_OUTPUT), "stale").unwrap();
-        b.prepare_agent(d.path(), &recipes).unwrap();
+        let plugins = [("oneoff-packager".into(), "One-Off Packager".into(), "One-time and supplied-media requests.".into())];
+        b.prepare_agent(d.path(), &recipes, &plugins).unwrap();
         assert!(std::fs::read_to_string(d.path().join("digest.md")).unwrap().contains("## T1 - Package Zoom"));
         assert!(std::fs::read_to_string(d.path().join("recipes.md")).unwrap().contains("qgis | QGIS"));
-        assert!(b.load_agent_items(d.path(), &recipes, "x").is_err(), "stale output must be removed");
-        std::fs::write(d.path().join(Batch::AGENT_OUTPUT), r#"{"items":[{"source":"T1","app":"QGIS","request":"new"},{"source":"T1","app":"Zoom Workplace","request":"new"}]}"#).unwrap();
-        assert_eq!(b.load_agent_items(d.path(), &recipes, "GitHub Copilot CLI").unwrap(), 2);
+        assert!(std::fs::read_to_string(d.path().join("plugins.md")).unwrap().contains("oneoff-packager | One-Off Packager"));
+        let plugin_ids = ["oneoff-packager".to_string()];
+        assert!(b.load_agent_items(d.path(), &recipes, &plugin_ids, "x").is_err(), "stale output must be removed");
+        std::fs::write(d.path().join(Batch::AGENT_OUTPUT), r#"{"items":[{"source":"T1","app":"QGIS","request":"new"},{"source":"T1","app":"Zoom Workplace","request":"new","handler":"oneoff-packager"}]}"#).unwrap();
+        assert_eq!(b.load_agent_items(d.path(), &recipes, &plugin_ids, "GitHub Copilot CLI").unwrap(), 2);
         assert_eq!(b.items[0].existing_recipe, "qgis");
         assert_eq!(b.items[0].request, RequestKind::Existing);
+        assert_eq!(b.items[1].handler, "oneoff-packager");
+        assert!(!b.items[1].include);
         assert_eq!(b.extracted_by, "GitHub Copilot CLI");
     }
 }

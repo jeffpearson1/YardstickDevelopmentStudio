@@ -135,7 +135,33 @@ fn job_in(app: &StudioApp, dir: &Path) -> Option<(u64, String)> {
 }
 
 pub fn plugin_busy(app: &StudioApp, id: &str) -> bool {
-    app.jobs.iter().any(|j| j.proc.is_running() && matches!(&j.kind, JobKind::PluginStep { plugin, .. } | JobKind::PluginAgent { plugin, .. } if plugin == id))
+    app.jobs.iter().any(|j| {
+        j.proc.is_running()
+            && match &j.kind {
+                JobKind::PluginStep { plugin, .. } | JobKind::PluginAgent { plugin, .. } | JobKind::PluginClone { plugin, .. } => plugin == id,
+                _ => false,
+            }
+    })
+}
+
+/// A plugin with a separate private repository does not touch the active Yardstick
+/// checkout, so its file-only agent work may run beside Recipe Builder.
+pub fn has_private_workspace(app: &StudioApp, id: &str) -> bool {
+    let Some(installed) = app.plugins.get(id) else { return false };
+    let Some(def) = installed.manifest.settings.iter().find(|setting| setting.clone_repository) else { return false };
+    let Some(path) = app.settings.plugins.get(id).and_then(|prefs| prefs.values.get(&def.key)).map(PathBuf::from) else { return false };
+    path.is_absolute() && app.ws.as_ref().is_none_or(|workspace| !ystudio_core::same_path(&workspace.root, &path))
+}
+
+fn isolated_agent_conflict(app: &StudioApp, id: &str) -> bool {
+    app.jobs.iter().any(|job| {
+        job.proc.is_running()
+            && match &job.kind {
+                JobKind::PluginAgent { plugin, .. } => plugin == id,
+                JobKind::PluginStep { risk: Risk::LocalInstall, .. } | JobKind::BatchExtract { .. } => true,
+                _ => false,
+            }
+    })
 }
 
 /// Starts a step. Hash-gated steps need a granted approval; `confirmed`
@@ -357,7 +383,7 @@ fn workitems(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, root: &Path) {
         page.refresh_items(root);
     }
     let mut import = false;
-    egui::Panel::left(("plugin-items", &id)).resizable(true).default_size(300.0).show(ui, |ui| {
+    egui::Panel::left(("plugin-items", &id)).resizable(true).default_size(300.0).frame(theme::pane_frame()).show(ui, |ui| {
         let page = app.plugins.page(&id);
         ui.horizontal(|ui| {
             if theme::primary(ui, true, format!("\u{E710}  New {}", m.page.noun.to_lowercase())).clicked() {
@@ -415,12 +441,14 @@ fn workitems(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, root: &Path) {
         run_step(app, &id, root, &importer, params, false, Purpose::Import);
     }
     let selected = app.plugins.page(&id).selected.clone();
-    egui::ScrollArea::vertical().id_salt(("plugin-detail", &id)).auto_shrink(false).show(ui, |ui| match selected.and_then(|d| WorkItem::open(&d).ok()) {
-        Some(item) if item.dir.is_dir() => item_detail(app, ui, c, &item),
-        _ => {
-            ui.add_space(24.0);
-            ui.label(RichText::new(format!("Pick a {} on the left, or start a new one.", m.page.noun.to_lowercase())).weak());
-        }
+    theme::pane(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt(("plugin-detail", &id)).auto_shrink(false).show(ui, |ui| match selected.and_then(|d| WorkItem::open(&d).ok()) {
+            Some(item) if item.dir.is_dir() => item_detail(app, ui, c, &item),
+            _ => {
+                ui.add_space(24.0);
+                ui.label(RichText::new(format!("Pick a {} on the left, or start a new one.", m.page.noun.to_lowercase())).weak());
+            }
+        });
     });
 }
 
@@ -431,6 +459,20 @@ fn item_detail(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem) {
         ui.label(RichText::new(&item.meta.title).heading());
         if ui.small_button("\u{E838}  Open folder").clicked() {
             super::open_in_explorer(&item.dir);
+        }
+        if ui
+            .small_button("\u{E70F}  Continue in Recipe Builder")
+            .on_hover_text("Use this request to create a reusable Yardstick recipe instead; the plugin work item is kept.")
+            .clicked()
+        {
+            let request = ystudio_core::read_text(&item.dir.join("ticket.md")).unwrap_or_default();
+            let notes = format!(
+                "Continued from {} work item '{}'.\n\n{}",
+                c.plugin.manifest.name,
+                item.name(),
+                request
+            );
+            crate::views::batch::add_plugin_work_item(app, &item.meta.title, &item.meta.reference, &notes);
         }
     });
     let mut facts = vec![item.name()];
@@ -465,13 +507,14 @@ fn item_detail(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem) {
     theme::section_heading(ui, "Pipeline");
     if m.agent.as_ref().is_some_and(|a| !a.tasks.is_empty()) {
         egui::CollapsingHeader::new("Agent options").id_salt(("plugin-agent-options", &id)).default_open(false).show(ui, |ui| {
-            ui.add_enabled_ui(!crate::workflow::busy(app), |ui| {
+            let agent_available = if has_private_workspace(app, &id) { !isolated_agent_conflict(app, &id) } else { !crate::workflow::busy(app) };
+            ui.add_enabled_ui(agent_available, |ui| {
                 super::settings::agent_picker(app, ui, &format!("plugin-{id}"));
                 super::settings::downloads_checkbox(app, ui);
             });
         });
     }
-    let busy_elsewhere = crate::workflow::busy(app);
+    let busy_elsewhere = if has_private_workspace(app, &id) { isolated_agent_conflict(app, &id) } else { crate::workflow::busy(app) };
     for stage in m.pipeline() {
         let rec = item.step(stage.id());
         let state = if running.as_ref().is_some_and(|(_, s)| s == stage.id()) { StepState::Running } else { rec.state };
@@ -753,7 +796,7 @@ fn catalog(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, root: &Path) {
 
     let rows = app.plugins.page(&id).rows.clone();
     let cols = columns(&m.page.columns, &rows);
-    egui::Panel::left(("plugin-rows", &id)).resizable(true).default_size(520.0).show(ui, |ui| {
+    egui::Panel::left(("plugin-rows", &id)).resizable(true).default_size(520.0).frame(theme::pane_frame()).show(ui, |ui| {
         egui::ScrollArea::both().id_salt(("plugin-rows-scroll", &id)).auto_shrink(false).show(ui, |ui| {
             if rows.is_empty() {
                 ui.label(RichText::new("Search to list items.").weak());
@@ -783,12 +826,12 @@ fn catalog(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, root: &Path) {
         });
     });
     let Some((i, row)) = app.plugins.page(&id).selected_row.and_then(|i| rows.get(i).map(|r| (i, r.clone()))) else {
-        ui.label(RichText::new("Pick a row to see its details and actions.").weak());
+        theme::pane(ui, |ui| ui.label(RichText::new("Pick a row to see its details and actions.").weak()));
         return;
     };
     let key = row_key(&row, i);
     let folder = row.get("folder").map(cell).filter(|f| plugin::safe_relative(f)).map(|f| root.join(f)).or_else(|| app.plugins.page(&id).row_folders.get(&key).cloned());
-    egui::ScrollArea::vertical().id_salt(("plugin-row-detail", &id)).auto_shrink(false).show(ui, |ui| {
+    theme::pane(ui, |ui| egui::ScrollArea::vertical().id_salt(("plugin-row-detail", &id)).auto_shrink(false).show(ui, |ui| {
         let title = cols.first().and_then(|c| row.get(c)).map(cell).unwrap_or_else(|| key.clone());
         ui.label(RichText::new(title).heading());
         egui::Grid::new(("plugin-row-fields", &id)).num_columns(2).show(ui, |ui| {
@@ -809,7 +852,7 @@ fn catalog(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, root: &Path) {
             refresh_panels(app, &id, c, dir, false);
             panels(app, ui, &id, c, dir);
         }
-    });
+    }));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1078,6 +1121,37 @@ fn create_item(root: &Path, pattern: &str, title: &str, reference: &str, text: &
         }
     }
     Ok(item)
+}
+
+/// Creates a plugin work item directly from a Recipe Builder request and opens it.
+pub fn create_from_recipe_builder(
+    app: &mut StudioApp,
+    plugin_id: &str,
+    title: &str,
+    reference: &str,
+    text: &str,
+    key: &str,
+) -> anyhow::Result<PathBuf> {
+    let c = context(app, plugin_id).ok_or_else(|| anyhow::anyhow!("The selected plugin is no longer installed."))?;
+    c.plugin.ensure_runnable()?;
+    let root = c.root.ok_or_else(|| anyhow::anyhow!("Set up {} in Settings first.", c.plugin.manifest.name))?;
+    let item = create_item(
+        &root,
+        &c.plugin.manifest.page.folder,
+        title,
+        reference,
+        text,
+        &[],
+        Origin { kind: "recipe-builder".into(), from_plugin: "recipe-builder".into(), key: key.to_string() },
+    )?;
+    let dir = item.dir.clone();
+    let page = app.plugins.page(plugin_id);
+    page.refresh_items(&root);
+    page.selected = Some(dir.clone());
+    if let Some(view) = app.plugins.view_of(plugin_id) {
+        app.view = view;
+    }
+    Ok(dir)
 }
 
 fn import_modal(app: &mut StudioApp, ctx: &egui::Context, c: &Ctx) {
@@ -1360,6 +1434,59 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn recipe_builder_and_oneoff_handoffs_preserve_context_and_private_clone() {
+        let (dir, mut app) = fake_app();
+        if !PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(r"..\..\plugins\oneoff-packager\plugin.yaml").is_file() {
+            return;
+        }
+        let (oneoff, _) = install_repo_plugins(&mut app, dir.path());
+        let private = dir.path().join("private-yardstick");
+        std::fs::create_dir_all(private.join(".git")).unwrap();
+        app.settings
+            .plugins
+            .entry("oneoff-packager".into())
+            .or_default()
+            .values
+            .insert("yardstickDevPath".into(), private.to_string_lossy().into());
+        assert!(has_private_workspace(&app, "oneoff-packager"));
+        app.plugins_ui.open_settings = Some("oneoff-packager".into());
+        app.view = View::Settings;
+        render(&mut app, "oneoff-private-clone-setting", 1400, 1900);
+
+        let made = create_from_recipe_builder(
+            &mut app,
+            "oneoff-packager",
+            "Licensed Lab Tool",
+            "TASK-42",
+            "Requester supplied licensed media.",
+            "batch:0",
+        )
+        .unwrap();
+        assert!(made.starts_with(&oneoff));
+        assert_eq!(ystudio_core::read_text(&made.join("ticket.md")).unwrap(), "Requester supplied licensed media.");
+        let item = WorkItem::open(&made).unwrap();
+        assert_eq!((item.meta.origin.kind.as_str(), item.meta.origin.from_plugin.as_str(), item.meta.origin.key.as_str()), ("recipe-builder", "recipe-builder", "batch:0"));
+
+        assert!(crate::views::batch::add_plugin_work_item(
+            &mut app,
+            &item.meta.title,
+            &item.meta.reference,
+            "Continued from One-Off Packager.",
+        ));
+        let returned = app.batch.batch.as_ref().unwrap().items.last().unwrap();
+        assert!(returned.is_recipe_work());
+        assert_eq!((returned.app.as_str(), returned.source.as_str()), ("Licensed Lab Tool", "TASK-42"));
+        render(&mut app, "recipe-builder-plugin-return", 1400, 900);
+        render(&mut app, "recipe-builder-plugin-return-narrow", 900, 600);
+        let returned = app.batch.batch.as_mut().unwrap().items.last_mut().unwrap();
+        returned.handler = "oneoff-packager".into();
+        returned.handler_item = Some(made);
+        returned.include = false;
+        app.batch.selected = Some(app.batch.batch.as_ref().unwrap().items.len() - 1);
+        render(&mut app, "recipe-builder-plugin-destination", 1400, 900);
+    }
+
+    #[test]
     fn an_sccm_application_is_handed_to_the_oneoff_packager() {
         let (dir, mut app) = fake_app();
         if !PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(r"..\..\plugins\sccm-migration\plugin.yaml").is_file() {
@@ -1495,17 +1622,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn recipe_handoff_fills_the_new_recipe_dialog() {
+    fn recipe_handoff_fills_recipe_builder() {
         let (dir, mut app) = fake_app();
         let notes = dir.path().join("export.md");
         std::fs::write(&notes, "## Spectragryph\n\nSilent switch: /S\n").unwrap();
         let row = serde_json::json!({"key": "ScopeId_1/Application_2", "name": "Spectragryph optical spectroscopy", "manufacturer": "Dr. F. Menges"});
         recipe_handoff(&mut app, &row, "ScopeId_1/Application_2", &notes);
-        assert_eq!(app.view, View::Recipes);
-        assert!(app.library.new_open);
-        assert_eq!((app.library.new_display.as_str(), app.library.new_publisher.as_str()), ("Spectragryph optical spectroscopy", "Dr. F. Menges"));
-        assert!(app.library.new_notes.contains("Silent switch: /S"));
-        assert!(ystudio_core::recipe::is_valid_id(&app.library.new_id), "{}", app.library.new_id);
+        assert_eq!(app.view, View::Batch);
+        assert_eq!((app.batch.new_recipe.display.as_str(), app.batch.new_recipe.publisher.as_str()), ("Spectragryph optical spectroscopy", "Dr. F. Menges"));
+        assert!(app.batch.new_recipe.notes.contains("Silent switch: /S"));
+        assert!(ystudio_core::recipe::is_valid_id(&app.batch.new_recipe.id), "{}", app.batch.new_recipe.id);
     }
 
     #[test]
@@ -1595,7 +1721,8 @@ pub fn run_agent(app: &mut StudioApp, id: &str, dir: &Path, task_id: &str) -> bo
         return false;
     };
     let Some(task) = c.plugin.manifest.task(task_id).cloned() else { return false };
-    if crate::workflow::busy(app) || !app.batch.queue.is_empty() {
+    let busy = if has_private_workspace(app, id) { isolated_agent_conflict(app, id) } else { crate::workflow::busy(app) || !app.batch.queue.is_empty() };
+    if busy {
         app.error("Finish the running agent or test first.");
         return false;
     }
@@ -1702,20 +1829,19 @@ pub fn agent_finished(app: &mut StudioApp, job: u64, id: &str, dir: &Path, task_
     }
 }
 
-/// Fills the New recipe dialog from a catalog row and its export notes, so
+/// Fills Recipe Builder's new-recipe form from a catalog row and its export notes, so
 /// the user reviews it before the recipe agent runs.
 fn recipe_handoff(app: &mut StudioApp, row: &Value, key: &str, notes_file: &Path) {
     let field = |names: &[&str]| names.iter().find_map(|n| row.get(*n).map(cell)).unwrap_or_default();
     let name = Some(field(&["name", "title"])).filter(|n| !n.is_empty()).unwrap_or_else(|| key.to_string());
     let notes: String = ystudio_core::read_text(notes_file).unwrap_or_default().chars().take(6000).collect();
-    let lib = &mut app.library;
-    lib.new_display = name.clone();
-    lib.new_publisher = field(&["publisher", "manufacturer"]);
-    lib.new_vendor.clear();
-    lib.new_id = ystudio_core::recipe::suggest_id(&name);
-    lib.new_id_touched = false;
-    lib.new_notes = notes.trim().to_string();
-    lib.new_open = true;
-    app.view = View::Recipes;
-    app.notify(format!("Review {name} and press 'Write it with the agent' to start the recipe."));
+    let draft = &mut app.batch.new_recipe;
+    draft.display = name.clone();
+    draft.publisher = field(&["publisher", "manufacturer"]);
+    draft.vendor.clear();
+    draft.id = ystudio_core::recipe::suggest_id(&name);
+    draft.id_touched = false;
+    draft.notes = notes.trim().to_string();
+    super::batch::show_new_recipe(app);
+    app.notify(format!("Review {name} and press 'Write with agent' to start the recipe."));
 }

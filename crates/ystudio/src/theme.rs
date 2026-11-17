@@ -460,6 +460,19 @@ pub fn card(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
 /// Gap between cards, both between rows and between cards in a row.
 pub const CARD_GAP: f32 = 16.0;
 
+/// Horizontal breathing room inside a resizable split pane. Egui's default
+/// side-panel frame has padding, while the remaining center pane does not;
+/// using this frame on every sibling keeps both sides of a divider aligned.
+pub const PANE_INSET: i8 = 12;
+
+pub fn pane_frame() -> egui::Frame {
+    egui::Frame::new().inner_margin(Margin::symmetric(PANE_INSET, 0))
+}
+
+pub fn pane<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    pane_frame().show(ui, add).inner
+}
+
 /// A row of equal-width, equal-height cards. Each card has a body and a footer;
 /// bodies are padded to the tallest body so footers (usually the card's action)
 /// line up across the row. Heights are measured each frame and applied on the next.
