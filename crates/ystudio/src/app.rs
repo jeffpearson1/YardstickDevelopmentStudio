@@ -663,6 +663,11 @@ impl StudioApp {
             self.error(format!("Could not record that {id} passed: {e:#}"));
         }
         self.refresh_completion();
+        // A recipe fixed and validated outside Recipe Builder (its Test or Agent tab)
+        // must not keep a working-list item reading "failed".
+        if self.completion(id).is_complete() {
+            views::batch::recipe_validated(self, id, &run.timestamp, &run.dir);
+        }
     }
 
     /// Reads the branch and ahead/behind counts (local only, no network).
@@ -1510,20 +1515,68 @@ pub fn job_log(ui: &mut Ui, proc: &mut RunningProcess, salt: &str) {
             let code = proc.exit.flatten().map(|c| c.to_string()).unwrap_or_else(|| "?".into());
             theme::badge(ui, format!("Failed (exit {code})"), theme::red());
         }
+        let sel_id = egui::Id::unique(("job-log-selection", salt, proc.pid));
+        let selected = ui.data(|d| d.get_temp::<LogSelection>(sel_id)).and_then(|s| s.range(proc.lines.len()));
+        if let Some(range) = selected.clone() {
+            let n = range.len();
+            if ui.small_button(format!("\u{E8C8}  Copy {n} line{}", if n == 1 { "" } else { "s" })).clicked() {
+                ui.ctx().copy_text(log_text(&proc.lines, range));
+            }
+        }
         if ui.small_button("\u{E8C8}  Copy log").clicked() {
             ui.ctx().copy_text(proc.text());
         }
+        if selected.is_none() && !proc.lines.is_empty() {
+            ui.label(RichText::new("Drag across lines to select them, then Ctrl+C.").small().weak());
+        }
     });
+    log_lines(ui, proc, salt);
+}
+
+/// A range of selected log lines, by index. Logs only grow, so indices stay valid
+/// while new output arrives and while rows scroll out of the virtual view.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct LogSelection {
+    anchor: usize,
+    end: usize,
+    dragging: bool,
+}
+
+impl LogSelection {
+    fn range(&self, len: usize) -> Option<std::ops::Range<usize>> {
+        let lo = self.anchor.min(self.end);
+        let hi = self.anchor.max(self.end);
+        (lo < len).then(|| lo..(hi + 1).min(len))
+    }
+}
+
+fn log_text(lines: &[ystudio_core::process::LogLine], range: std::ops::Range<usize>) -> String {
+    lines[range].iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n")
+}
+
+/// The virtualised log body with line selection: click a line, drag or Shift+click to
+/// extend, Ctrl+C or the context menu to copy. egui's own label selection cannot span
+/// rows that `show_rows` has scrolled out of existence, so selection is by line.
+fn log_lines(ui: &mut Ui, proc: &RunningProcess, salt: &str) {
+    let sel_id = egui::Id::unique(("job-log-selection", salt, proc.pid));
+    let mut sel = ui.data(|d| d.get_temp::<LogSelection>(sel_id));
     let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
     let n = proc.lines.len();
     let normal = ui.visuals().text_color();
     let stderr_color = if proc.spec.stderr_is_progress { ui.visuals().weak_text_color() } else { theme::red() };
-    egui::ScrollArea::both()
+    let select_bg = ui.visuals().selection.bg_fill;
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let (shift, pointer, primary_down) = ui.input(|i| (i.modifiers.shift, i.pointer.interact_pos(), i.pointer.primary_down()));
+    let mut menu_action: Option<LogMenu> = None;
+    let output = egui::ScrollArea::both()
         .id_salt(("job-log", salt, proc.pid))
         .stick_to_bottom(true)
         .auto_shrink(false)
         .show_rows(ui, row_h, n, |ui, range| {
-            for line in &proc.lines[range] {
+            let selected = sel.and_then(|s| s.range(n));
+            let mut rows: Vec<(usize, egui::Rect)> = Vec::with_capacity(range.len());
+            for i in range {
+                let line = &proc.lines[i];
                 let color = match line.stream {
                     Stream::Stdout => normal,
                     Stream::Stderr => stderr_color,
@@ -1532,12 +1585,111 @@ pub fn job_log(ui: &mut Ui, proc: &mut RunningProcess, salt: &str) {
                 // `show_rows` requires every child to have exactly `row_h` height.
                 // Keep process output on one line so long commands scroll sideways
                 // instead of changing the virtual row geometry between repaints.
-                ui.add(
-                    egui::Label::new(RichText::new(&line.text).monospace().color(color))
-                        .wrap_mode(egui::TextWrapMode::Extend),
-                );
+                let galley = ui.painter().layout_no_wrap(line.text.clone(), font.clone(), color);
+                let width = galley.size().x.max(ui.available_width());
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, row_h), egui::Sense::click_and_drag());
+                if selected.as_ref().is_some_and(|r| r.contains(&i)) {
+                    ui.painter().rect_filled(rect.expand2(egui::vec2(4.0, ui.spacing().item_spacing.y / 2.0)), 0.0, select_bg);
+                }
+                ui.painter().galley(rect.left_top(), galley, color);
+                rows.push((i, rect));
+                if resp.drag_started_by(egui::PointerButton::Primary) || resp.clicked() {
+                    sel = Some(match sel {
+                        Some(s) if shift => LogSelection { end: i, dragging: resp.dragged(), ..s },
+                        _ => LogSelection { anchor: i, end: i, dragging: resp.dragged() },
+                    });
+                }
+                resp.context_menu(|ui| {
+                    if !selected.as_ref().is_some_and(|r| r.contains(&i)) {
+                        sel = Some(LogSelection { anchor: i, end: i, dragging: false });
+                    }
+                    if ui.button("\u{E8C8}  Copy selected lines").clicked() {
+                        menu_action = Some(LogMenu::CopySelection);
+                        ui.close();
+                    }
+                    if ui.button("\u{E8C8}  Copy log").clicked() {
+                        menu_action = Some(LogMenu::CopyAll);
+                        ui.close();
+                    }
+                    if ui.button("\u{E8B3}  Select all").clicked() {
+                        menu_action = Some(LogMenu::SelectAll);
+                        ui.close();
+                    }
+                });
+            }
+            // While dragging, the line under the pointer (clamped to the visible rows) ends the range.
+            if let (Some(mut s), Some(p)) = (sel, pointer)
+                && s.dragging
+                && primary_down
+                && let (Some(first), Some(last)) = (rows.first(), rows.last())
+            {
+                s.end = if p.y < first.1.top() {
+                    first.0
+                } else if p.y > last.1.bottom() {
+                    last.0
+                } else {
+                    rows.iter().find(|(_, r)| p.y <= r.bottom()).map_or(last.0, |(i, _)| *i)
+                };
+                sel = Some(s);
             }
         });
+    // Drag past the top or bottom edge to scroll and keep extending the selection.
+    if let (Some(s), Some(p)) = (sel, pointer)
+        && s.dragging
+        && primary_down
+    {
+        let view = output.inner_rect;
+        let dy = if p.y < view.top() { view.top() - p.y } else if p.y > view.bottom() { view.bottom() - p.y } else { 0.0 };
+        if dy != 0.0 {
+            ui.scroll_with_delta(egui::vec2(0.0, dy.clamp(-row_h * 3.0, row_h * 3.0)));
+            ui.ctx().request_repaint();
+        }
+    }
+    if let Some(s) = &mut sel
+        && !primary_down
+    {
+        s.dragging = false;
+    }
+    match menu_action {
+        Some(LogMenu::SelectAll) if n > 0 => sel = Some(LogSelection { anchor: 0, end: n - 1, dragging: false }),
+        Some(LogMenu::CopyAll) => ui.ctx().copy_text(proc.text()),
+        _ => {}
+    }
+    let hovered = pointer.is_some_and(|p| output.inner_rect.contains(p));
+    let focus_elsewhere = ui.memory(|m| m.focused().is_some());
+    let (copy, select_all, escape) = ui.input(|i| {
+        (
+            i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+            i.modifiers.command && i.key_pressed(egui::Key::A),
+            i.key_pressed(egui::Key::Escape),
+        )
+    });
+    if let Some(range) = sel.and_then(|s| s.range(n)) {
+        if menu_action == Some(LogMenu::CopySelection) || (copy && !focus_elsewhere) {
+            ui.ctx().copy_text(log_text(&proc.lines, range));
+        }
+        if escape && !focus_elsewhere {
+            sel = None;
+        }
+    }
+    if select_all && hovered && !focus_elsewhere && n > 0 {
+        sel = Some(LogSelection { anchor: 0, end: n - 1, dragging: false });
+    }
+    ui.data_mut(|d| match sel {
+        Some(s) => {
+            d.insert_temp(sel_id, s);
+        }
+        None => {
+            d.remove::<LogSelection>(sel_id);
+        }
+    });
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum LogMenu {
+    CopySelection,
+    CopyAll,
+    SelectAll,
 }
 
 impl eframe::App for StudioApp {
@@ -1715,6 +1867,49 @@ mod layout_tests {
         });
         assert!(!output.shapes.is_empty());
         output.textures_delta.clear();
+    }
+
+    #[test]
+    fn log_selection_is_ordered_and_clamped_to_the_log() {
+        let s = LogSelection { anchor: 5, end: 2, dragging: false };
+        assert_eq!(s.range(10), Some(2..6));
+        assert_eq!(s.range(4), Some(2..4));
+        assert_eq!(s.range(2), None);
+    }
+
+    #[test]
+    fn dragging_across_log_lines_selects_and_copies_them() {
+        use ystudio_core::process::{LogLine, ProcessSpec};
+        let (mut proc, _feed) = RunningProcess::remote(ProcessSpec::new("test", "pwsh", &std::env::temp_dir()), "test", None, Box::new(|| {}));
+        proc.lines = (0..20).map(|i| LogLine { stream: Stream::Stdout, text: format!("line {i}") }).collect();
+        let ctx = egui::Context::default();
+        let top = std::cell::Cell::new(0.0);
+        let pitch = std::cell::Cell::new(0.0);
+        let frame = |events: Vec<egui::Event>, measure: bool| {
+            let input = egui::RawInput { events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                if measure {
+                    top.set(ui.cursor().top());
+                    pitch.set(ui.text_style_height(&egui::TextStyle::Monospace) + ui.spacing().item_spacing.y);
+                }
+                log_lines(ui, &proc, "test");
+            });
+            out.textures_delta.clear();
+            out.platform_output
+        };
+        frame(Vec::new(), true);
+        let at = |row: f32| egui::pos2(40.0, top.get() + pitch.get() * row + pitch.get() / 2.0);
+        let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(vec![egui::Event::PointerMoved(at(1.0)), button(at(1.0), true)], false);
+        frame(vec![egui::Event::PointerMoved(at(2.0))], false);
+        frame(vec![egui::Event::PointerMoved(at(3.0))], false);
+        frame(vec![button(at(3.0), false)], false);
+        let out = frame(vec![egui::Event::Copy], false);
+        let copied: Vec<_> = out.commands.iter().filter_map(|c| match c {
+            egui::OutputCommand::CopyText(t) => Some(t.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(copied, ["line 1\nline 2\nline 3"]);
     }
 
     #[test]

@@ -50,10 +50,22 @@ pub struct IconsState {
     process: Process,
     preview: Option<Preview>,
     backdrop: Backdrop,
-    last_saved: Option<String>,
+    last_saved: Option<SavedMark>,
     current: Option<CurrentIcon>,
     /// Start a search on the next frame (set by other views' hooks).
     pub auto_search: bool,
+}
+
+/// What the last save wrote, so the Save button can show that the preview on screen
+/// is already on disk instead of looking as if nothing happened.
+struct SavedMark {
+    file: String,
+    origin: String,
+    process: Process,
+    width: u32,
+    height: u32,
+    bytes: usize,
+    replaced: bool,
 }
 
 /// The icon file the recipe uses today, shown beside the candidates.
@@ -578,26 +590,49 @@ fn preview_panel(app: &mut StudioApp, ui: &mut Ui) {
         if !writable {
             ui.label(RichText::new("Open a development folder to save icons (production is read-only).").small().weak());
         }
-        let label = if exists { "\u{E74E}  Replace icon" } else { "\u{E74E}  Save icon" };
+        // The preview on screen is exactly what the last save wrote.
+        let saved_now = app.icons.last_saved.as_ref().filter(|m| {
+            m.file.eq_ignore_ascii_case(&file)
+                && app.icons.preview.as_ref().is_some_and(|p| p.origin == m.origin && p.process == m.process)
+        });
         let mut saved = None;
-        if theme::primary(ui, valid && writable, RichText::new(label)).clicked() {
-            let ws = app.ws.as_ref().unwrap();
-            let path = ws.layout.icons.join(&file);
-            let img = app.icons.preview.as_ref().unwrap().image.clone();
-            match icons::save_png(&img, &path) {
-                Ok(s) => saved = Some(s),
-                Err(e) => app.error(format!("Could not save icon: {e:#}")),
+        if let Some(m) = saved_now {
+            ui.add_enabled(false, egui::Button::new("\u{E73E}  Saved"));
+            let verb = if m.replaced { "Replaced" } else { "Saved" };
+            ui.colored_label(
+                theme::green(),
+                format!("\u{E73E}  {verb} Icons\\{} ({}×{}, {} KB).", m.file, m.width, m.height, m.bytes.div_ceil(1024)),
+            );
+        } else {
+            let label = if exists { "\u{E74E}  Replace icon" } else { "\u{E74E}  Save icon" };
+            if theme::primary(ui, valid && writable, RichText::new(label)).clicked() {
+                let ws = app.ws.as_ref().unwrap();
+                let path = ws.layout.icons.join(&file);
+                let p = app.icons.preview.as_ref().unwrap();
+                let (origin, process, img) = (p.origin.clone(), p.process, p.image.clone());
+                match icons::save_png(&img, &path) {
+                    Ok(s) => saved = Some((s, origin, process)),
+                    Err(e) => app.error(format!("Could not save icon: {e:#}")),
+                }
             }
         }
-        if let Some(s) = saved {
+        if let Some((s, origin, process)) = saved {
             app.notify(format!("Saved {} ({}×{}, {} KB).", s.path.display(), s.width, s.height, s.bytes.div_ceil(1024)));
-            app.icons.last_saved = Some(file.clone());
+            app.icons.last_saved = Some(SavedMark {
+                file: file.clone(),
+                origin,
+                process,
+                width: s.width,
+                height: s.height,
+                bytes: s.bytes,
+                replaced: exists,
+            });
             app.refresh_recipes();
             if let Some((batch_id, idx)) = app.icons.batch_item.clone() {
                 super::batch::icon_saved(app, &batch_id, idx, &file);
             }
         }
-        if app.icons.last_saved.as_deref() == Some(file.as_str())
+        if app.icons.last_saved.as_ref().is_some_and(|m| m.file == file)
             && let Some(id) = app.icons.recipe_id.clone()
         {
             let current = app.recipes.iter().find(|r| r.id == id).map(|r| r.meta.icon_file.clone()).unwrap_or_default();

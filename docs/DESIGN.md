@@ -101,6 +101,12 @@ status bar.
 
 Only one agent process runs at a time, whether it came from the Agent view, a batch, or an extraction.
 
+Job logs are virtualised (`show_rows`), so egui's label selection cannot span rows that have
+scrolled away. `app::job_log` therefore selects whole lines by index: click, drag (scrolling past
+the edges) or Shift+click, then Ctrl+C, *Copy N lines* or the context menu. Logs only grow, so
+the indices stay valid while output arrives. Read-only text boxes use a `&str` buffer rather
+than `interactive(false)`, so their text can still be selected and copied.
+
 Live validation requires all eight validation phases to pass (warnings are allowed).
 The result reader recognizes the harness's `PostInstallDetect` and
 `PostUninstallDetect` names as well as the older `PostDetect` and `PostUninstall`
@@ -136,6 +142,12 @@ is `Pass`; it has not tested uninstall, post-uninstall detection or residue.
    shipped file is never edited. The selection then runs the same test-and-repair
    pipeline as authoring: each recipe is tested first, so one that now passes is not
    touched, and failures go to `AgentTask::Fix` within the attempt limit.
+
+An item's Done/Failed status comes from the checks of the recipes it currently names; checks
+of a recipe a repair replaced are dropped. A live install test that validates a recipe from any
+view (`StudioApp::record_validation`) records a passing check on the open working list's
+finished items that use it, and an item in another list that still reads Failed shows as
+complete once all its recipes are.
 
 Status messages and batch notes carry a one-line summary of a failure
 (`RecipeResult::problems`, the lint errors, or the last error line of the output),
