@@ -110,7 +110,9 @@ the Studio's PID to exit, runs `msiexec /i … /passive` elevated (`-Verb RunAs`
 the Studio again with `--updated <exit code> <log>`, which the new process reports in the
 status bar.
 
-Only one agent process runs at a time, whether it came from the Agent view, a batch, or an extraction.
+Only one agent process runs at a time, whether it came from the Agent view, a batch, or an extraction,
+except in Multi-agent mode, where Recipe Builder runs several authoring and repair agents at once
+(see *Test and repair* below). Harness runs are always one at a time.
 
 Claude Code runs with `--output-format stream-json --verbose`. `agent_stream::claude_lines`
 renders each event as the pump reads it: assistant text as output, thinking as `Stream::Thinking`
@@ -150,6 +152,20 @@ is `Pass`; it has not tested uninstall, post-uninstall detection or residue.
    test attempts (the first check plus at most four repairs); environmental blockers,
    cancellation, missing recipes and missing/skipped evidence stop automatic repair.
    The agent itself is still forbidden from running live installs.
+
+   The run is a **test coordinator**: test requests queue in arrival order and the harness
+   takes one app at a time, because Windows runs one installation at a time. A recipe that
+   fails leaves the harness for a repair agent. Normally the harness waits and retests it
+   next. In **Multi-agent mode** (`workflow::parallel_agents`: the setting, a backend with
+   multi-agent support, and *N apps at once*, default 3, at most 8) Recipe Builder researches
+   up to N apps at once: `batch::start_next` fills every free agent slot, each finished authoring
+   agent hands its recipe to the coordinator (`workflow::enqueue`) and its slot takes the next
+   app, and repairs share the slots (a repair waits for a free one). The harness moves on to
+   the next queued app while a recipe is repaired, and the repaired recipe rejoins the back of
+   the queue. These agents run without the per-agent coordinator prompt, so they do not each
+   start subagents. With several agents writing at once, a finished item takes recipes from
+   the workspace diff only when they are its own; the others come from its `STUDIO-RECIPES:`
+   line. The progress line lists what is testing, waiting, being repaired and researching.
 7. **Retest a batch.** `Test selected batch` gathers every included software item's
    recipe ids, deduplicates them while preserving all ticket associations, and runs
    checks sequentially without editing recipes. Failure stops that recipe, not the

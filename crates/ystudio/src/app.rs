@@ -1022,7 +1022,7 @@ impl StudioApp {
                 crate::workflow::harness_finished(self, step, &recipe_id, ok, started, text);
             }
             JobKind::WorkflowRepair { before } => {
-                crate::workflow::repair_finished(self, before, ok, &text);
+                crate::workflow::repair_finished(self, id, before, ok, &text);
             }
             JobKind::Agent { before, batch_item, verification } => {
                 if let Some(ws) = &self.ws {
@@ -1069,7 +1069,11 @@ impl StudioApp {
                     let items = batch_item.into_iter().collect();
                     let target = crate::workflow::Target { id: verification.recipe_id.clone(), items };
                     if ok && !blocked {
-                        crate::workflow::start(self, vec![target], verification.options, true, resume_batch);
+                        crate::workflow::enqueue(self, target, verification.options, true, resume_batch);
+                        // Multi-agent mode: the finished agent's slot researches the next app.
+                        if resume_batch && crate::workflow::parallel_agents(self) > 1 {
+                            views::batch::start_next(self);
+                        }
                     } else {
                         if let Some((batch_id, idx)) = target.items.first() {
                             views::batch::check_finished(self, batch_id, *idx, ystudio_core::intake::BatchCheck {
