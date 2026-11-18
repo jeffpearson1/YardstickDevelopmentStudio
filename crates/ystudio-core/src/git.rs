@@ -63,6 +63,111 @@ pub fn pull(ws: &Workspace) -> Result<ProcessSpec> {
     Ok(spec("git pull", git, &ws.root, &["pull", "--ff-only", "--progress"]))
 }
 
+/// A branch the workspace can switch to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Branch {
+    /// `main`, or `origin/feature` for a remote branch with no local copy yet.
+    pub name: String,
+    pub remote: bool,
+    pub current: bool,
+    /// The upstream of a local branch, e.g. `origin/main`.
+    pub upstream: Option<String>,
+}
+
+/// Local branches (current first), then remote branches that have no local
+/// branch of the same name. Reads refs only; does not touch the network.
+pub fn branches(root: &Path) -> Result<Vec<Branch>> {
+    let git = git_exe()?;
+    let out = run_capture(&spec("git", git, root, &["for-each-ref", "--format=%(refname)%09%(HEAD)%09%(upstream:short)", "refs/heads", "refs/remotes"]))?;
+    Ok(parse_branches(&out))
+}
+
+fn parse_branches(out: &str) -> Vec<Branch> {
+    let mut local = Vec::new();
+    let mut remote = Vec::new();
+    for line in out.lines() {
+        let mut f = line.split('\t');
+        let (Some(refname), head, upstream) = (f.next(), f.next().unwrap_or(""), f.next().unwrap_or("")) else { continue };
+        if let Some(name) = refname.strip_prefix("refs/heads/") {
+            let upstream = Some(upstream.trim().to_string()).filter(|u| !u.is_empty());
+            local.push(Branch { name: name.to_string(), remote: false, current: head.trim() == "*", upstream });
+        } else if let Some(name) = refname.strip_prefix("refs/remotes/")
+            && !name.ends_with("/HEAD")
+        {
+            remote.push(Branch { name: name.to_string(), remote: true, current: false, upstream: None });
+        }
+    }
+    remote.retain(|r| {
+        let short = r.name.split_once('/').map_or(r.name.as_str(), |(_, b)| b);
+        !local.iter().any(|l| l.name == short)
+    });
+    local.sort_by_key(|b| (!b.current, b.name.to_lowercase()));
+    remote.sort_by_key(|b| b.name.to_lowercase());
+    local.extend(remote);
+    local
+}
+
+/// Whether `name` is a branch name git accepts (the common rules of
+/// `git check-ref-format --branch`), so it never reaches git as an option.
+pub fn is_valid_branch_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(['-', '/', '.'])
+        && !name.ends_with(['/', '.'])
+        && !name.ends_with(".lock")
+        && !name.contains("..")
+        && !name.contains("//")
+        && !name.contains("@{")
+        && name != "@"
+        && !name.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+}
+
+/// Tracked files with uncommitted changes. `Recipes\Development` is git-ignored,
+/// so work in progress there does not count.
+pub fn changed_files(root: &Path) -> Result<usize> {
+    let git = git_exe()?;
+    let out = run_capture(&spec("git", git, root, &["status", "--porcelain", "--untracked-files=no"]))?;
+    Ok(out.lines().filter(|l| !l.trim().is_empty()).count())
+}
+
+/// Switches the workspace to `branch`. A remote branch (`origin/x`) becomes a
+/// local branch tracking it. Never forces: git refuses when uncommitted changes
+/// would be overwritten.
+pub fn switch(ws: &Workspace, branch: &Branch) -> Result<ProcessSpec> {
+    let git = ensure_repo(ws, "switch branches in")?;
+    if !is_valid_branch_name(&branch.name) {
+        bail!("'{}' is not a valid branch name.", branch.name);
+    }
+    let label = format!("git switch {}", branch.name);
+    Ok(if branch.remote {
+        spec(&label, git, &ws.root, &["switch", "--track", &branch.name])
+    } else {
+        spec(&label, git, &ws.root, &["switch", &branch.name])
+    })
+}
+
+/// Creates `name` from the current commit and switches to it.
+pub fn create_branch(ws: &Workspace, name: &str) -> Result<ProcessSpec> {
+    let git = ensure_repo(ws, "create branches in")?;
+    let name = name.trim();
+    if !is_valid_branch_name(name) {
+        bail!("'{name}' is not a valid branch name: no spaces, and none of ~ ^ : ? * [ \\ or '..'.");
+    }
+    Ok(spec(&format!("git switch -c {name}"), git, &ws.root, &["switch", "-c", name]))
+}
+
+/// Pushes the current branch; a branch with no upstream is published to
+/// `origin` and starts tracking it.
+pub fn push(ws: &Workspace, status: &Status) -> Result<ProcessSpec> {
+    let git = ensure_repo(ws, "git push from")?;
+    if status.upstream.is_some() {
+        return Ok(spec("git push", git, &ws.root, &["push", "--progress"]));
+    }
+    if !is_valid_branch_name(&status.branch) || status.branch == "HEAD" {
+        bail!("Switch to a branch before pushing (HEAD is detached).");
+    }
+    Ok(spec(&format!("git push -u origin {}", status.branch), git, &ws.root, &["push", "--progress", "-u", "origin", &status.branch]))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
     pub branch: String,
@@ -96,6 +201,47 @@ fn parse_left_right(s: &str) -> Result<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lists_local_branches_first_and_remote_only_ones_after() {
+        let out = "refs/heads/feature\t \torigin/feature\nrefs/heads/main\t*\torigin/main\n\
+                   refs/remotes/origin/HEAD\t \t\nrefs/remotes/origin/main\t \t\nrefs/remotes/origin/feature\t \t\n\
+                   refs/remotes/origin/recipe/brave\t \t\n";
+        let b = parse_branches(out);
+        let names: Vec<_> = b.iter().map(|b| (b.name.as_str(), b.remote, b.current)).collect();
+        assert_eq!(names, [("main", false, true), ("feature", false, false), ("origin/recipe/brave", true, false)]);
+        assert_eq!(b[0].upstream.as_deref(), Some("origin/main"));
+    }
+
+    #[test]
+    fn branch_names_that_could_be_options_or_invalid_are_refused() {
+        for ok in ["main", "recipe/brave-1.2", "jeff/fix_icons"] {
+            assert!(is_valid_branch_name(ok), "{ok}");
+        }
+        for bad in ["", "-f", "--force", "a b", "a..b", "a~1", "x.lock", "/x", "x/", "a\\b", "@", "a@{1}", "a:b"] {
+            assert!(!is_valid_branch_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn switching_creating_and_pushing_build_safe_commands() {
+        if crate::process::which("git").is_none() {
+            return;
+        }
+        let d = crate::workspace::fake_workspace(Some("developmentOnly: true\n"));
+        std::fs::create_dir_all(d.path().join(".git")).unwrap();
+        let ws = Workspace::open(d.path(), &[], &[]).unwrap();
+        let remote = Branch { name: "origin/feature".into(), remote: true, current: false, upstream: None };
+        assert_eq!(switch(&ws, &remote).unwrap().args, ["switch", "--track", "origin/feature"]);
+        assert_eq!(create_branch(&ws, " new/one ").unwrap().args, ["switch", "-c", "new/one"]);
+        assert!(create_branch(&ws, "-D").is_err());
+        let tracked = Status { branch: "main".into(), upstream: Some("origin/main".into()), ahead: 1, behind: 0 };
+        assert_eq!(push(&ws, &tracked).unwrap().args, ["push", "--progress"]);
+        let new = Status { upstream: None, branch: "new/one".into(), ..tracked };
+        assert_eq!(push(&ws, &new).unwrap().args, ["push", "--progress", "-u", "origin", "new/one"]);
+        let prod = Workspace::open(d.path(), &[d.path().to_path_buf()], &[]).unwrap();
+        assert!(switch(&prod, &remote).unwrap_err().to_string().contains("production"));
+    }
 
     #[test]
     fn parses_ahead_behind() {

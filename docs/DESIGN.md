@@ -80,6 +80,17 @@ dispatches on `JobKind`:
   the files the task expects. Both release the work item's lock;
 - git fetch/pull jobs refresh the ahead/behind status (a pull also rescans recipes and reloads an
   unedited open recipe); shared-sync jobs rescan icons and re-lint.
+- git switch jobs (from the footer's branch menu) do the same as a pull; git push jobs refresh
+  the status.
+
+**Branches.** The status bar shows the development workspace's branch and ahead/behind (`⑂ main
+↓2 ↑1`, or *not published*). Clicking it opens a menu, like VS Code's, that searches local
+branches and remote-only ones, switches (`git switch`, or `switch --track` for a remote branch),
+creates (`switch -c` from the current commit), and fetches, pulls (`--ff-only`) and pushes
+(`push -u origin <branch>` for an unpublished branch). Switching is refused while any job runs or
+the open recipe has unsaved edits, never forces, and warns about uncommitted tracked files;
+`Recipes\Development` is git-ignored, so work there stays put. Branch names are validated before
+they reach git, so a name can never be read as an option.
 
 Plugin work-item stages are written as `Running` before their external process starts. If that
 state cannot be saved, nothing runs. When a plugin work root is first opened in a new Studio

@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod batch;
+pub mod branches;
 pub mod designer;
 pub mod docs;
 pub mod editor;

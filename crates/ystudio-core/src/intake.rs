@@ -12,6 +12,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+static BATCH_ROOT_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -1074,7 +1076,17 @@ pub struct Batch {
 
 impl Batch {
     pub fn root() -> PathBuf {
+        if let Some(root) = BATCH_ROOT_OVERRIDE.get() {
+            return root.clone();
+        }
         crate::settings::Settings::default_path().parent().map(Path::to_path_buf).unwrap_or_else(std::env::temp_dir).join("batches")
+    }
+
+    /// Points [`Batch::root`] somewhere else for the rest of the process, so
+    /// tests never write working lists into the user's `%APPDATA%`. The first
+    /// call wins.
+    pub fn override_root(root: PathBuf) {
+        let _ = BATCH_ROOT_OVERRIDE.set(root);
     }
 
     pub fn dir(&self) -> PathBuf {

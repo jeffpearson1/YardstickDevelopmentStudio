@@ -141,6 +141,9 @@ pub enum JobKind {
     PullRequests,
     GitFetch,
     GitPull,
+    /// `git switch` (or `switch -c`) of the workspace, from the footer's branch menu.
+    GitSwitch { branch: String },
+    GitPush,
     SyncShared,
     /// `Install-Yardstick -Status`, for the setup wizard.
     SetupStatus { result: PathBuf },
@@ -324,6 +327,8 @@ pub struct StudioApp {
     pub perf: Perf,
     /// Branch and ahead/behind of the open workspace; `None` if it is not a git clone.
     pub git_status: Option<Result<git::Status, String>>,
+    /// The footer's branch menu.
+    pub branch_menu: views::branches::BranchMenu,
     pub home: views::home::HomeState,
     pub library: views::recipes::LibraryState,
     pub bench: BenchState,
@@ -386,6 +391,8 @@ impl BenchState {
 impl StudioApp {
     #[cfg(test)]
     pub(crate) fn isolated_for_tests(ws: Workspace) -> Self {
+        // Working lists the tests save go to a per-process temp folder, never %APPDATA%.
+        ystudio_core::intake::Batch::override_root(std::env::temp_dir().join(format!("ystudio-test-batches-{}", std::process::id())));
         let settings = Settings::default();
         let mut app = Self {
             home: views::home::HomeState::new(&settings), settings_ui: views::settings::SettingsState::new(&settings), setup: Default::default(), settings,
@@ -395,7 +402,7 @@ impl StudioApp {
             status: Status::default(), pending: None, md_cache: CommonMarkCache::default(),
             verdicts: BTreeMap::new(), ledger: Ledger::default(), completion: BTreeMap::new(),
             usage: Vec::new(), usage_by_job: HashMap::new(), usage_log: std::env::temp_dir().join(format!("ystudio-test-usage-{}.jsonl", std::process::id())),
-            runs: Vec::new(), perf: Perf::default(), git_status: None,
+            runs: Vec::new(), perf: Perf::default(), git_status: None, branch_menu: Default::default(),
             library: Default::default(), bench: Default::default(), agent: Default::default(),
             batch: Default::default(), icons: Default::default(), runs_ui: Default::default(),
             docs: Default::default(), promote: Default::default(), update: Default::default(), workflow: Default::default(),
@@ -455,6 +462,7 @@ impl StudioApp {
             runs: Vec::new(),
             perf: Perf::new(),
             git_status: None,
+            branch_menu: Default::default(),
             library: Default::default(),
             bench: Default::default(),
             agent: Default::default(),
@@ -1119,6 +1127,8 @@ impl StudioApp {
                     _ => {}
                 }
             }
+            JobKind::GitSwitch { branch } => views::branches::switched(self, &branch, ok, id),
+            JobKind::GitPush => views::branches::pushed(self, ok, id),
             JobKind::GitPull => {
                 self.refresh_git_status();
                 if ok {
@@ -1163,7 +1173,7 @@ impl StudioApp {
     }
 
     /// Re-reads the open recipe from disk when it has no unsaved edits.
-    fn reload_clean_recipe(&mut self) {
+    pub(crate) fn reload_clean_recipe(&mut self) {
         let Some(r) = &self.recipe else { return };
         if r.dirty() {
             return;
@@ -1405,6 +1415,7 @@ impl StudioApp {
                     theme::badge(ui, "No workspace", theme::grey());
                 }
             }
+            views::branches::chip(self, ui);
             ui.separator();
             let running = self.running_jobs();
             let console_label = if running > 0 { format!("{}  Console ({running} running)", theme::icon::CONSOLE) } else { format!("{}  Console", theme::icon::CONSOLE) };
@@ -1790,6 +1801,7 @@ impl StudioApp {
             }
         }
 
+        views::branches::menu(self, &ctx);
         self.pending_modal(&ctx);
         views::rename_modal(self, &ctx);
         views::recipes::windows(self, &ctx);
