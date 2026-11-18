@@ -302,7 +302,13 @@ Enforcement:
   uses a `studio/<id>` branch in a temporary worktree so the user's checkout is untouched,
   and opens a pull request; production pulls merged work. When the branch already has an
   open pull request, the Studio builds on that remote branch and appends a commit instead
-  of replacing its history or opening a duplicate. Publish monitors open Studio pull
+  of replacing its history or opening a duplicate. Recipes published together share pull
+  requests (`promote::group`): a recipe already in an open Studio pull request keeps building
+  on it, and the rest go into new pull requests of up to *N* recipes (`publish_per_pr`, default
+  10, set in the Publish dialog) on a `studio/batch-<stamp>-<n>` branch; a pull request of one
+  recipe keeps the `studio/<id>` branch. A combined pull request commits each recipe with its
+  evidence file and lists its recipes in a `<!-- studio-recipes: a, b -->` line, which the
+  status refresh reads back so checks, reviews and merged-recipe cleanup still work per recipe. Publish monitors open Studio pull
   requests in place: check runs, review decisions, comments, and reviews from people or
   GitHub Copilot refresh in the background with loading and recovery states. Refreshing
   Publish also reconciles merged Studio pull requests: a matching

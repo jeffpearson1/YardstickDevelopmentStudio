@@ -394,15 +394,29 @@ fn truncate_text(text: &str, max: usize) -> String {
     if chars.next().is_some() { shortened + "…" } else { shortened }
 }
 
-/// Pushes a branch per recipe in the background, streaming git's output to the console.
+/// How the selected recipes split into pull requests (see [`promote::group`]).
+fn groups(app: &StudioApp, ids: &[String]) -> Vec<promote::Group> {
+    let stamp = ystudio_core::intake::timestamp().chars().filter(char::is_ascii_digit).collect::<String>();
+    promote::group(ids, &app.promote.pull_requests, app.settings.publish_per_pr as usize, &stamp)
+}
+
+/// Opens or updates the pull requests in the background, streaming git's
+/// output to the console. New recipes share pull requests of up to
+/// `publish_per_pr`; a recipe that already has an open one builds on it.
 pub(crate) fn start(app: &mut StudioApp, ids: &[String]) {
     let Some(ws) = app.ws.clone() else { return };
     let Some((Ok(repo), gh)) = repo(app) else { return };
     let mut work = Vec::new();
-    for id in ids {
-        match promote::plan(&ws, id) {
-            Ok(plan) => work.push((plan, evidence(app, id, true))),
-            Err(e) => app.error(format!("{id}: {e:#}")),
+    for group in groups(app, ids) {
+        let mut plans = Vec::new();
+        for id in &group.ids {
+            match promote::plan(&ws, id) {
+                Ok(plan) => plans.push((plan, evidence(app, id, true))),
+                Err(e) => app.error(format!("{id}: {e:#}")),
+            }
+        }
+        if !plans.is_empty() {
+            work.push((group.branch, plans));
         }
     }
     if work.is_empty() {
@@ -414,14 +428,16 @@ pub(crate) fn start(app: &mut StudioApp, ids: &[String]) {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         let mut results = Vec::new();
-        for (plan, evidence) in work {
-            feed.line(Stream::Studio, format!("--- {} → {}", plan.id, plan.dest.display()));
-            let result = promote::open_pull_request(&ws, &plan, &repo, gh.as_deref(), &evidence, &mut |l| feed.line(Stream::Stdout, l.to_string()));
+        for (branch, plans) in work {
+            let names = plans.iter().map(|(p, _)| p.id.as_str()).collect::<Vec<_>>().join(", ");
+            feed.line(Stream::Studio, format!("--- {names} → {branch}"));
+            let result = promote::open_group_pull_request(&ws, &plans, &branch, &repo, gh.as_deref(), &mut |l| feed.line(Stream::Stdout, l.to_string()));
             match &result {
-                Ok(o) => feed.line(Stream::Studio, format!("{}: {}", plan.id, o.url())),
-                Err(e) => feed.line(Stream::Stderr, format!("{}: {e:#}", plan.id)),
+                Ok(o) => feed.line(Stream::Studio, format!("{names}: {}", o.url())),
+                Err(e) => feed.line(Stream::Stderr, format!("{names}: {e:#}")),
             }
-            results.push((plan.id.clone(), result.map_err(|e| format!("{e:#}"))));
+            let result = result.map_err(|e| format!("{e:#}"));
+            results.extend(plans.iter().map(|(p, _)| (p.id.clone(), result.clone())));
         }
         let ok = results.iter().all(|(_, r)| r.is_ok());
         let _ = tx.send(results);
@@ -441,7 +457,11 @@ pub(crate) fn poll(app: &mut StudioApp) {
         match result {
             Ok(outcome) => {
                 done.push(id.clone());
-                app.promote.prompts.push((id, outcome));
+                // Recipes that share a pull request share one prompt.
+                match app.promote.prompts.iter_mut().find(|(_, o)| o.url() == outcome.url()) {
+                    Some((names, _)) => *names = format!("{names}, {id}"),
+                    None => app.promote.prompts.push((id, outcome)),
+                }
             }
             Err(e) => failed.push(format!("{id}: {e}")),
         }
@@ -503,13 +523,39 @@ fn confirm_modal(app: &mut StudioApp, ctx: &egui::Context) {
     let base = app.promote.repo.as_ref().and_then(|(_, r, _)| r.as_ref().ok()).map(|r| r.base.clone()).unwrap_or_else(|| "main".into());
     let mut go = false;
     let mut cancel = false;
+    let mut save_settings = false;
     egui::Modal::new(egui::Id::unique("publish-modal")).show(ctx, |ui| {
         ui.set_max_width(560.0);
         ui.label(RichText::new("\u{E898}  Open pull requests").heading());
         ui.label(format!(
-            "For each recipe the Studio cuts a studio/<id> branch from {base}, commits the recipe to its shipped path, pushes it and opens a pull request. Your checkout is not changed."
+            "The Studio cuts branches from {base}, commits each recipe to its shipped path with its evidence, pushes them and opens pull requests. Your checkout is not changed."
         ));
-        ui.label(RichText::new(ids.join(", ")).monospace());
+        ui.horizontal(|ui| {
+            ui.label("New recipes per pull request, up to");
+            if ui.add(egui::DragValue::new(&mut app.settings.publish_per_pr).range(1..=50)).changed() {
+                save_settings = true;
+            }
+        });
+        // What will happen, pull request by pull request.
+        egui::ScrollArea::vertical().id_salt("publish-groups").max_height(180.0).show(ui, |ui| {
+            for g in groups(app, &ids) {
+                let what = if g.existing {
+                    let pr = app.promote.pull_requests.iter().find(|p| p.branch == g.branch).map(|p| format!("#{}", p.number)).unwrap_or_default();
+                    format!("Update open pull request {pr}")
+                } else if g.ids.len() == 1 {
+                    "New pull request".to_string()
+                } else {
+                    format!("New pull request of {}", g.ids.len())
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(what).strong());
+                    ui.label(RichText::new(g.ids.join(", ")).monospace());
+                });
+            }
+        });
+        if !app.promote.pull_requests_loaded {
+            ui.label(RichText::new("Open pull requests are still loading; a recipe whose open pull request is not known yet gets a new one.").small().color(theme::amber()));
+        }
         if incomplete {
             ui.add_space(8.0);
             ui.label(RichText::new("Validation is incomplete").strong().color(theme::amber()));
@@ -556,6 +602,9 @@ fn confirm_modal(app: &mut StudioApp, ctx: &egui::Context) {
             cancel = ui.button("Cancel").clicked();
         });
     });
+    if save_settings {
+        app.save_settings();
+    }
     if cancel {
         app.promote.modal = false;
     }
