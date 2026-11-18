@@ -53,10 +53,6 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         {
             app.library.selecting = !app.library.selecting;
         }
-        if ui.button("\u{E91B}  Missing icons").on_hover_text("Recipes whose iconFile is empty or missing, in the icon finder.").clicked() {
-            app.icons.prepare("", "", "", "");
-            app.view = View::Icons;
-        }
         if ui.button("\u{E72C}  Refresh").on_hover_text("Rescan recipes; also git fetch and sync shared icons/overrides when enabled in Settings").clicked() {
             app.refresh_recipes();
             app.refresh_runs();

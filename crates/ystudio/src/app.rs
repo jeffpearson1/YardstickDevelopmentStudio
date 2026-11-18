@@ -64,19 +64,20 @@ pub enum View {
 
 impl View {
     /// The sidebar. The open recipe's pages (Design, YAML, Test, Icon,
-    /// Agent) are tabs inside Recipe Builder. Plugin tabs follow Publish
+    /// Agent) are tabs inside Recipe Builder. Plugin tabs follow Icons
     /// ([`View::NAV_PLUGINS_AT`]).
-    pub const NAV: [(View, &'static str, &'static str); 7] = [
+    pub const NAV: [(View, &'static str, &'static str); 8] = [
         (View::Home, theme::icon::HOME, "Home"),
         (View::Recipes, theme::icon::LIBRARY, "Recipe Library"),
         (View::Batch, theme::icon::HAMMER, "Recipe Builder"),
         (View::Promote, theme::icon::UPLOAD, "Publish"),
+        (View::Icons, theme::icon::PHOTO, "Icons"),
         (View::Runs, theme::icon::CLOCK, "History"),
         (View::Settings, theme::icon::SETTINGS, "Settings"),
         (View::Docs, theme::icon::BOOK, "Help"),
     ];
     /// Where in [`View::NAV`] the plugin tabs go.
-    pub const NAV_PLUGINS_AT: usize = 4;
+    pub const NAV_PLUGINS_AT: usize = 5;
 }
 
 /// Test Bench pipeline steps, cheapest first.
@@ -1291,9 +1292,9 @@ impl StudioApp {
         });
         ui.add_space(14.0);
         ui.spacing_mut().item_spacing.y = 0.0;
-        // Recipe editing is part of the unified Recipe Builder. The standalone
-        // icon finder still belongs to the Library unless it is working on a
-        // Builder item.
+        // Recipe editing is part of the unified Recipe Builder, including an
+        // icon search for a Builder item or the open recipe's Icon tab; the
+        // library-wide Icons page has its own entry.
         let section = match self.view {
             View::Designer | View::Editor | View::TestBench | View::Agent => View::Batch,
             View::Icons if self.icons.batch_item.is_some() => View::Batch,
@@ -1302,7 +1303,6 @@ impl StudioApp {
             {
                 View::Batch
             }
-            View::Icons => View::Recipes,
             v => v,
         };
         let plugin_tabs: Vec<(View, String, String)> = self
@@ -1328,7 +1328,7 @@ impl StudioApp {
                 }
             }
             let busy = match view {
-                View::Recipes => self.icons.searching(),
+                View::Icons => self.icons.searching(),
                 View::Batch => {
                     self.workflow.busy()
                         || self.jobs.iter().any(|j| {
@@ -1345,6 +1345,10 @@ impl StudioApp {
                 resp = resp.on_hover_text(if view == View::Settings { "An update is available" } else { "Running" });
             }
             if resp.clicked() {
+                if view == View::Icons && section != View::Icons {
+                    // The sidebar entry opens the library-wide page, not a recipe's Icon tab.
+                    views::icons::open_library(self);
+                }
                 self.view = view;
             }
         }
