@@ -26,6 +26,11 @@ use crate::workspace::{RecipeLocation, Workspace};
 
 /// Branches the Studio pushes live under this prefix.
 pub const BRANCH_PREFIX: &str = "studio/";
+/// Branches of pull requests that carry several recipes: `studio/batch-<stamp>-<n>`.
+pub const COMBINED_PREFIX: &str = "studio/batch-";
+/// Lists a combined pull request's recipes in its description, so the Studio
+/// can track each recipe (status, merged-recipe cleanup) like a single one.
+const RECIPES_MARKER: &str = "<!-- studio-recipes:";
 
 /// Where Yardstick's `Recipe evidence` check looks for a recipe's evidence.
 pub const EVIDENCE_DIR: &str = "Tests/RecipeEvidence";
@@ -181,6 +186,8 @@ pub struct Repo {
 pub struct PullRequestStatus {
     pub number: u64,
     pub recipe_id: String,
+    /// The head branch: `studio/<id>`, or a combined `studio/batch-…`.
+    pub branch: String,
     pub title: String,
     pub url: String,
     /// `OPEN`, `MERGED`, or `CLOSED` from GitHub.
@@ -376,7 +383,7 @@ fn find_open_pull_request(root: &Path, repo: &Repo, gh_exe: &Path, branch: &str)
 /// requests are included so the caller can retire their Development copies.
 /// The caller should run this off the UI thread because `gh` contacts GitHub.
 pub fn pull_requests(root: &Path, repo: &Repo, gh_exe: &Path) -> Result<Vec<PullRequestStatus>> {
-    let fields = "number,title,url,headRefName,state,mergedAt,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup,comments,reviews,updatedAt";
+    let fields = "number,title,body,url,headRefName,state,mergedAt,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup,comments,reviews,updatedAt";
     let out = gh_output(root, gh_exe, &["pr", "list", "--repo", repo_slug(repo), "--state", "all", "--limit", "100", "--json", fields])?;
     if !out.success {
         bail!("GitHub pull requests could not be refreshed: {}", last_line(&out));
@@ -389,7 +396,15 @@ fn parse_pull_requests(json: &str) -> Result<Vec<PullRequestStatus>> {
     let mut prs = Vec::new();
     for row in rows.as_array().ok_or_else(|| anyhow!("GitHub returned an unexpected pull request list"))? {
         let branch = text_field(row, "headRefName");
-        let Some(recipe_id) = branch.strip_prefix(BRANCH_PREFIX).filter(|id| !id.is_empty()) else { continue };
+        // A combined pull request stands for each recipe it lists.
+        let recipe_ids: Vec<String> = if branch.starts_with(COMBINED_PREFIX) {
+            marked_recipes(&text_field(row, "body"))
+        } else {
+            branch.strip_prefix(BRANCH_PREFIX).filter(|id| !id.is_empty()).map(|id| vec![id.to_string()]).unwrap_or_default()
+        };
+        if recipe_ids.is_empty() {
+            continue;
+        }
         let mut activity = Vec::new();
         for comment in array_field(row, "comments") {
             activity.push(PullActivity {
@@ -425,9 +440,10 @@ fn parse_pull_requests(json: &str) -> Result<Vec<PullRequestStatus>> {
                 PullCheck { name, workflow: text_field(check, "workflowName"), state, url }
             })
             .collect();
-        prs.push(PullRequestStatus {
+        let pr = PullRequestStatus {
             number: row.get("number").and_then(Value::as_u64).unwrap_or_default(),
-            recipe_id: recipe_id.to_string(),
+            recipe_id: String::new(),
+            branch: branch.clone(),
             title: text_field(row, "title"),
             url: text_field(row, "url"),
             state: text_field(row, "state"),
@@ -438,9 +454,58 @@ fn parse_pull_requests(json: &str) -> Result<Vec<PullRequestStatus>> {
             updated_at: text_field(row, "updatedAt"),
             checks,
             activity,
-        });
+        };
+        prs.extend(recipe_ids.into_iter().map(|recipe_id| PullRequestStatus { recipe_id, ..pr.clone() }));
     }
     Ok(prs)
+}
+
+/// The recipe ids in a combined pull request's `<!-- studio-recipes: a, b -->` line.
+fn marked_recipes(body: &str) -> Vec<String> {
+    body.lines()
+        .find_map(|l| l.trim().strip_prefix(RECIPES_MARKER))
+        .map(|rest| {
+            rest.trim_end_matches("-->")
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| crate::recipe::is_valid_id(s))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One pull request to open or update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Group {
+    pub branch: String,
+    pub ids: Vec<String>,
+    /// The branch already has an open Studio pull request, which gets a new commit.
+    pub existing: bool,
+}
+
+/// Splits the recipes being published into pull requests. A recipe that is
+/// already in an open Studio pull request (its own or a combined one) keeps
+/// building on it; the rest share new pull requests of at most `max` recipes.
+/// A pull request of one recipe uses the classic `studio/<id>` branch.
+pub fn group(ids: &[String], open: &[PullRequestStatus], max: usize, stamp: &str) -> Vec<Group> {
+    let max = max.max(1);
+    let mut groups: Vec<Group> = Vec::new();
+    let mut fresh = Vec::new();
+    for id in ids {
+        let existing = open.iter().find(|pr| pr.state.eq_ignore_ascii_case("OPEN") && pr.recipe_id.eq_ignore_ascii_case(id));
+        match existing {
+            Some(pr) => match groups.iter_mut().find(|g| g.branch == pr.branch) {
+                Some(g) => g.ids.push(id.clone()),
+                None => groups.push(Group { branch: pr.branch.clone(), ids: vec![id.clone()], existing: true }),
+            },
+            None => fresh.push(id.clone()),
+        }
+    }
+    for (n, chunk) in fresh.chunks(max).enumerate() {
+        let branch = if chunk.len() == 1 { format!("{BRANCH_PREFIX}{}", chunk[0]) } else { format!("{COMBINED_PREFIX}{stamp}-{}", n + 1) };
+        groups.push(Group { branch, ids: chunk.to_vec(), existing: false });
+    }
+    groups
 }
 
 /// Archives Development recipes whose pull requests are merged and whose
@@ -567,82 +632,118 @@ fn array_field<'a>(value: &'a Value, field: &str) -> &'a [Value] {
 /// given (falling back to GitHub's compare page). `evidence` goes in the
 /// commit and pull request bodies.
 pub fn open_pull_request(ws: &Workspace, plan: &Plan, repo: &Repo, gh: Option<&Path>, evidence: &Evidence, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
+    open_group_pull_request(ws, &[(plan.clone(), evidence.clone())], &plan.branch, repo, gh, log)
+}
+
+/// Like [`open_pull_request`] for several recipes on one `branch`: each recipe
+/// and its evidence file are committed together, and the description lists
+/// them (with a marker the Studio reads back to track each recipe).
+pub fn open_group_pull_request(ws: &Workspace, plans: &[(Plan, Evidence)], branch: &str, repo: &Repo, gh: Option<&Path>, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
     ws.ensure_writable("open a pull request from")?;
+    if plans.is_empty() {
+        bail!("No recipes to publish.");
+    }
+    if !branch.starts_with(BRANCH_PREFIX) || !crate::git::is_valid_branch_name(branch) {
+        bail!("'{branch}' is not a Studio branch.");
+    }
     let git_exe = crate::git::git_exe()?;
     let root = &ws.root;
     let existing = match gh {
-        Some(exe) => find_open_pull_request(root, repo, exe, &plan.branch)?,
+        Some(exe) => find_open_pull_request(root, repo, exe, branch)?,
         None => None,
     };
     run(&git_exe, root, &["fetch", "origin", &repo.base], log)?;
     if existing.is_some() {
-        run(
-            &git_exe,
-            root,
-            &["fetch", "origin", &format!("refs/heads/{}:refs/remotes/origin/{}", plan.branch, plan.branch)],
-            log,
-        )?;
+        run(&git_exe, root, &["fetch", "origin", &format!("refs/heads/{branch}:refs/remotes/origin/{branch}")], log)?;
     }
 
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("ystudio-pr-{}-{stamp}", plan.id));
+    let slug: String = branch.trim_start_matches(BRANCH_PREFIX).chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect();
+    let dir = std::env::temp_dir().join(format!("ystudio-pr-{slug}-{stamp}"));
     let dir_s = dir.to_string_lossy().into_owned();
-    let base_ref = existing.as_ref().map_or_else(|| format!("origin/{}", repo.base), |_| format!("origin/{}", plan.branch));
-    run(&git_exe, root, &["worktree", "add", "--force", "-B", &plan.branch, &dir_s, &base_ref], log)?;
-    let _cleanup = Worktree { git: &git_exe, repo: root, dir: dir.clone(), branch: plan.branch.clone() };
+    let base_ref = existing.as_ref().map_or_else(|| format!("origin/{}", repo.base), |_| format!("origin/{branch}"));
+    run(&git_exe, root, &["worktree", "add", "--force", "-B", branch, &dir_s, &base_ref], log)?;
+    let _cleanup = Worktree { git: &git_exe, repo: root, dir: dir.clone(), branch: branch.to_string() };
 
-    let dest = dir.join(&plan.dest);
-    let new = !dest.exists();
-    std::fs::create_dir_all(dest.parent().unwrap_or(&dir)).with_context(|| format!("creating the folder for {}", plan.dest.display()))?;
-    std::fs::copy(&plan.source, &dest).with_context(|| format!("copying {} into the branch", plan.source.display()))?;
-    let dest_s = plan.dest.to_string_lossy().replace('\\', "/");
-    run(&git_exe, &dir, &["add", "--", &dest_s], log)?;
-    // Hash what git commits: a clean filter (Yardstick's cleanSecrets) may
-    // rewrite the recipe, and the check hashes the committed version.
-    let blob = run_bytes(&git(&git_exe, &dir, &["cat-file", "blob", &format!(":{dest_s}")]))?;
-    let mut evidence = evidence.clone();
-    evidence.recipe_path = dest_s.clone();
-    evidence.recipe_sha256 = hash_bytes(&blob);
-    if evidence.tested_sha256.as_ref().is_some_and(|t| *t != evidence.recipe_sha256) {
-        log("Git's clean filter rewrote the recipe as it was committed; the evidence records the committed version.");
+    let mut added = Vec::new();
+    let mut lines = Vec::new();
+    for (plan, evidence) in plans {
+        let dest = dir.join(&plan.dest);
+        added.push(!dest.exists());
+        std::fs::create_dir_all(dest.parent().unwrap_or(&dir)).with_context(|| format!("creating the folder for {}", plan.dest.display()))?;
+        std::fs::copy(&plan.source, &dest).with_context(|| format!("copying {} into the branch", plan.source.display()))?;
+        let dest_s = plan.dest.to_string_lossy().replace('\\', "/");
+        run(&git_exe, &dir, &["add", "--", &dest_s], log)?;
+        // Hash what git commits: a clean filter (Yardstick's cleanSecrets) may
+        // rewrite the recipe, and the check hashes the committed version.
+        let blob = run_bytes(&git(&git_exe, &dir, &["cat-file", "blob", &format!(":{dest_s}")]))?;
+        let mut evidence = evidence.clone();
+        evidence.recipe_path = dest_s.clone();
+        evidence.recipe_sha256 = hash_bytes(&blob);
+        if evidence.tested_sha256.as_ref().is_some_and(|t| *t != evidence.recipe_sha256) {
+            log(&format!("{}: git's clean filter rewrote the recipe as it was committed; the evidence records the committed version.", plan.id));
+        }
+        let evidence_rel = format!("{EVIDENCE_DIR}/{}.json", plan.id);
+        let evidence_path = dir.join(&evidence_rel);
+        std::fs::create_dir_all(evidence_path.parent().unwrap_or(&dir)).with_context(|| format!("creating {EVIDENCE_DIR}"))?;
+        std::fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)? + "\n").with_context(|| format!("writing {evidence_rel}"))?;
+        run(&git_exe, &dir, &["add", "--", &evidence_rel], log)?;
+        if !evidence.validated {
+            log(&format!("{}: not validated, so Yardstick's Recipe evidence check will fail until it is tested or the pull request is labelled evidence-waived.", plan.id));
+        }
+        lines.push((plan.id.clone(), evidence_rel, evidence.summary()));
     }
-    let evidence_rel = format!("{EVIDENCE_DIR}/{}.json", plan.id);
-    let evidence_path = dir.join(&evidence_rel);
-    std::fs::create_dir_all(evidence_path.parent().unwrap_or(&dir)).with_context(|| format!("creating {EVIDENCE_DIR}"))?;
-    std::fs::write(&evidence_path, serde_json::to_string_pretty(&evidence)? + "\n").with_context(|| format!("writing {evidence_rel}"))?;
-    run(&git_exe, &dir, &["add", "--", &evidence_rel], log)?;
     if run_output(&git(&git_exe, &dir, &["diff", "--cached", "--quiet"]))?.success {
-        let target = existing.as_ref().map_or(repo.base.as_str(), |_| plan.branch.as_str());
-        bail!("{} and its evidence are already identical on {target}; there is nothing to promote.", plan.dest.display());
-    }
-    if !evidence.validated {
-        log(&format!("{}: not validated, so Yardstick's Recipe evidence check will fail until it is tested or the pull request is labelled evidence-waived.", plan.id));
+        let target = if existing.is_some() { branch } else { repo.base.as_str() };
+        let what = if plans.len() == 1 { plans[0].0.dest.display().to_string() } else { format!("All {} recipes", plans.len()) };
+        bail!("{what} and their evidence are already identical on {target}; there is nothing to promote.");
     }
 
-    let title = format!("{} recipe: {}", if new { "Add" } else { "Update" }, plan.id);
-    let body = format!(
-        "{}\n\nEvidence: {evidence_rel}. Opened by Yardstick Development Studio from Recipes/Development/{}.yaml.",
-        evidence.summary(),
-        plan.id
-    );
+    let ids: Vec<&str> = plans.iter().map(|(p, _)| p.id.as_str()).collect();
+    let (title, body) = if plans.len() == 1 {
+        let (id, evidence_rel, summary) = &lines[0];
+        (
+            format!("{} recipe: {id}", if added[0] { "Add" } else { "Update" }),
+            format!("{summary}\n\nEvidence: {evidence_rel}. Opened by Yardstick Development Studio from Recipes/Development/{id}.yaml."),
+        )
+    } else {
+        let verb = match (added.iter().all(|a| *a), added.iter().any(|a| *a)) {
+            (true, _) => "Add",
+            (false, false) => "Update",
+            _ => "Add and update",
+        };
+        let mut list = ids.iter().take(6).copied().collect::<Vec<_>>().join(", ");
+        if ids.len() > 6 {
+            list += &format!(" and {} more", ids.len() - 6);
+        }
+        let mut body = format!("{} recipes, opened by Yardstick Development Studio from Recipes/Development.\n\n", ids.len());
+        for (id, evidence_rel, summary) in &lines {
+            body += &format!("- **{id}**: {summary} Evidence: {evidence_rel}.\n");
+        }
+        body += &format!("\n{RECIPES_MARKER} {} -->", ids.join(", "));
+        (format!("{verb} {} recipes: {list}", ids.len()), body)
+    };
     run(&git_exe, &dir, &["commit", "-m", &title, "-m", &body], log)?;
-    let destination = format!("HEAD:refs/heads/{}", plan.branch);
+    let destination = format!("HEAD:refs/heads/{branch}");
     if existing.is_some() {
         run(&git_exe, &dir, &["push", "origin", &destination], log)?;
     } else {
         run(&git_exe, &dir, &["push", "--force-with-lease", "origin", &destination], log)?;
     }
 
-    copy_icon(plan, log);
+    for (plan, _) in plans {
+        copy_icon(plan, log);
+    }
+    let plan_branch = branch;
 
-    let compare = format!("{}/compare/{}...{}?expand=1", repo.web_url, repo.base, plan.branch);
+    let compare = format!("{}/compare/{}...{}?expand=1", repo.web_url, repo.base, plan_branch);
     let Some(gh) = gh else {
         log("gh is not installed; the pull request is created from GitHub's compare page.");
         return Ok(Outcome::Compare { url: compare });
     };
     let slug = repo_slug(repo);
     if let Some(existing) = existing {
-        log(&format!("A pull request for {} is already open; appending the new commit to PR #{}.", plan.id, existing.number));
+        log(&format!("A pull request for {} is already open; appending the new commit to PR #{}.", ids.join(", "), existing.number));
         let number = existing.number.to_string();
         match gh_output(root, gh, &["pr", "edit", &number, "--repo", slug, "--title", &title, "--body", &body]) {
             Ok(out) if !out.success => log(&format!("The commit was appended, but the pull request description could not be refreshed ({}).", last_line(&out))),
@@ -651,8 +752,8 @@ pub fn open_pull_request(ws: &Workspace, plan: &Plan, repo: &Repo, gh: Option<&P
         }
         return Ok(Outcome::PullRequest { url: existing.url, existing: true });
     }
-    log(&format!("> gh pr create --repo {slug} --base {} --head {}", repo.base, plan.branch));
-    let out = gh_output(root, gh, &["pr", "create", "--repo", slug, "--base", &repo.base, "--head", &plan.branch, "--title", &title, "--body", &body])?;
+    log(&format!("> gh pr create --repo {slug} --base {} --head {plan_branch}", repo.base));
+    let out = gh_output(root, gh, &["pr", "create", "--repo", slug, "--base", &repo.base, "--head", plan_branch, "--title", &title, "--body", &body])?;
     if out.success
         && let Some(url) = pull_url(&out.stdout)
     {
@@ -708,6 +809,47 @@ mod tests {
         assert_eq!(web_url("ssh://git@ghe.example.com:22/o/r.git").as_deref(), Some("https://ghe.example.com/o/r"));
         assert_eq!(web_url(r"C:\repos\bare.git"), None);
         assert_eq!(web_url("https://github.com/only-owner"), None);
+    }
+
+    fn open_pr(id: &str, branch: &str, state: &str) -> PullRequestStatus {
+        PullRequestStatus {
+            number: 7, recipe_id: id.into(), branch: branch.into(), title: String::new(), url: String::new(), state: state.into(),
+            merged_at: String::new(), draft: false, merge_state: String::new(), review_decision: String::new(), updated_at: String::new(),
+            checks: Vec::new(), activity: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn groups_new_recipes_and_keeps_ones_with_open_pull_requests_on_them() {
+        let ids: Vec<String> = ["a", "b", "c", "d", "e", "f"].iter().map(|s| s.to_string()).collect();
+        let open = [
+            open_pr("b", "studio/b", "OPEN"),
+            open_pr("c", "studio/batch-1-1", "OPEN"),
+            open_pr("d", "studio/batch-1-1", "OPEN"),
+            open_pr("e", "studio/e", "MERGED"),
+        ];
+        let groups = group(&ids, &open, 2, "20261118");
+        let shape: Vec<(&str, Vec<&str>, bool)> = groups.iter().map(|g| (g.branch.as_str(), g.ids.iter().map(String::as_str).collect(), g.existing)).collect();
+        assert_eq!(shape, [
+            ("studio/b", vec!["b"], true),
+            ("studio/batch-1-1", vec!["c", "d"], true),
+            ("studio/batch-20261118-1", vec!["a", "e"], false),
+            ("studio/f", vec!["f"], false),
+        ]);
+        // A limit of one is the old one-recipe-per-pull-request behaviour.
+        assert!(group(&ids, &[], 1, "x").iter().all(|g| g.branch == format!("studio/{}", g.ids[0])));
+        assert_eq!(group(&ids, &[], 10, "x").len(), 1);
+    }
+
+    #[test]
+    fn combined_pull_requests_are_tracked_per_recipe() {
+        let json = r#"[{"number":9,"title":"Add 2 recipes: a, b","body":"2 recipes\n\n<!-- studio-recipes: a, b -->","url":"https://x/pull/9",
+            "headRefName":"studio/batch-20261118-1","state":"OPEN"},
+            {"number":10,"headRefName":"studio/batch-x-1","body":"no marker","state":"OPEN"},
+            {"number":11,"headRefName":"feature/other","state":"OPEN"}]"#;
+        let prs = parse_pull_requests(json).unwrap();
+        let rows: Vec<_> = prs.iter().map(|p| (p.recipe_id.as_str(), p.number, p.branch.as_str())).collect();
+        assert_eq!(rows, [("a", 9, "studio/batch-20261118-1"), ("b", 9, "studio/batch-20261118-1")]);
     }
 
     #[test]
@@ -859,6 +1001,22 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("evidence-waived")), "{lines:#?}");
         assert_eq!(g(origin.path(), &["rev-list", "--count", "main..studio/brave"]).trim(), "1");
 
+        // Several recipes in one pull request: one commit with each recipe and its evidence.
+        std::fs::write(root.join(r"Recipes\Development\vlc.yaml"), "id: vlc\n").unwrap();
+        std::fs::write(root.join(r"Recipes\Development\gimp.yaml"), "id: gimp\n").unwrap();
+        let plans: Vec<(Plan, Evidence)> = ["vlc", "gimp"].iter()
+            .map(|id| (plan(&ws, id).unwrap(), Evidence::new(id, &Completion::NotValidated, None, None)))
+            .collect();
+        let outcome = open_group_pull_request(&ws, &plans, "studio/batch-1-1", &repo, None, &mut |_| {}).unwrap();
+        assert_eq!(outcome.url(), "https://github.com/o/r/compare/main...studio/batch-1-1?expand=1");
+        for f in ["Recipes/vlc.yaml", "Recipes/gimp.yaml", "Tests/RecipeEvidence/vlc.json", "Tests/RecipeEvidence/gimp.json"] {
+            g(origin.path(), &["show", &format!("studio/batch-1-1:{f}")]);
+        }
+        let msg = g(origin.path(), &["log", "-1", "--format=%B", "studio/batch-1-1"]);
+        assert!(msg.starts_with("Add 2 recipes: vlc, gimp") && msg.contains("<!-- studio-recipes: vlc, gimp -->"), "{msg}");
+        assert_eq!(marked_recipes(&msg), ["vlc", "gimp"]);
+        assert!(open_group_pull_request(&ws, &plans, "feature/x", &repo, None, &mut |_| {}).is_err(), "only Studio branches");
+
         // Once main has it, there is nothing to promote.
         g(origin.path(), &["update-ref", "refs/heads/main", "refs/heads/studio/brave"]);
         let err = open_pull_request(&ws, &p, &repo, None, &changed, &mut |_| {}).unwrap_err();
@@ -867,6 +1025,7 @@ mod tests {
         let merged = PullRequestStatus {
             number: 42,
             recipe_id: "brave".into(),
+            branch: "studio/brave".into(),
             title: "Add brave".into(),
             url: "https://github.com/o/r/pull/42".into(),
             state: "MERGED".into(),

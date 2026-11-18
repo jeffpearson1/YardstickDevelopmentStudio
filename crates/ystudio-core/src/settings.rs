@@ -47,6 +47,8 @@ pub struct Settings {
     pub agent_multi: bool,
     /// In Multi-agent mode, how many apps Recipe Builder researches at once.
     pub agent_parallel: u32,
+    /// Publish puts up to this many new recipes in one pull request.
+    pub publish_per_pr: u32,
     /// Keep full job output, the Studio's messages and the agent CLIs' own
     /// logs in `%APPDATA%\YardstickStudio\logs` (see `diagnostics`).
     pub diagnostic_logging: bool,
@@ -109,6 +111,7 @@ impl Default for Settings {
             agent_downloads: false,
             agent_multi: false,
             agent_parallel: 3,
+            publish_per_pr: 10,
             diagnostic_logging: false,
             plugins: BTreeMap::new(),
             agent_prompt_history: Vec::new(),

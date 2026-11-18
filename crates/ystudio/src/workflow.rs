@@ -1502,6 +1502,7 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         app.promote.pull_requests = vec![ystudio_core::promote::PullRequestStatus {
             number: 42,
             recipe_id: "app".into(),
+            branch: "studio/app".into(),
             title: "Update recipe: app".into(),
             url: "https://github.com/o/r/pull/42".into(),
             state: "OPEN".into(),
