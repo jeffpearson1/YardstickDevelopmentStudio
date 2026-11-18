@@ -484,7 +484,7 @@ pub fn build_command(
                 allowed += " Task";
             }
             let denied: Vec<String> = DENIED_COMMANDS.iter().map(|c| format!("Bash({c}:*)")).collect();
-            spec = spec.args(["-p", &prompt, "--add-dir", &root, "--permission-mode", "acceptEdits", "--allowedTools", &allowed]);
+            spec = claude_stream(spec).args(["-p", &prompt, "--add-dir", &root, "--permission-mode", "acceptEdits", "--allowedTools", &allowed]);
             spec = spec.arg("--disallowedTools").arg(denied.join(" "));
         }
         AgentBackend::Codex => spec = spec.args(codex_args(&prompt, &root, task.writes(), model, options)),
@@ -550,7 +550,7 @@ pub fn build_extract_command(backend: AgentBackend, model: &str, batch_dir: &Pat
         }
         AgentBackend::ClaudeCode => {
             let tools = if options.multi_agent { "Read Write Glob Grep WebFetch WebSearch Task" } else { "Read Write Glob Grep WebFetch WebSearch" };
-            spec = spec.args(["-p", &prompt, "--add-dir", &dir, "--permission-mode", "acceptEdits"]);
+            spec = claude_stream(spec).args(["-p", &prompt, "--add-dir", &dir, "--permission-mode", "acceptEdits"]);
             spec = spec.args(["--allowedTools", tools, "--disallowedTools", "Bash Edit"]);
         }
         // Reading a list needs no downloads, so Codex keeps its sandbox.
@@ -634,6 +634,12 @@ pub const DENIED_COMMANDS: &[&str] = &[
     "Publish-Yardstick.ps1",
     "git push",
 ];
+
+/// Claude Code reports its thinking and tool calls only in its structured stream
+/// (`stream-json` needs `--verbose` in print mode); the job log renders it.
+fn claude_stream(spec: ProcessSpec) -> ProcessSpec {
+    spec.args(["--output-format", "stream-json", "--verbose"]).stdout_format(crate::process::OutputFormat::ClaudeStream)
+}
 
 /// The `STUDIO-RECIPES:` line from an agent's final report.
 pub fn reported_recipes(output: &str) -> Vec<String> {
@@ -842,7 +848,7 @@ pub fn build_plugin_command(
                 allowed += " Task";
             }
             let blocked: Vec<String> = DENIED_COMMANDS.iter().map(|s| s.to_string()).chain(denied).map(|c| format!("Bash({c}:*)")).collect();
-            spec = spec.args(["-p", &prompt, "--add-dir", &dir, "--permission-mode", "acceptEdits", "--allowedTools", &allowed]);
+            spec = claude_stream(spec).args(["-p", &prompt, "--add-dir", &dir, "--permission-mode", "acceptEdits", "--allowedTools", &allowed]);
             spec = spec.arg("--disallowedTools").arg(blocked.join(" "));
         }
         AgentBackend::Codex => spec = spec.args(codex_args(&prompt, &dir, true, model, options)),
@@ -1187,6 +1193,13 @@ mod tests {
             {"slug":"no-visibility-field","priority":6}]}"#;
         assert_eq!(parse_codex_models(json), ["gpt-6.1-sol", "gpt-5.6-terra", "no-visibility-field"]);
         assert!(parse_codex_models("not json").is_empty() && parse_codex_models("{}").is_empty());
+    }
+
+    #[test]
+    fn claude_runs_stream_their_thinking_and_tool_calls() {
+        let spec = claude_stream(ProcessSpec::new("claude", "claude", &std::env::temp_dir()));
+        assert_eq!(spec.args, ["--output-format", "stream-json", "--verbose"]);
+        assert_eq!(spec.stdout_format, crate::process::OutputFormat::ClaudeStream);
     }
 
     #[test]

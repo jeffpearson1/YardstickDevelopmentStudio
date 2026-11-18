@@ -89,12 +89,14 @@ fn write_job_in(dir: &Path, proc: &RunningProcess, started: SystemTime) -> Resul
     for (k, v) in &spec.env {
         s += &format!("Env:      {k}={v}\n");
     }
-    s += "\n--- Output (stderr lines start with !, Studio notes with >) ---\n";
+    s += "\n--- Output (stderr lines start with !, Studio notes with >, agent thinking with ~, tool calls with *) ---\n";
     for line in &proc.lines {
         let mark = match line.stream {
             Stream::Stdout => ' ',
             Stream::Stderr => '!',
             Stream::Studio => '>',
+            Stream::Thinking => '~',
+            Stream::Tool => '*',
         };
         s += &format!("{mark} {}\n", line.text);
     }

@@ -4,6 +4,7 @@
 //! state owned by these types and forwards user intent to them.
 
 pub mod agent;
+pub mod agent_stream;
 pub mod diagnostics;
 pub mod elevation;
 pub mod fields;

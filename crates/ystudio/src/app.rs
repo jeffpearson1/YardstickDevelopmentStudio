@@ -962,7 +962,7 @@ impl StudioApp {
         let ok = self.jobs[idx].proc.succeeded();
         let cancelled = self.jobs[idx].proc.cancelled;
         let started = self.jobs[idx].started_sys;
-        let text = self.jobs[idx].proc.text();
+        let text = self.jobs[idx].proc.report_text();
         let kind = self.jobs[idx].kind.clone();
         if cancelled && matches!(kind, JobKind::WorkflowHarness { .. } | JobKind::WorkflowRepair { .. }) {
             crate::workflow::stop(self, true);
@@ -1500,7 +1500,7 @@ impl StudioApp {
 /// Renders a process log with cancel/copy controls. Shared by the console,
 /// Test Bench and Agent views.
 pub fn job_log(ui: &mut Ui, proc: &mut RunningProcess, salt: &str) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if proc.is_running() {
             ui.spinner();
             ui.label(format!("Running {}", fmt_duration(proc.elapsed())));
@@ -1515,22 +1515,47 @@ pub fn job_log(ui: &mut Ui, proc: &mut RunningProcess, salt: &str) {
             let code = proc.exit.flatten().map(|c| c.to_string()).unwrap_or_else(|| "?".into());
             theme::badge(ui, format!("Failed (exit {code})"), theme::red());
         }
+        if proc.lines.iter().any(|l| l.stream.is_narration()) {
+            let mut show = narration_shown(ui, salt, proc.pid);
+            if ui
+                .checkbox(&mut show, "Thinking & tool calls")
+                .on_hover_text("Show the agent's reasoning and each tool it calls, as it works.")
+                .changed()
+            {
+                ui.data_mut(|d| {
+                    d.insert_temp(egui::Id::unique(("job-log-narration", salt, proc.pid)), show);
+                    d.remove::<LogSelection>(egui::Id::unique(("job-log-selection", salt, proc.pid)));
+                });
+            }
+        }
+        let view = log_view(proc, narration_shown(ui, salt, proc.pid));
         let sel_id = egui::Id::unique(("job-log-selection", salt, proc.pid));
-        let selected = ui.data(|d| d.get_temp::<LogSelection>(sel_id)).and_then(|s| s.range(proc.lines.len()));
+        let selected = ui.data(|d| d.get_temp::<LogSelection>(sel_id)).and_then(|s| s.range(view.len()));
         if let Some(range) = selected.clone() {
             let n = range.len();
             if ui.small_button(format!("\u{E8C8}  Copy {n} line{}", if n == 1 { "" } else { "s" })).clicked() {
-                ui.ctx().copy_text(log_text(&proc.lines, range));
+                ui.ctx().copy_text(log_text(&proc.lines, &view[range]));
             }
         }
         if ui.small_button("\u{E8C8}  Copy log").clicked() {
-            ui.ctx().copy_text(proc.text());
+            ui.ctx().copy_text(log_text(&proc.lines, &view));
         }
         if selected.is_none() && !proc.lines.is_empty() {
             ui.label(RichText::new("Drag across lines to select them, then Ctrl+C.").small().weak());
         }
     });
-    log_lines(ui, proc, salt);
+    let view = log_view(proc, narration_shown(ui, salt, proc.pid));
+    log_lines(ui, proc, salt, &view);
+}
+
+/// Whether this log shows agent narration (thinking, tool calls); on by default.
+fn narration_shown(ui: &Ui, salt: &str, pid: u32) -> bool {
+    ui.data(|d| d.get_temp::<bool>(egui::Id::unique(("job-log-narration", salt, pid)))).unwrap_or(true)
+}
+
+/// Indices of the lines the log shows, in order.
+fn log_view(proc: &RunningProcess, narration: bool) -> Vec<usize> {
+    proc.lines.iter().enumerate().filter(|(_, l)| narration || !l.stream.is_narration()).map(|(i, _)| i).collect()
 }
 
 /// A range of selected log lines, by index. Logs only grow, so indices stay valid
@@ -1550,19 +1575,21 @@ impl LogSelection {
     }
 }
 
-fn log_text(lines: &[ystudio_core::process::LogLine], range: std::ops::Range<usize>) -> String {
-    lines[range].iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n")
+fn log_text(lines: &[ystudio_core::process::LogLine], view: &[usize]) -> String {
+    view.iter().map(|&i| lines[i].text.as_str()).collect::<Vec<_>>().join("\n")
 }
 
 /// The virtualised log body with line selection: click a line, drag or Shift+click to
 /// extend, Ctrl+C or the context menu to copy. egui's own label selection cannot span
 /// rows that `show_rows` has scrolled out of existence, so selection is by line.
-fn log_lines(ui: &mut Ui, proc: &RunningProcess, salt: &str) {
+/// `view` lists the line indices shown; selection positions index into it.
+fn log_lines(ui: &mut Ui, proc: &RunningProcess, salt: &str, view: &[usize]) {
     let sel_id = egui::Id::unique(("job-log-selection", salt, proc.pid));
     let mut sel = ui.data(|d| d.get_temp::<LogSelection>(sel_id));
     let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
-    let n = proc.lines.len();
+    let n = view.len();
     let normal = ui.visuals().text_color();
+    let weak = ui.visuals().weak_text_color();
     let stderr_color = if proc.spec.stderr_is_progress { ui.visuals().weak_text_color() } else { theme::red() };
     let select_bg = ui.visuals().selection.bg_fill;
     let font = egui::TextStyle::Monospace.resolve(ui.style());
@@ -1576,11 +1603,12 @@ fn log_lines(ui: &mut Ui, proc: &RunningProcess, salt: &str) {
             let selected = sel.and_then(|s| s.range(n));
             let mut rows: Vec<(usize, egui::Rect)> = Vec::with_capacity(range.len());
             for i in range {
-                let line = &proc.lines[i];
+                let line = &proc.lines[view[i]];
                 let color = match line.stream {
                     Stream::Stdout => normal,
                     Stream::Stderr => stderr_color,
                     Stream::Studio => theme::blue(),
+                    Stream::Thinking | Stream::Tool => weak,
                 };
                 // `show_rows` requires every child to have exactly `row_h` height.
                 // Keep process output on one line so long commands scroll sideways
@@ -1591,7 +1619,15 @@ fn log_lines(ui: &mut Ui, proc: &RunningProcess, salt: &str) {
                 if selected.as_ref().is_some_and(|r| r.contains(&i)) {
                     ui.painter().rect_filled(rect.expand2(egui::vec2(4.0, ui.spacing().item_spacing.y / 2.0)), 0.0, select_bg);
                 }
-                ui.painter().galley(rect.left_top(), galley, color);
+                // Thinking is set in from a thin accent rule, like a quotation.
+                let indent = if line.stream == Stream::Thinking {
+                    let x = rect.left() + 3.0;
+                    ui.painter().vline(x, rect.y_range(), egui::Stroke::new(2.0, theme::accent().gamma_multiply(0.6)));
+                    12.0
+                } else {
+                    0.0
+                };
+                ui.painter().galley(rect.left_top() + egui::vec2(indent, 0.0), galley, color);
                 rows.push((i, rect));
                 if resp.drag_started_by(egui::PointerButton::Primary) || resp.clicked() {
                     sel = Some(match sel {
@@ -1652,7 +1688,7 @@ fn log_lines(ui: &mut Ui, proc: &RunningProcess, salt: &str) {
     }
     match menu_action {
         Some(LogMenu::SelectAll) if n > 0 => sel = Some(LogSelection { anchor: 0, end: n - 1, dragging: false }),
-        Some(LogMenu::CopyAll) => ui.ctx().copy_text(proc.text()),
+        Some(LogMenu::CopyAll) => ui.ctx().copy_text(log_text(&proc.lines, view)),
         _ => {}
     }
     let hovered = pointer.is_some_and(|p| output.inner_rect.contains(p));
@@ -1666,7 +1702,7 @@ fn log_lines(ui: &mut Ui, proc: &RunningProcess, salt: &str) {
     });
     if let Some(range) = sel.and_then(|s| s.range(n)) {
         if menu_action == Some(LogMenu::CopySelection) || (copy && !focus_elsewhere) {
-            ui.ctx().copy_text(log_text(&proc.lines, range));
+            ui.ctx().copy_text(log_text(&proc.lines, &view[range]));
         }
         if escape && !focus_elsewhere {
             sel = None;
@@ -1892,7 +1928,7 @@ mod layout_tests {
                     top.set(ui.cursor().top());
                     pitch.set(ui.text_style_height(&egui::TextStyle::Monospace) + ui.spacing().item_spacing.y);
                 }
-                log_lines(ui, &proc, "test");
+                log_lines(ui, &proc, "test", &(0..proc.lines.len()).collect::<Vec<_>>());
             });
             out.textures_delta.clear();
             out.platform_output
