@@ -35,6 +35,8 @@ The Studio searches Intune read-only for each product, using your `searchPattern
 
 Prefer an official vendor source with a stable unattended enterprise installer and a verifiable version. Use a supplied Dropbox folder only if the ticket authorises it, and inspect its contents before choosing a payload.
 
+Files the ticket links to are already downloaded into `downloads/` with their facts in `downloads.json`, and after triage the Studio copies each product's files (its `downloads`) to `<SoftwareDropbox>\<recipe-id>\` and lists them on the product as `ticketInstallers`. Recipe authoring can then use that installer through `manualDownload` when the vendor offers no unattended download of the same file.
+
 When no retrievable installer exists, report the staging location `<SoftwareDropbox>\<recipe-id>\` with acceptable file types and names, and stop that product as **blocked awaiting installer**. Do not fabricate a URL or substitute a trial or community edition.
 
 ## 4. Research and author

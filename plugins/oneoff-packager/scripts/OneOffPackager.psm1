@@ -771,7 +771,318 @@ function Invoke-OneOffLiveChange {
     }
 }
 
+# ------------------------------------------------------------------ installers linked from the ticket
+
+$script:InstallerExtensions = @('.exe', '.msi', '.msix', '.msixbundle', '.appx', '.appxbundle', '.zip', '.7z', '.cab', '.iso', '.ps1', '.bat', '.cmd', '.pkg', '.dmg')
+# Files a ticket link may deliver that are worth keeping beside the installers.
+$script:KeptExtensions = $script:InstallerExtensions + @('.mst', '.msp', '.xml', '.json', '.ini', '.cfg', '.reg', '.txt', '.lic', '.key')
+
+function Remove-OneOffUrlQuery {
+    # A link as it may be written down: scheme, host and path, never the query
+    # (Dropbox and SharePoint put access tokens there).
+    param([Parameter(Mandatory)][string]$Url)
+    $uri = $null
+    if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri)) { return '(unreadable link)' }
+    $text = "$($uri.Scheme)://$($uri.Authority)$($uri.AbsolutePath)"
+    if ($uri.Query) { $text += ' (query removed)' }
+    $text
+}
+
+function Get-OneOffDownloadUri {
+    # The URL that returns the file itself: a Dropbox share link only downloads with dl=1,
+    # a SharePoint/OneDrive sharing link with download=1. Other links are used as they are.
+    param([Parameter(Mandatory)][string]$Url)
+    $uri = [Uri]$Url
+    $hostName = $uri.Host.ToLowerInvariant()
+    $query = $uri.Query.TrimStart('?')
+    $pairs = @(if ($query) { $query -split '&' | Where-Object { $_ } })
+    $set = {
+        param($pairs, $name, $value)
+        $kept = @($pairs | Where-Object { $_ -notmatch "^(?i)$name=" })
+        $kept + "$name=$value"
+    }
+    if ($hostName -match '(^|\.)dropbox\.com$') {
+        $pairs = & $set $pairs 'dl' '1'
+    } elseif ($hostName -match '(^|\.)(sharepoint\.com|1drv\.ms|onedrive\.live\.com)$') {
+        $pairs = & $set $pairs 'download' '1'
+    } else {
+        return $uri.AbsoluteUri
+    }
+    $builder = [UriBuilder]::new($uri)
+    $builder.Query = ($pairs -join '&')
+    $builder.Uri.AbsoluteUri
+}
+
+function Get-OneOffSafeFileName {
+    param([string]$Name, [string]$Fallback = 'download.bin')
+    $name = [IO.Path]::GetFileName(([string]$Name).Trim().Trim('"'))
+    foreach ($c in [IO.Path]::GetInvalidFileNameChars()) { $name = $name.Replace([string]$c, '_') }
+    $name = $name.Trim(' ', '.')
+    if (-not $name) { $name = $Fallback }
+    $name
+}
+
+function Get-OneOffUniquePath {
+    param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][string]$Name)
+    $path = Join-Path $Directory $Name
+    $n = 2
+    while (Test-Path -LiteralPath $path) {
+        $path = Join-Path $Directory ("{0} ({1}){2}" -f [IO.Path]::GetFileNameWithoutExtension($Name), $n, [IO.Path]::GetExtension($Name))
+        $n++
+    }
+    $path
+}
+
+function Get-OneOffMsiProperties {
+    # Reads an MSI's Property table without installing anything (the database is opened read-only).
+    param([Parameter(Mandatory)][string]$Path)
+    $facts = [ordered]@{}
+    $installer = $null
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        $database = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($Path, 0))
+        foreach ($name in 'ProductName', 'ProductVersion', 'Manufacturer', 'ProductCode', 'UpgradeCode', 'ALLUSERS') {
+            $view = $database.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $database, @("SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = '$name'"))
+            $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
+            $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+            if ($record) { $facts[$name] = $record.GetType().InvokeMember('StringData', 'GetProperty', $null, $record, 1) }
+            $view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null) | Out-Null
+        }
+    } catch {
+        $facts['error'] = "MSI properties could not be read: $($_.Exception.Message)"
+    } finally {
+        if ($installer) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($installer) }
+    }
+    $facts
+}
+
+function Get-OneOffInstallerFacts {
+    # What can be learned about a file without running it: size, hash, signature,
+    # version resources and, for an MSI, its product properties.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$WorkItem)
+    $item = Get-Item -LiteralPath $Path
+    $facts = [ordered]@{
+        file   = ConvertTo-WorkItemRelative -WorkItem $WorkItem -Path $item.FullName
+        name   = $item.Name
+        size   = $item.Length
+        sha256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    $extension = $item.Extension.ToLowerInvariant()
+    if ($extension -in '.exe', '.msi', '.msix', '.msixbundle', '.appx', '.appxbundle', '.cab', '.ps1', '.dll', '.sys') {
+        try {
+            $signature = Get-AuthenticodeSignature -LiteralPath $item.FullName
+            $facts['signature'] = "$($signature.Status)"
+            if ($signature.SignerCertificate) { $facts['signer'] = $signature.SignerCertificate.GetNameInfo('SimpleName', $false) }
+        } catch { $facts['signature'] = 'Unknown' }
+    }
+    if ($extension -in '.exe', '.dll') {
+        $version = $item.VersionInfo
+        foreach ($pair in @(@('productName', $version.ProductName), @('company', $version.CompanyName), @('productVersion', $version.ProductVersion),
+                @('fileVersion', $version.FileVersion), @('description', $version.FileDescription))) {
+            if ("$($pair[1])".Trim()) { $facts[$pair[0]] = "$($pair[1])".Trim() }
+        }
+    }
+    if ($extension -eq '.msi') { $facts['msi'] = Get-OneOffMsiProperties -Path $item.FullName }
+    $facts
+}
+
+function Expand-OneOffArchive {
+    # Unpacks a zip into a folder of the same name, refusing entries that would land
+    # outside it. Returns the files it wrote.
+    param([Parameter(Mandatory)][string]$Path, [long]$MaxBytes)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $target = Join-Path (Split-Path $Path -Parent) ([IO.Path]::GetFileNameWithoutExtension($Path))
+    $target = [IO.Path]::GetFullPath($target)
+    $zip = [IO.Compression.ZipFile]::OpenRead($Path)
+    try {
+        $total = ($zip.Entries | Measure-Object -Property Length -Sum).Sum
+        if ($MaxBytes -and $total -gt $MaxBytes) { throw "it would unpack to $total bytes, more than the $MaxBytes allowed" }
+        $written = [System.Collections.Generic.List[string]]::new()
+        foreach ($entry in $zip.Entries) {
+            if (-not $entry.Name) { continue }
+            $destination = [IO.Path]::GetFullPath((Join-Path $target $entry.FullName))
+            if (-not $destination.StartsWith($target + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "it contains an entry outside its folder ($($entry.FullName))"
+            }
+            New-Item -ItemType Directory -Path (Split-Path $destination -Parent) -Force | Out-Null
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $destination, $false)
+            $written.Add($destination)
+        }
+        @($written)
+    } finally {
+        $zip.Dispose()
+    }
+}
+
+function Save-OneOffTicketDownloads {
+    # Downloads every ticket link that serves a file into downloads\, unpacks zips, and
+    # records what each file is in downloads.json and downloads.md. Links that open a web
+    # page are noted, not kept. Nothing downloaded is run.
+    param(
+        [Parameter(Mandatory)][string]$WorkItem,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Urls,
+        [long]$MaxBytes = 4GB,
+        [int]$TimeoutSec = 900
+    )
+    $folder = Join-Path $WorkItem 'downloads'
+    New-Item -ItemType Directory -Path $folder -Force | Out-Null
+    # The progress display slows large downloads many times over.
+    $ProgressPreference = 'SilentlyContinue'
+    $links = [System.Collections.Generic.List[object]]::new()
+    $files = [System.Collections.Generic.List[object]]::new()
+    foreach ($url in @($Urls | Where-Object { $_ -match '^(?i)https?://' } | Select-Object -Unique)) {
+        $link = [ordered]@{ link = Remove-OneOffUrlQuery -Url $url; result = ''; files = @() }
+        $partial = Join-Path $folder (".download-" + [guid]::NewGuid().ToString('N'))
+        try {
+            $response = Invoke-WebRequest -Uri (Get-OneOffDownloadUri -Url $url) -OutFile $partial -PassThru -MaximumRedirection 10 -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop
+            $headers = $response.Headers
+            $type = "$(@($headers['Content-Type'])[0])".ToLowerInvariant()
+            $disposition = "$(@($headers['Content-Disposition'])[0])"
+            $nameFromHeader = if ($disposition -match "(?i)filename\*=(?:UTF-8'')?([^;]+)") { [Uri]::UnescapeDataString($Matches[1].Trim('"')) }
+                elseif ($disposition -match '(?i)filename="?([^";]+)"?') { $Matches[1] }
+            $finalUri = if ($response.BaseResponse -and $response.BaseResponse.RequestMessage) { $response.BaseResponse.RequestMessage.RequestUri } else { [Uri]$url }
+            $name = Get-OneOffSafeFileName -Name ($(if ($nameFromHeader) { $nameFromHeader } else { [Uri]::UnescapeDataString($finalUri.AbsolutePath) })) -Fallback 'download.bin'
+            $extension = [IO.Path]::GetExtension($name).ToLowerInvariant()
+            $isPage = ($type -match '^text/html' -or $type -match 'xhtml') -and -not $disposition -and $extension -notin $script:InstallerExtensions
+            $size = (Get-Item -LiteralPath $partial).Length
+            if ($isPage) {
+                Remove-Item -LiteralPath $partial -Force
+                $link.result = 'web page, not a file (nothing kept)'
+                $links.Add($link); continue
+            }
+            if ($size -gt $MaxBytes) {
+                Remove-Item -LiteralPath $partial -Force
+                $link.result = "too large ($size bytes; the limit is $MaxBytes)"
+                $links.Add($link); continue
+            }
+            if (-not $extension) { $name += '.bin'; $extension = '.bin' }
+            $path = Get-OneOffUniquePath -Directory $folder -Name $name
+            Move-Item -LiteralPath $partial -Destination $path
+            $saved = @($path)
+            if ($extension -eq '.zip') {
+                try {
+                    $saved = @(Expand-OneOffArchive -Path $path -MaxBytes $MaxBytes)
+                    $link.result = "zip unpacked ($($saved.Count) file(s))"
+                } catch {
+                    $link.result = "zip kept but not unpacked: $($_.Exception.Message)"
+                    $saved = @($path)
+                }
+            } else {
+                $link.result = 'downloaded'
+            }
+            foreach ($file in $saved) {
+                if ([IO.Path]::GetExtension($file).ToLowerInvariant() -notin $script:KeptExtensions -and $file -ne $path) { continue }
+                $facts = Get-OneOffInstallerFacts -Path $file -WorkItem $WorkItem
+                $facts['link'] = $link.link
+                $files.Add($facts)
+                $link.files += $facts.file
+            }
+        } catch {
+            Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
+            $status = if ($_.Exception.Response) { " (HTTP $([int]$_.Exception.Response.StatusCode))" } else { '' }
+            $link.result = "failed$status`: $($_.Exception.Message -replace '\?\S*', '?(query removed)')"
+        }
+        $links.Add($link)
+    }
+    $document = [ordered]@{ links = @($links); files = @($files) }
+    Write-Json -Path (Join-Path $WorkItem 'downloads.json') -Value $document
+
+    $md = [System.Collections.Generic.List[string]]::new()
+    $md.Add('# Installers linked from the ticket'); $md.Add('')
+    if ($links.Count -eq 0) { $md.Add('The ticket has no links.') }
+    foreach ($link in $links) { $md.Add("- $($link.link): $($link.result)") }
+    foreach ($file in $files) {
+        $md.Add(''); $md.Add("## $($file.name)"); $md.Add('')
+        foreach ($key in $file.Keys) {
+            if ($key -in 'name', 'msi') { continue }
+            $md.Add("- ${key}: $($file[$key])")
+        }
+        if ($file.Contains('msi')) { foreach ($key in $file.msi.Keys) { $md.Add("- MSI ${key}: $($file.msi[$key])") } }
+    }
+    Set-Content -LiteralPath (Join-Path $WorkItem 'downloads.md') -Value ($md -join "`n") -Encoding utf8NoBOM
+    [pscustomobject]@{ Links = @($links); Files = @($files) }
+}
+
+function Get-OneOffSoftwareDropbox {
+    # Yardstick's SoftwareDropbox from the YardstickDev clone's preferences: where
+    # manualDownload recipes find installers that cannot be downloaded unattended.
+    param([string]$YardstickDev)
+    if (-not $YardstickDev) { return $null }
+    foreach ($file in (Join-Path $YardstickDev 'Local\preferences.yaml'), (Join-Path $YardstickDev 'preferences.yaml')) {
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { continue }
+        Import-Module powershell-yaml -MinimumVersion 0.4.12 -ErrorAction Stop
+        $prefs = [IO.File]::ReadAllText($file) | ConvertFrom-Yaml
+        if ($prefs -is [System.Collections.IDictionary] -and $prefs.Contains('SoftwareDropbox')) {
+            $value = "$($prefs['SoftwareDropbox'])".Trim().Trim('"', "'").Trim()
+            if ($value) { return $value }
+        }
+    }
+    $null
+}
+
+function Copy-OneOffTicketInstallers {
+    # Puts each product's ticket downloads in <SoftwareDropbox>\<product id>\ and records them
+    # on the product (ticketInstallers) so recipe authoring knows they are there. A different
+    # file already there under the same name is never replaced.
+    param([Parameter(Mandatory)][string]$WorkItem, [string]$SoftwareDropbox)
+    $productsPath = Join-Path $WorkItem 'products.json'
+    if (-not (Test-Path -LiteralPath $productsPath -PathType Leaf)) { throw 'products.json is missing. Run the triage task first.' }
+    $downloadsPath = Join-Path $WorkItem 'downloads.json'
+    $known = if (Test-Path -LiteralPath $downloadsPath) { @((Read-Json -Path $downloadsPath).files) } else { @() }
+    $document = Read-Json -Path $productsPath
+    $staged = 0; $existing = 0
+    $notes = [System.Collections.Generic.List[string]]::new()
+    foreach ($product in @(Get-Prop $document 'products' @())) {
+        $wanted = @(Get-Prop $product 'downloads' @())
+        if ($wanted.Count -eq 0) { continue }
+        $id = [string](Get-Prop $product 'id' '')
+        if ($id -notmatch '^[a-z0-9][a-z0-9._-]*$') { $notes.Add("A product has the invalid id '$id'; its downloads were not staged."); continue }
+        $records = [System.Collections.Generic.List[object]]::new()
+        foreach ($relative in $wanted) {
+            $source = Resolve-WorkItemPath -WorkItem $WorkItem -Relative ([string]$relative)
+            if (-not (Test-PathWithin -Path $source -Root (Join-Path $WorkItem 'downloads')) -or -not (Test-Path -LiteralPath $source -PathType Leaf)) {
+                $notes.Add("${id}: $relative is not a file in downloads\."); continue
+            }
+            $facts = $known | Where-Object { $_.file -eq (ConvertTo-WorkItemRelative -WorkItem $WorkItem -Path $source) } | Select-Object -First 1
+            $hash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+            $record = [ordered]@{
+                file = Split-Path $source -Leaf
+                sha256 = $hash
+                stagedAt = $null
+            }
+            foreach ($key in 'productName', 'productVersion', 'company', 'signer', 'signature') {
+                $value = Get-Prop $facts $key
+                if ($value) { $record[$key] = $value }
+            }
+            $msi = Get-Prop $facts 'msi'
+            if ($msi) { $record['msi'] = $msi }
+            if ($SoftwareDropbox) {
+                $folder = Join-Path $SoftwareDropbox $id
+                $target = Join-Path $folder $record.file
+                New-Item -ItemType Directory -Path $folder -Force | Out-Null
+                if (Test-Path -LiteralPath $target -PathType Leaf) {
+                    if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant() -eq $hash) {
+                        $existing++
+                        $record.stagedAt = "<SoftwareDropbox>\$id\$($record.file)"
+                    } else {
+                        $notes.Add("${id}: <SoftwareDropbox>\$id\$($record.file) already exists with different contents; it was left as it is.")
+                    }
+                } else {
+                    Copy-Item -LiteralPath $source -Destination $target
+                    $staged++
+                    $record.stagedAt = "<SoftwareDropbox>\$id\$($record.file)"
+                }
+            }
+            $records.Add($record)
+        }
+        $product | Add-Member -NotePropertyName ticketInstallers -NotePropertyValue @($records) -Force
+    }
+    Write-Json -Path $productsPath -Value $document -Depth 30
+    [pscustomobject]@{ Staged = $staged; AlreadyThere = $existing; Notes = @($notes) }
+}
+
 Export-ModuleMember -Function Get-OneOffSearchPatterns, Select-InventoryCandidates, Get-OneOffGroup, Get-OneOffInventoryData, Connect-OneOffTenant,
     New-OneOffInventory, Find-TestResult, Find-FullTestResult, New-OneOffLocalPackages, Get-RecipeAppSettings, New-OneOffDetectionRule, New-OneOffChangeSummary,
     New-OneOffLiveChange, Test-DetectionRulesMatch, Test-AppMetadata, Test-AppAssignment, Invoke-OneOffLiveChangeCore, Invoke-OneOffLiveChange,
-    Resolve-RecipePlaceholders, Get-WorkItemProducts
+    Resolve-RecipePlaceholders, Get-WorkItemProducts, Remove-OneOffUrlQuery, Get-OneOffDownloadUri, Get-OneOffInstallerFacts,
+    Save-OneOffTicketDownloads, Get-OneOffSoftwareDropbox, Copy-OneOffTicketInstallers

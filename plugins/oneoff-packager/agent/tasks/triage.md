@@ -1,4 +1,4 @@
-Read `ticket.md`, `parsed-ticket.json` and anything in `intake/`. Then write `products.json`: one entry for each separate piece of software the ticket asks for.
+Read `ticket.md`, `parsed-ticket.json`, `downloads.json` (if present) and anything in `intake/`. Then write `products.json`: one entry for each separate piece of software the ticket asks for.
 
 If `products.json` already contains `routedProducts`, preserve that array exactly and do not put those product IDs back into `products`. The user routed them to Recipe Builder in Studio.
 
@@ -11,6 +11,16 @@ First read `.studio\agent\references\workflow.md`, section 1.
 - Never copy a private link's query string into any file. Keep the host and path; replace the query with `(query removed)`.
 - Do not substitute similarly named software. Where two products share a name, record both readings in `ambiguities`.
 - Targets such as asset tags (`NC-1234567`), device names or user names are **not** group names. Record them under `targets`. Only a real Entra group object ID belongs in `requestedGroupId`, and only if the ticket names one.
+
+## Installers the ticket's links delivered
+
+The Studio has already downloaded every file the ticket links to into `downloads/` (zips unpacked) and listed them in `downloads.json`: each file's path, size, SHA-256, Authenticode signer and, where present, its version resources and MSI properties (`ProductName`, `ProductVersion`, `Manufacturer`, `ProductCode`). Links that opened a web page or failed are listed with why. Use these facts:
+
+- to tell which product a file is, and its exact publisher and version, when the ticket is vague. The file's own metadata outranks its file name and the link's position in the text;
+- to fill `version` from the file when the ticket names none but supplied this exact installer;
+- to note anything packaging needs (unsigned file, an MSI vs. an EXE wrapper, several architectures, a zip of several installers) in `notes`.
+
+List the files that belong to each product in its `downloads`, as the work-item-relative paths from `downloads.json` (for example `downloads\Zoom\ZoomInstallerFull.msi`; escape the backslashes in JSON). A later Studio step copies them to the software dropbox under the product id for the recipe to use. Leave out files that are not installers for that product (readme files, other products' installers). Do not run, install or unpack anything yourself.
 
 ## If the ticket came from SCCM
 
@@ -29,6 +39,7 @@ When `intake\sccm-export.json` exists the request is one application: write exac
       "status": "needs-research",
       "notes": "One or two sentences: edition, architecture, anything the packager needs.",
       "links": ["https://example.com/FSViewerSetup85.exe (query removed)"],
+      "downloads": ["downloads\\FSViewerSetup85.exe"],
       "targets": ["NC-4214805"],
       "searchPatterns": ["fast\\s*stone", "image\\s*viewer"],
       "requestedGroupId": null,
