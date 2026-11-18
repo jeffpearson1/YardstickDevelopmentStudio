@@ -5,7 +5,7 @@ version: 1.0.0
 publisher: Yardstick contributors
 description: A tiny plugin the Studio's tests install and run.
 icon: E8F1
-studio: { minVersion: 0.6.0, hostApi: 3 }
+studio: { minVersion: 0.7.0, hostApi: 3 }
 source: { github: jeffpearson1/YardstickDevelopmentStudio, tagPrefix: plugin-sample-plugin-v }
 requires:
   plugins:

@@ -5,7 +5,7 @@ version: 1.5.0
 publisher: Yardstick contributors
 description: Packages one-off software requests that don't suit Yardstick. An agent triages the ticket, Recipe Builder authors and checks recipes, and packaging and Intune upload remain separate stages. Anything that installs software or changes the tenant waits for your approval of the exact file it acts on.
 icon: E7B8
-studio: { minVersion: 0.6.0, hostApi: 3 }
+studio: { minVersion: 0.7.0, hostApi: 3 }
 source: { github: jeffpearson1/YardstickDevelopmentStudio, tagPrefix: plugin-oneoff-packager-v }
 requires:
   modules:

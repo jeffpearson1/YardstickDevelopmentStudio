@@ -2305,7 +2305,7 @@ pub(crate) mod tests {
             std::fs::copy(src.join(rel), copy.join(rel)).unwrap();
         }
         let manifest = std::fs::read_to_string(copy.join("plugin.yaml")).unwrap().replace("\r\n", "\n");
-        let manifest = edit(manifest.replace("minVersion: 0.6.0", &format!("minVersion: {}", super::super::update::CURRENT_VERSION)).replace("id: sample-plugin", &format!("id: {id}")));
+        let manifest = edit(manifest.replace("minVersion: 0.7.0", &format!("minVersion: {}", super::super::update::CURRENT_VERSION)).replace("id: sample-plugin", &format!("id: {id}")));
         std::fs::write(copy.join("plugin.yaml"), manifest).unwrap();
         let pkg = plugin::Package::from_bytes(&plugin::zip_dir(&copy).unwrap()).unwrap();
         let plugins = dir.join("plugins");

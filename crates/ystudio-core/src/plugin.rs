@@ -2169,7 +2169,7 @@ mod tests {
     use std::io::Write as _;
     use std::time::Duration;
 
-    const VERSION: &str = "0.6.0";
+    const VERSION: &str = "0.7.0";
 
     fn fixture() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("plugins").join("sample")
@@ -2218,7 +2218,7 @@ mod tests {
         assert_eq!(m.step("approve").unwrap().gate, Gate::Hash { file: "change.json".into(), summary: Some("change.md".into()) });
         assert_eq!(m.step("echo").unwrap().gate, Gate::None);
         assert!(m.incompatibility(VERSION).is_none());
-        assert!(m.incompatibility("0.5.2").unwrap().contains("0.6.0"));
+        assert!(m.incompatibility("0.6.1").unwrap().contains("0.7.0"));
         let order: Vec<&str> = m.pipeline().iter().map(|s| s.id()).collect();
         assert_eq!(order, ["triage", "echo", "confirmed", "approve"]);
         assert_eq!(

@@ -5,7 +5,7 @@ version: 1.1.0
 publisher: Yardstick contributors
 description: Browse the applications in a Configuration Manager site and migrate one to Intune, either as a one-off package built from its content or as a Yardstick recipe. Read-only towards Configuration Manager.
 icon: E968
-studio: { minVersion: 0.6.0, hostApi: 3 }
+studio: { minVersion: 0.7.0, hostApi: 3 }
 source: { github: jeffpearson1/YardstickDevelopmentStudio, tagPrefix: plugin-sccm-migration-v }
 requires:
   plugins:
