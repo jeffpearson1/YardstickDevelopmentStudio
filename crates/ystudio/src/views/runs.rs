@@ -18,6 +18,23 @@ enum Tab {
     Lab,
 }
 
+#[derive(Default, PartialEq, Clone, Copy)]
+enum HistoryView {
+    #[default]
+    RecipeTests,
+    PluginWork,
+}
+
+#[derive(Default, PartialEq, Clone, Copy)]
+enum PluginFilter {
+    #[default]
+    Active,
+    Attention,
+    Running,
+    Complete,
+    All,
+}
+
 #[derive(Default)]
 pub struct RunsState {
     selected: Option<PathBuf>,
@@ -25,12 +42,19 @@ pub struct RunsState {
     followed: Option<String>,
     tab: Tab,
     loaded: bool,
+    view: HistoryView,
+    plugin_filter: PluginFilter,
 }
 
 impl RunsState {
     pub fn select_dir(&mut self, dir: &Path) {
         self.selected = Some(dir.to_path_buf());
         self.tab = Tab::Results;
+        self.view = HistoryView::RecipeTests;
+    }
+
+    pub fn show_plugin_work(&mut self) {
+        self.view = HistoryView::PluginWork;
     }
 }
 
@@ -52,6 +76,109 @@ pub fn phases_table(ui: &mut Ui, r: &RecipeResult, salt: &str) {
 }
 
 pub fn show(app: &mut StudioApp, ui: &mut Ui) {
+    super::plugin_page::refresh_activity(app, false);
+    theme::page_title(ui, "History");
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.selectable_value(&mut app.runs_ui.view, HistoryView::RecipeTests, "Recipe tests");
+        ui.selectable_value(&mut app.runs_ui.view, HistoryView::PluginWork, "Plugin work");
+    });
+    ui.add_space(8.0);
+    match app.runs_ui.view {
+        HistoryView::RecipeTests => recipe_history(app, ui),
+        HistoryView::PluginWork => plugin_history(app, ui),
+    }
+}
+
+fn plugin_history(app: &mut StudioApp, ui: &mut Ui) {
+    let mut refresh = false;
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("\u{E72C}  Refresh").clicked() {
+            refresh = true;
+        }
+        let count = |filter: PluginFilter| {
+            app.plugins
+                .activity
+                .iter()
+                .filter(|activity| plugin_filter_matches(filter, activity.state))
+                .count()
+        };
+        for (filter, label) in [
+            (PluginFilter::Active, "Active"),
+            (PluginFilter::Attention, "Needs attention"),
+            (PluginFilter::Running, "Running"),
+            (PluginFilter::Complete, "Complete"),
+            (PluginFilter::All, "All"),
+        ] {
+            ui.selectable_value(&mut app.runs_ui.plugin_filter, filter, format!("{label} ({})", count(filter)));
+        }
+    });
+    if refresh {
+        super::plugin_page::refresh_activity(app, true);
+    }
+    ui.add_space(8.0);
+    let activity: Vec<_> = app
+        .plugins
+        .activity
+        .iter()
+        .filter(|activity| plugin_filter_matches(app.runs_ui.plugin_filter, activity.state))
+        .cloned()
+        .collect();
+    if activity.is_empty() {
+        theme::card(ui, |ui| {
+            theme::section_heading(ui, "No matching plugin work");
+            ui.label("New plugin tickets and handoffs will appear here. Use Active to see everything that can still be continued.");
+        });
+        return;
+    }
+    let mut open = None;
+    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+        for item in &activity {
+            theme::card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(&item.title).size(16.0).semibold());
+                    theme::badge(ui, item.state.label(), super::home::plugin_activity_color(item.state));
+                    ui.label(RichText::new(&item.plugin_name).weak());
+                    if !item.reference.is_empty() {
+                        ui.label(RichText::new(&item.reference).monospace().small().weak());
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Open work item").clicked() {
+                            open = Some(item.clone());
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("{} of {} stages complete", item.done, item.total));
+                    if !item.created.is_empty() {
+                        ui.label(RichText::new(format!("Created {}", item.created)).small().weak());
+                    }
+                });
+                if !item.note.is_empty() {
+                    ui.label(RichText::new(&item.note).weak());
+                }
+            });
+            ui.add_space(8.0);
+        }
+    });
+    if let Some(activity) = open {
+        super::plugin_page::open_activity(app, &activity);
+    }
+}
+
+fn plugin_filter_matches(filter: PluginFilter, state: super::plugin_page::PluginActivityState) -> bool {
+    use super::plugin_page::PluginActivityState;
+    match filter {
+        PluginFilter::Active => state != PluginActivityState::Complete,
+        PluginFilter::Attention => state.needs_attention(),
+        PluginFilter::Running => state == PluginActivityState::Running,
+        PluginFilter::Complete => state == PluginActivityState::Complete,
+        PluginFilter::All => true,
+    }
+}
+
+fn recipe_history(app: &mut StudioApp, ui: &mut Ui) {
     if !super::need_workspace(app, ui) {
         return;
     }
@@ -60,7 +187,6 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         app.runs_ui.loaded = true;
     }
     ui.horizontal_wrapped(|ui| {
-        theme::page_title(ui, "History");
         if ui.button("\u{E72C}  Refresh").clicked() {
             app.refresh_runs();
         }

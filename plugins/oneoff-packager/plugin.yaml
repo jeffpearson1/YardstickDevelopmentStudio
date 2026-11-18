@@ -1,11 +1,11 @@
 schema: 1
 id: oneoff-packager
 name: One-Off Packager
-version: 1.1.0
+version: 1.5.0
 publisher: Yardstick contributors
-description: Packages one-off software requests that don't suit Yardstick. An agent triages the ticket and drafts the recipe; tests, packaging and the Intune upload run as separate steps, and anything that installs software or changes the tenant waits for your approval of the exact file it acts on.
+description: Packages one-off software requests that don't suit Yardstick. An agent triages the ticket, Recipe Builder authors and checks recipes, and packaging and Intune upload remain separate stages. Anything that installs software or changes the tenant waits for your approval of the exact file it acts on.
 icon: E7B8
-studio: { minVersion: 0.6.0, hostApi: 1 }
+studio: { minVersion: 0.7.0, hostApi: 3 }
 source: { github: jeffpearson1/YardstickDevelopmentStudio, tagPrefix: plugin-oneoff-packager-v }
 requires:
   modules:
@@ -41,6 +41,7 @@ settings:
     help: The Windows Credential Manager entry Yardstick uses for Graph.
 page:
   type: workitems
+  hostActions: [new-work, import, refresh, work-folder, settings]
   noun: Ticket
   folder: "{date}-{ref}-{slug}"
   intake: [text, files]
@@ -50,17 +51,19 @@ page:
     - triage
     - runtime
     - inventory
-    - research
     - prepare-test
-    - repair
     - full-test-request
     - full-test
     - build
     - prepare-live
     - live-change
   panels:
-    - { type: table, title: Products, file: products.json, rows: /products, columns: [name, version, status, notes] }
-    - { type: markdown, title: Research and status, file: research-and-status.md }
+    - type: table
+      title: Products
+      file: products.json
+      rows: /products
+      columns: [name, version, status, notes]
+      recipeBuilder: { routedRows: /routedProducts, reviewBefore: runtime, authorBefore: prepare-test, recipeFolder: recipes, iconFolder: icons }
     - { type: markdown, title: Change set, file: intune-upload/live-change-summary.md }
     - type: files
       title: Evidence
@@ -95,18 +98,7 @@ agent:
       prompt: agent/tasks/triage.md
       after: [parse-ticket]
       outputs: [products.json]
-    - id: research
-      label: Research and draft recipes
-      description: Finds each installer, works out silent switches and detection, writes a Yardstick recipe and icon. Skips products already in Intune.
-      prompt: agent/tasks/research.md
-      after: [inventory]
-      outputs: [research-and-status.md]
-    - id: repair
-      label: Fix a recipe from test results
-      description: Reads the latest test evidence and corrects the recipe. Run the Prepare test again afterwards.
-      prompt: agent/tasks/repair.md
-      after: [prepare-test]
-      evidenceFrom: [prepare-test, full-test]
+      automatic: true
 steps:
   - id: import-servicenow
     label: Read a ServiceNow export
@@ -119,30 +111,35 @@ steps:
     description: Pulls links, Dropbox links and asset tags out of the request text into parsed-ticket.json.
     script: scripts/Step-ParseTicket.ps1
     risk: local-write
+    automatic: true
   - id: runtime
     label: Create the isolated runtime
     description: Copies YardstickDev into this ticket with a guard that blocks every Graph DELETE, then proves the guard works.
     script: scripts/Step-Runtime.ps1
     risk: local-write
+    automatic: true
   - id: inventory
     label: Check Intune for existing apps
     description: A read-only search of the tenant's Win32 apps and the target group. Run before anything is downloaded.
     script: scripts/Step-Inventory.ps1
     risk: tenant-read
     after: [runtime, triage]
+    automatic: true
   - id: prepare-test
     label: Prepare test (no install)
     description: Schema check, download, hash and signature, generated scripts and pre-detection. Installs nothing.
     script: scripts/Step-PackageTest.ps1
     params: { mode: Prepare, keepInstaller: true }
     risk: local-write
-    after: [research]
+    after: [inventory]
+    automatic: true
   - id: full-test-request
     label: Write the install-test request
     description: Records the exact recipes, their hashes, this PC and the YardstickDev commit that you are asked to approve for a real install.
     script: scripts/Step-FullTestRequest.ps1
     risk: local-write
     after: [prepare-test]
+    automatic: true
   - id: full-test
     label: Install, detect and uninstall on this PC
     description: The real lifecycle test. It installs the software here, checks detection, uninstalls it and looks for leftovers.
@@ -151,18 +148,21 @@ steps:
     risk: local-install
     gate: { kind: hash, file: artifacts/full-test-request.json, summary: artifacts/full-test-request.md }
     after: [full-test-request]
+    automatic: true
   - id: build
     label: Build the .intunewin packages
     description: Packages the exact installer that passed the install test.
     script: scripts/Step-Build.ps1
     risk: local-write
     after: [full-test, runtime]
+    automatic: true
   - id: prepare-live
     label: Prepare the Intune change
     description: Re-checks the tenant and target group, builds each app's settings and writes the change set for you to approve. Changes nothing in Intune.
     script: scripts/Step-PrepareLive.ps1
     risk: tenant-read
     after: [build, inventory]
+    automatic: true
   - id: live-change
     label: Upload and assign in Intune
     description: Creates each app, verifies it, then makes it Available to the approved group. Never deletes anything.
@@ -170,3 +170,4 @@ steps:
     risk: tenant-write
     gate: { kind: hash, file: intune-upload/live-change-set.json, summary: intune-upload/live-change-summary.md }
     after: [prepare-live]
+    automatic: true

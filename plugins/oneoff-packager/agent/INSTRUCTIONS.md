@@ -1,6 +1,6 @@
 # One-Off Packager: instructions for the agent
 
-You are helping an Intune packaging team turn one IT ticket into a researched, tested Win32 app package. The Studio runs every step that downloads and installs, builds packages, or talks to Intune, and it asks the user before anything that installs software or changes the tenant. **Your part is research and writing**: reading the ticket, finding authoritative installers, and writing the files the steps work from.
+You are helping an Intune packaging team separate one IT ticket into accurate software products. The Studio and Recipe Builder own research, recipe authoring, testing, packaging and tenant work. **Your part is triage**: read the ticket and write the product records that drive those host workflows.
 
 You work in one folder, the ticket's work item. Everything you may touch is inside it:
 
@@ -11,9 +11,8 @@ You work in one folder, the ticket's work item. Everything you may touch is insi
 | `intake/` | Files the user attached. |
 | `products.json` | Your triage: one entry per product (see below). |
 | `inventory/intune-inventory.json` | What a read-only search of Intune found, written by a Studio step. |
-| `recipes/<id>.yaml` | The Yardstick recipe you write for each product. |
-| `icons/<id>.png` | The app's icon. |
-| `research-and-status.md` | Your sources, decisions and the status of each product. |
+| `recipes/<id>.yaml` | Checked recipes synced back from Recipe Builder. Read only. |
+| `icons/<id>.png` | Icons synced back from Recipe Builder. Read only. |
 | `runtime/` | A private copy of YardstickDev: `Docs\WritingRecipes.md`, `Templates\`, `Recipes\` (existing recipes), `Tests\RecipeHarness\`. Read it; do not change it. |
 | `artifacts/`, `local-packages/`, `intune-upload/` | Evidence and packages the steps write. Read, never edit. |
 
@@ -27,7 +26,7 @@ Reference notes are in `.studio\agent\references\`. Read the one that matches yo
 - Never install or uninstall software and never run a downloaded installer. Inspect installers statically (hashes, signatures, MSI tables, archive listings).
 - Never put private links (Dropbox or SharePoint URLs with tokens), secrets, ticket numbers or requester names into recipe fields or any file meant for Intune. Remove query strings when you quote a link.
 - Do not edit YardstickDev or anything in `runtime/`. Recipes go in `recipes/`.
-- You cannot ask the user questions. Make the safest reasonable assumption, state it, and flag it in `research-and-status.md`.
+- You cannot ask the user questions. Record ambiguity in the product's `notes` and `ambiguities` fields instead of guessing.
 
 ## Tickets that come from SCCM
 
@@ -41,7 +40,7 @@ If `intake\sccm-export.json` exists, the ticket was started by the **SCCM App Mi
 
 ## What the Studio shows the user
 
-`products.json` fills the Products table, `research-and-status.md` the Research panel, and the files under `artifacts/` and `intune-upload/` the rest. Keep them accurate and readable; the user decides from them.
+`products.json` fills the Products table and determines which Recipe Builder and One-Off work follows. Keep it accurate and readable; the user decides from it.
 
 ## Status words
 
@@ -50,6 +49,8 @@ Use exactly these in `products.json` `status`:
 `needs-research` · `already-available` · `existing-not-equivalent` · `blocked-awaiting-installer` · `blocked-awaiting-targeting` · `locally-validated` · `published-unassigned` · `assigned` · `failed`
 
 You set the first five. The Studio's later steps and the user move a product on from there.
+
+Studio may move products the user sends to Recipe Builder from `products` into `routedProducts`. Preserve that array and never research, package or re-add those rows to `products`.
 
 ## When you cannot continue
 

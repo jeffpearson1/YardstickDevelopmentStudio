@@ -7,16 +7,17 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui::{self, RichText, Ui};
 use egui_commonmark::CommonMarkViewer;
 use serde_json::{Map, Value};
 use ystudio_core::plugin::{
-    self, ActionKind, Gate, Health, Installed, Lock, Origin, PageKind, PanelKind, Risk, Scope, Stage, StepDef, StepRequest, StepResult, StepState,
-    StudioContext, WorkItem,
+    self, ActionKind, AutomationNext, AutomationState, Gate, Health, HostAction, Installed, Lock, Origin, PageKind, PanelKind, RecipeWorkRecord, RecipeWorkState,
+    Risk, Scope, Stage, StepDef, StepRequest, StepResult, StepState, StudioContext, WorkItem,
 };
 use ystudio_core::agent::{self, Change, Evidence, PluginAgentContext, Snapshot};
+use ystudio_core::intake::{Batch, BatchItem, ItemStatus, PluginRecipeOrigin, RequestKind};
 use ystudio_core::workspace::WorkspaceKind;
 
 use crate::app::{JobKind, StudioApp, View};
@@ -37,13 +38,52 @@ pub enum Purpose {
     Row(String),
 }
 
+/// One work item in the cross-plugin activity center.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginActivityState {
+    Running,
+    Waiting,
+    Attention,
+    Ready,
+    Complete,
+}
+
+impl PluginActivityState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "Running",
+            Self::Waiting => "Waiting for you",
+            Self::Attention => "Needs attention",
+            Self::Ready => "Ready to continue",
+            Self::Complete => "Complete",
+        }
+    }
+
+    pub fn needs_attention(self) -> bool {
+        matches!(self, Self::Waiting | Self::Attention)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginActivity {
+    pub plugin_id: String,
+    pub plugin_name: String,
+    pub dir: PathBuf,
+    pub title: String,
+    pub reference: String,
+    pub created: String,
+    pub state: PluginActivityState,
+    pub note: String,
+    pub done: usize,
+    pub total: usize,
+}
+
 #[derive(Default)]
 pub struct PageState {
     /// Work items under the work root, newest first.
     pub items: Vec<WorkItem>,
     listed_root: Option<PathBuf>,
     pub selected: Option<PathBuf>,
-    pub show_settings: bool,
     new_item: Option<NewItem>,
     import: Option<Vec<(bool, Value)>>,
     prompt: Option<Prompt>,
@@ -79,6 +119,7 @@ struct PanelCache {
     built: Instant,
     request: Option<Arc<String>>,
     tables: HashMap<String, Result<Vec<Value>, String>>,
+    routed: HashMap<String, Result<Vec<Value>, String>>,
     markdown: HashMap<String, Option<Arc<String>>>,
     files: HashMap<String, Vec<String>>,
 }
@@ -111,6 +152,87 @@ fn context(app: &StudioApp, id: &str) -> Option<Ctx> {
     Some(Ctx { plugin, settings, root })
 }
 
+/// Refreshes the disk-backed cross-plugin activity cache. This also performs
+/// the same interrupted-run reconciliation as opening the plugin itself, so
+/// Home and History never leave an orphaned run looking live.
+pub fn refresh_activity(app: &mut StudioApp, force: bool) {
+    if !force
+        && app
+            .plugins
+            .activity_refreshed
+            .is_some_and(|refreshed| refreshed.elapsed() < Duration::from_secs(3))
+    {
+        return;
+    }
+    let installed = app.plugins.registry.plugins.clone();
+    let mut activity = Vec::new();
+    for plugin in installed {
+        let id = plugin.manifest.id.clone();
+        if plugin.manifest.page.kind != PageKind::Workitems
+            || !app.settings.plugins.get(&id).is_none_or(|preferences| preferences.enabled)
+        {
+            continue;
+        }
+        let values = app.settings.plugins.get(&id).map(|preferences| preferences.values.clone()).unwrap_or_default();
+        let Ok(settings) = plugin::resolve_settings(&plugin.manifest, &values, dev_workspace(app).as_deref()) else { continue };
+        let Some(root) = plugin::work_root(&settings) else { continue };
+        reconcile_work_items(app, &id, &root);
+        let stages = plugin.manifest.pipeline();
+        for item in WorkItem::list(&root) {
+            let total = stages.len();
+            let done = stages
+                .iter()
+                .filter(|stage| matches!(item.step(stage.id()).state, StepState::Ok | StepState::Warn))
+                .count();
+            let failed = stages.iter().find_map(|stage| {
+                let record = item.step(stage.id());
+                matches!(record.state, StepState::Interrupted | StepState::Fail | StepState::Blocked)
+                    .then_some((stage.label(), record.summary))
+            });
+            let recipe_failed = item.meta.recipe_work.values().find(|record| record.state == RecipeWorkState::Failed);
+            let (state, note) = if let Some((stage, summary)) = failed {
+                let detail = if summary.is_empty() { item.meta.automation.note.as_str() } else { summary.as_str() };
+                (PluginActivityState::Attention, format!("{stage}: {detail}"))
+            } else if let Some(record) = recipe_failed {
+                (PluginActivityState::Attention, record.note.clone())
+            } else {
+                let state = match item.meta.automation.state {
+                    AutomationState::Running => PluginActivityState::Running,
+                    AutomationState::AwaitingAction => PluginActivityState::Waiting,
+                    AutomationState::Paused => PluginActivityState::Attention,
+                    AutomationState::Idle => PluginActivityState::Ready,
+                    AutomationState::Complete => PluginActivityState::Complete,
+                };
+                (state, item.meta.automation.note.clone())
+            };
+            activity.push(PluginActivity {
+                plugin_id: id.clone(),
+                plugin_name: plugin.manifest.name.clone(),
+                dir: item.dir,
+                title: item.meta.title,
+                reference: item.meta.reference,
+                created: item.meta.created,
+                state,
+                note,
+                done,
+                total,
+            });
+        }
+    }
+    activity.sort_by(|left, right| right.created.cmp(&left.created).then_with(|| left.title.cmp(&right.title)));
+    app.plugins.activity = activity;
+    app.plugins.activity_refreshed = Some(Instant::now());
+}
+
+pub fn open_activity(app: &mut StudioApp, activity: &PluginActivity) {
+    let Some(view) = app.plugins.view_of(&activity.plugin_id) else {
+        app.error(format!("{} is no longer available.", activity.plugin_name));
+        return;
+    };
+    app.plugins.page(&activity.plugin_id).selected = Some(activity.dir.clone());
+    app.view = view;
+}
+
 fn studio_context(app: &StudioApp) -> StudioContext {
     StudioContext {
         version: super::update::CURRENT_VERSION.to_string(),
@@ -132,6 +254,38 @@ fn job_in(app: &StudioApp, dir: &Path) -> Option<(u64, String)> {
         JobKind::PluginStep { dir: d, step: id, .. } | JobKind::PluginAgent { dir: d, task: id, .. } if j.proc.is_running() && d == dir => Some((j.id, id.clone())),
         _ => None,
     })
+}
+
+/// Reconciles work-item state after a Studio/process interruption. This runs
+/// when a plugin work root is first opened in a session, before the list is
+/// shown, so a persisted `Running` record can never strand its retry action.
+fn reconcile_work_items(app: &mut StudioApp, id: &str, root: &Path) {
+    let active: HashMap<PathBuf, String> = app
+        .jobs
+        .iter()
+        .filter_map(|job| match &job.kind {
+            JobKind::PluginStep { plugin, dir, step, .. } if plugin == id && job.proc.is_running() => Some((dir.clone(), step.clone())),
+            JobKind::PluginAgent { plugin, dir, task, .. } if plugin == id && job.proc.is_running() => Some((dir.clone(), task.clone())),
+            _ => None,
+        })
+        .collect();
+    let mut failures = Vec::new();
+    let mut changed_items = Vec::new();
+    for mut item in WorkItem::list(root) {
+        let current = active.get(&item.dir).map(String::as_str);
+        if item.reconcile_running(current, SystemTime::now()) {
+            match item.save() {
+                Ok(()) => changed_items.push(item.dir.clone()),
+                Err(e) => failures.push(format!("{}: {e:#}", item.name())),
+            }
+        }
+    }
+    for dir in changed_items {
+        sync_recipe_builder_origin(app, id, &dir);
+    }
+    if !failures.is_empty() {
+        app.error(format!("Could not recover interrupted {} work: {}", id, failures.join("; ")));
+    }
 }
 
 pub fn plugin_busy(app: &StudioApp, id: &str) -> bool {
@@ -202,23 +356,290 @@ pub fn run_step(app: &mut StudioApp, id: &str, dir: &Path, step_id: &str, params
             return false;
         }
     };
-    let kind = JobKind::PluginStep { plugin: id.to_string(), dir: dir.to_path_buf(), step: step.id.clone(), result: prepared.result.clone(), risk: step.risk, purpose: purpose.clone() };
-    let Some(job) = app.start_job(prepared.spec, kind) else { return false };
-    if let Some(lock) = lock {
-        app.plugins.locks.insert(job, lock);
-    }
-    if purpose == Purpose::Item
-        && let Ok(mut item) = WorkItem::open(dir)
-    {
+    if purpose == Purpose::Item {
+        let mut item = match WorkItem::open(dir) {
+            Ok(item) => item,
+            Err(e) => {
+                app.error(format!("Could not record {} before it starts: {e:#}", step.label()));
+                return false;
+            }
+        };
         let rec = item.meta.steps.entry(step.id.clone()).or_default();
         rec.state = StepState::Running;
         rec.started = ystudio_core::intake::timestamp();
         rec.finished.clear();
-        rec.approval = prepared.approval;
-        let _ = item.save();
+        rec.summary.clear();
+        rec.result = None;
+        rec.approval = prepared.approval.clone();
+        if step.automatic && matches!(item.meta.automation.state, AutomationState::AwaitingAction | AutomationState::Paused) {
+            item.meta.automation.state = AutomationState::Running;
+            item.meta.automation.updated = ystudio_core::intake::timestamp();
+            item.meta.automation.note = format!("Running {}.", step.label());
+        }
+        if let Err(e) = item.save() {
+            app.error(format!("Could not record {} before it starts: {e:#}. Nothing was run.", step.label()));
+            return false;
+        }
+    }
+    let kind = JobKind::PluginStep { plugin: id.to_string(), dir: dir.to_path_buf(), step: step.id.clone(), result: prepared.result.clone(), risk: step.risk, purpose: purpose.clone() };
+    let Some(job) = app.start_job(prepared.spec, kind) else {
+        if purpose == Purpose::Item {
+            mark_interrupted(app, id, dir, &step.id, "The process could not be started. Review the error, then retry this stage.");
+        }
+        return false;
+    };
+    if let Some(lock) = lock {
+        app.plugins.locks.insert(job, lock);
+    }
+    if purpose == Purpose::Item {
         app.plugins.page(id).refresh_items(&root);
     }
     true
+}
+
+fn mark_interrupted(app: &mut StudioApp, id: &str, dir: &Path, stage: &str, summary: &str) {
+    match WorkItem::open(dir) {
+        Ok(mut item) => {
+            let rec = item.meta.steps.entry(stage.to_string()).or_default();
+            rec.state = StepState::Interrupted;
+            rec.finished = ystudio_core::intake::timestamp();
+            rec.summary = summary.to_string();
+            if let Err(e) = item.save() {
+                app.error(format!("Could not save the interrupted state for {stage}: {e:#}"));
+            }
+        }
+        Err(e) => app.error(format!("Could not open the interrupted work item for {stage}: {e:#}")),
+    }
+    if let Some(c) = context(app, id)
+        && let Some(root) = c.root
+    {
+        app.plugins.page(id).refresh_items(&root);
+    }
+}
+
+fn set_automation(app: &mut StudioApp, id: &str, dir: &Path, state: AutomationState, note: impl Into<String>, new_run: bool) -> bool {
+    let mut item = match WorkItem::open(dir) {
+        Ok(item) => item,
+        Err(e) => {
+            app.error(format!("Could not update the automatic pipeline: {e:#}"));
+            return false;
+        }
+    };
+    let now = ystudio_core::intake::timestamp();
+    if new_run {
+        item.meta.automation.started = now.clone();
+    }
+    item.meta.automation.state = state;
+    item.meta.automation.updated = now;
+    item.meta.automation.note = note.into();
+    if let Err(e) = item.save() {
+        app.error(format!("Could not save the automatic pipeline: {e:#}"));
+        return false;
+    }
+    if let Some(c) = context(app, id)
+        && let Some(root) = c.root
+    {
+        app.plugins.page(id).refresh_items(&root);
+    }
+    sync_recipe_builder_origin(app, id, dir);
+    true
+}
+
+fn plugin_origin_rollup(name: &str, manifest: &plugin::Manifest, item: &WorkItem) -> (ItemStatus, String) {
+    let stages = manifest.pipeline();
+    let total = stages.len();
+    let done = stages
+        .iter()
+        .filter(|stage| matches!(item.step(stage.id()).state, StepState::Ok | StepState::Warn))
+        .count();
+    let progress = format!("{done}/{total} stages complete");
+    let failed = stages.iter().find_map(|stage| {
+        let record = item.step(stage.id());
+        matches!(record.state, StepState::Interrupted | StepState::Fail | StepState::Blocked)
+            .then_some((stage.label().to_string(), record.summary))
+    });
+    if item.meta.automation.state == AutomationState::Complete {
+        return (ItemStatus::Done, format!("Complete in {name} · {progress}. {}", item.meta.automation.note));
+    }
+    if let Some((stage, summary)) = failed {
+        let detail = if summary.is_empty() { item.meta.automation.note.as_str() } else { summary.as_str() };
+        return (ItemStatus::Delegated, format!("Needs attention in {name} · {progress}. {stage}: {detail}"));
+    }
+    match item.meta.automation.state {
+        AutomationState::Running => (ItemStatus::Delegated, format!("Running in {name} · {progress}. {}", item.meta.automation.note)),
+        AutomationState::AwaitingAction => (ItemStatus::Delegated, format!("Waiting for you in {name} · {progress}. {}", item.meta.automation.note)),
+        AutomationState::Paused => (ItemStatus::Delegated, format!("Needs attention in {name} · {progress}. {}", item.meta.automation.note)),
+        AutomationState::Idle => (ItemStatus::Delegated, format!("In {name} · {progress}. Open the linked work item to continue.")),
+        AutomationState::Complete => unreachable!(),
+    }
+}
+
+/// Rolls a plugin work item's lifecycle back into the Recipe Builder request
+/// that created it. Missing or deleted source lists are intentionally quiet.
+fn sync_recipe_builder_origin(app: &mut StudioApp, id: &str, dir: &Path) {
+    let Some(installed) = app.plugins.get(id).cloned() else { return };
+    let Ok(item) = WorkItem::open(dir) else { return };
+    if item.meta.origin.kind != "recipe-builder" || item.meta.origin.from_plugin != "recipe-builder" {
+        return;
+    }
+    let Some((batch_id, raw_index)) = item.meta.origin.key.rsplit_once(':') else { return };
+    let hinted = raw_index.parse::<usize>().ok();
+    let (status, note) = plugin_origin_rollup(&installed.manifest.name, &installed.manifest, &item);
+    let update = |batch: &mut Batch| {
+        let index = hinted
+            .filter(|index| batch.items.get(*index).is_some_and(|source| source.handler_item.as_deref() == Some(dir)))
+            .or_else(|| batch.items.iter().position(|source| source.handler_item.as_deref() == Some(dir)));
+        let Some(index) = index else { return false };
+        let source = &mut batch.items[index];
+        let changed = source.status != status || source.status_note != note;
+        source.status = status;
+        source.status_note.clone_from(&note);
+        changed
+    };
+    if app.batch.batch.as_ref().is_some_and(|batch| batch.id == batch_id) {
+        if let Some(batch) = app.batch.batch.as_mut()
+            && update(batch)
+        {
+            let _ = batch.save();
+        }
+    } else if let Ok(mut batch) = Batch::load(&Batch::root().join(batch_id))
+        && update(&mut batch)
+    {
+        let _ = batch.save();
+    }
+}
+
+/// Starts the next explicitly automatic stage, or records the boundary that
+/// needs the user's attention. One call starts at most one external process;
+/// successful completion calls this again.
+fn advance_automation(app: &mut StudioApp, id: &str, dir: &Path) {
+    let Some(c) = context(app, id) else { return };
+    let item = match WorkItem::open(dir) {
+        Ok(item) => item,
+        Err(e) => {
+            app.error(format!("Could not continue the automatic pipeline: {e:#}"));
+            return;
+        }
+    };
+    match c.plugin.manifest.next_automatic(&item) {
+        AutomationNext::Run(Stage::Task(task)) => {
+            let (task_id, label) = (task.id.clone(), task.label.clone());
+            if set_automation(app, id, dir, AutomationState::Running, format!("Running {label}."), false)
+                && !run_agent(app, id, dir, &task_id)
+            {
+                set_automation(app, id, dir, AutomationState::Paused, format!("{label} could not start. Resolve the error, then continue safe stages."), false);
+            }
+        }
+        AutomationNext::Run(Stage::Step(step)) => {
+            let (step_id, label) = (step.id.clone(), step.label().to_string());
+            if set_automation(app, id, dir, AutomationState::Running, format!("Running {label}."), false)
+                && !run_step(app, id, dir, &step_id, Map::new(), false, Purpose::Item)
+            {
+                set_automation(app, id, dir, AutomationState::Paused, format!("{label} could not start. Resolve the error, then continue safe stages."), false);
+            }
+        }
+        AutomationNext::UserAction(stage) => {
+            set_automation(
+                app,
+                id,
+                dir,
+                AutomationState::AwaitingAction,
+                format!("Next: {} needs your review or approval. Run it below, then continue safe stages.", stage.label()),
+                false,
+            );
+        }
+        AutomationNext::RoutingReview(panel, count) => {
+            set_automation(
+                app,
+                id,
+                dir,
+                AutomationState::AwaitingAction,
+                format!("Review {count} products in {} and choose which belong in Recipe Builder.", panel.title),
+                false,
+            );
+        }
+        AutomationNext::RoutedComplete(panel) => {
+            set_automation(
+                app,
+                id,
+                dir,
+                AutomationState::Complete,
+                format!("All products in {} were routed to Recipe Builder. No One-Off stages remain.", panel.title),
+                false,
+            );
+        }
+        AutomationNext::RecipeWorkNeeded(panel, products) => {
+            if !ensure_recipe_work(app, id, dir, panel, &products) {
+                set_automation(
+                    app,
+                    id,
+                    dir,
+                    AutomationState::Paused,
+                    "Recipe Builder work could not be created. Resolve the error, then continue safe stages.",
+                    false,
+                );
+            }
+        }
+        AutomationNext::RecipeWorkWaiting(panel, products) => {
+            set_automation(
+                app,
+                id,
+                dir,
+                AutomationState::AwaitingAction,
+                format!("{} product(s) in {} are waiting for Recipe Builder's safe checks.", products.len(), panel.title),
+                false,
+            );
+        }
+        AutomationNext::RecipeWorkStopped(panel, products) => {
+            set_automation(
+                app,
+                id,
+                dir,
+                AutomationState::AwaitingAction,
+                format!("Recipe Builder needs attention for {} in {}. Open the linked work below, then retry it.", products.join(", "), panel.title),
+                false,
+            );
+        }
+        AutomationNext::Waiting(stage, unmet) => {
+            let labels = unmet.iter().map(|dependency| stage_label(&c, dependency)).collect::<Vec<_>>().join(" and ");
+            set_automation(
+                app,
+                id,
+                dir,
+                AutomationState::AwaitingAction,
+                format!("{} is waiting for {labels}. Complete that manual stage, then continue safe stages.", stage.label()),
+                false,
+            );
+        }
+        AutomationNext::Stopped(stage, state) => {
+            let reason = match state {
+                StepState::Interrupted => "was interrupted",
+                StepState::Blocked => "is blocked",
+                _ => "failed",
+            };
+            set_automation(
+                app,
+                id,
+                dir,
+                AutomationState::Paused,
+                format!("{} {reason}. Review or retry it below, then continue safe stages.", stage.label()),
+                false,
+            );
+        }
+        AutomationNext::Running(stage) => {
+            set_automation(app, id, dir, AutomationState::Running, format!("Running {}.", stage.label()), false);
+        }
+        AutomationNext::Complete => {
+            set_automation(
+                app,
+                id,
+                dir,
+                AutomationState::Complete,
+                "All currently available safe stages are complete. After any manual or approved stage, continue to check for more safe work.",
+                false,
+            );
+        }
+    }
 }
 
 /// Records a finished step: in its work item, or in the catalog page.
@@ -229,38 +650,46 @@ pub fn step_finished(app: &mut StudioApp, job: u64, id: &str, dir: &Path, step_i
     let state = r.status.state();
     let Some(c) = context(app, id) else { return };
     let label = c.plugin.manifest.step(step_id).map(|s| s.label().to_string()).unwrap_or_else(|| step_id.to_string());
-    let page = app.plugins.page(id);
     match &purpose {
         Purpose::Item => {
-            if let Ok(mut item) = WorkItem::open(dir) {
-                let rec = item.meta.steps.entry(step_id.to_string()).or_default();
-                rec.state = state;
-                rec.finished = ystudio_core::intake::timestamp();
-                rec.summary = r.summary.clone();
-                rec.result = Some(result.to_path_buf());
-                let _ = item.save();
+            let mut item = match WorkItem::open(dir) {
+                Ok(item) => item,
+                Err(e) => {
+                    app.error(format!("{label} finished, but its work item could not be opened: {e:#}"));
+                    return;
+                }
+            };
+            let rec = item.meta.steps.entry(step_id.to_string()).or_default();
+            rec.state = state;
+            rec.finished = ystudio_core::intake::timestamp();
+            rec.summary = r.summary.clone();
+            rec.result = Some(result.to_path_buf());
+            if let Err(e) = item.save() {
+                app.error(format!("{label} finished, but its result could not be saved: {e:#}"));
+                return;
             }
             if let Some(root) = &c.root {
-                page.refresh_items(root);
+                app.plugins.page(id).refresh_items(root);
             }
         }
-        Purpose::Probe => page.probe = Some(r.clone()),
+        Purpose::Probe => app.plugins.page(id).probe = Some(r.clone()),
         Purpose::Query => {
+            let page = app.plugins.page(id);
             page.rows = r.rows.clone();
             page.selected_row = None;
         }
         Purpose::Import => {
             if !r.rows.is_empty() {
-                page.import = Some(r.rows.iter().map(|v| (true, v.clone())).collect());
+                app.plugins.page(id).import = Some(r.rows.iter().map(|v| (true, v.clone())).collect());
             }
         }
         Purpose::Row(key) => {
             if let (Some(folder), Some(root)) = (r.outputs.get("folder"), &c.root)
                 && plugin::safe_relative(folder)
             {
-                page.row_folders.insert(key.clone(), root.join(folder));
+                app.plugins.page(id).row_folders.insert(key.clone(), root.join(folder));
             }
-            page.panels = None;
+            app.plugins.page(id).panels = None;
         }
     }
     let summary = if r.summary.is_empty() { String::new() } else { format!(": {}", r.summary) };
@@ -268,6 +697,26 @@ pub fn step_finished(app: &mut StudioApp, job: u64, id: &str, dir: &Path, step_i
     match state {
         StepState::Ok | StepState::Warn => app.notify(msg),
         _ => app.error(msg),
+    }
+    if purpose == Purpose::Item
+        && let Ok(item) = WorkItem::open(dir)
+        && item.meta.automation.state == AutomationState::Running
+    {
+        if matches!(state, StepState::Ok | StepState::Warn) {
+            advance_automation(app, id, dir);
+        } else {
+            set_automation(
+                app,
+                id,
+                dir,
+                AutomationState::Paused,
+                format!("{label} did not finish successfully. Review or retry it, then continue safe stages."),
+                false,
+            );
+        }
+    }
+    if purpose == Purpose::Item {
+        sync_recipe_builder_origin(app, id, dir);
     }
 }
 
@@ -285,15 +734,18 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui, tab: u16) {
         return;
     };
     let m = &c.plugin.manifest;
+    let host_actions = m.page.effective_host_actions();
     ui.horizontal(|ui| {
         theme::page_title(ui, &m.name);
         ui.label(RichText::new(format!("{} · {}", m.version, m.publisher)).weak());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let page = app.plugins.page(&id);
-            if ui.selectable_label(page.show_settings, "\u{E713}  Settings").clicked() {
-                page.show_settings = !page.show_settings;
+            if host_actions.contains(&HostAction::Settings)
+                && ui.button("\u{E713}  Plugin settings").on_hover_text("Open this plugin in Yardstick Development Studio Settings").clicked()
+            {
+                open_plugin_settings(app, &id);
             }
-            if let Some(root) = &c.root
+            if host_actions.contains(&HostAction::WorkFolder)
+                && let Some(root) = &c.root
                 && ui.button("\u{E838}  Work folder").clicked()
             {
                 let _ = std::fs::create_dir_all(root);
@@ -313,28 +765,39 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui, tab: u16) {
     };
     if let Some(h) = health {
         theme::banner(ui, theme::red(), |ui| {
-            ui.label(h);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(h);
+                if ui.button("Manage plugin").clicked() {
+                    open_plugin_settings(app, &id);
+                }
+            });
         });
         ui.add_space(6.0);
     }
     let missing = app.plugins.registry.missing_requirements(&c.plugin);
     if !missing.is_empty() {
         theme::banner(ui, theme::amber(), |ui| {
-            ui.label(format!("This plugin {}. Some actions are unavailable.", missing.join(", ")));
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("This plugin {}. Some actions are unavailable.", missing.join(", ")));
+                if ui.button("Manage plugins").clicked() {
+                    open_plugin_settings(app, &id);
+                }
+            });
         });
         ui.add_space(6.0);
     }
-    if app.plugins.page(&id).show_settings || c.settings.is_err() {
-        theme::card(ui, |ui| {
-            theme::section_heading(ui, "Settings");
-            super::plugins::settings_form(app, ui, &id);
+    if let Err(problems) = &c.settings {
+        theme::banner(ui, theme::amber(), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("Finish setting up this plugin: {}", problems.join(" ")));
+                if theme::primary(ui, true, "Open plugin settings").clicked() {
+                    open_plugin_settings(app, &id);
+                }
+            });
         });
-        ui.add_space(theme::CARD_GAP);
-    }
-    let Some(root) = c.root.clone() else { return };
-    if c.settings.is_err() {
         return;
     }
+    let Some(root) = c.root.clone() else { return };
     if !root.is_dir() {
         theme::banner(ui, theme::amber(), |ui| {
             ui.horizontal(|ui| {
@@ -355,10 +818,16 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui, tab: u16) {
     }
 }
 
+fn open_plugin_settings(app: &mut StudioApp, id: &str) {
+    app.plugins_ui.open_settings = Some(id.to_string());
+    app.view = View::Settings;
+}
+
 fn state_badge(ui: &mut Ui, state: StepState) -> egui::Response {
     let (text, color) = match state {
         StepState::NotRun => ("Not run", theme::grey()),
         StepState::Running => ("Running", theme::blue()),
+        StepState::Interrupted => ("Interrupted", theme::amber()),
         StepState::Ok => ("Done", theme::green()),
         StepState::Warn => ("Done · warnings", theme::amber()),
         StepState::Fail => ("Failed", theme::red()),
@@ -378,21 +847,28 @@ pub fn risk_color(risk: Risk) -> egui::Color32 {
 fn workitems(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, root: &Path) {
     let id = c.plugin.manifest.id.clone();
     let m = &c.plugin.manifest;
-    let page = app.plugins.page(&id);
-    if page.listed_root.as_deref() != Some(root) {
-        page.refresh_items(root);
+    let host_actions = m.page.effective_host_actions();
+    if app.plugins.page(&id).listed_root.as_deref() != Some(root) {
+        reconcile_work_items(app, &id, root);
+        app.plugins.page(&id).refresh_items(root);
     }
     let mut import = false;
     egui::Panel::left(("plugin-items", &id)).resizable(true).default_size(300.0).frame(theme::pane_frame()).show(ui, |ui| {
         let page = app.plugins.page(&id);
         ui.horizontal(|ui| {
-            if theme::primary(ui, true, format!("\u{E710}  New {}", m.page.noun.to_lowercase())).clicked() {
+            if host_actions.contains(&HostAction::NewWork)
+                && theme::primary(ui, true, format!("\u{E710}  New {}", m.page.noun.to_lowercase())).clicked()
+            {
                 page.new_item = Some(NewItem::default());
             }
-            if m.page.importer.is_some() && ui.button("\u{E8B5}  Import…").on_hover_text("Read a list into new work items").clicked() {
+            if host_actions.contains(&HostAction::Import)
+                && ui.button("\u{E8B5}  Import…").on_hover_text("Read a list into new work items").clicked()
+            {
                 import = true;
             }
-            if ui.button("\u{E72C}").on_hover_text("Refresh").clicked() {
+            if host_actions.contains(&HostAction::Refresh)
+                && ui.button("\u{E72C}").on_hover_text("Refresh").clicked()
+            {
                 page.refresh_items(root);
             }
         });
@@ -415,6 +891,8 @@ fn workitems(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, root: &Path) {
                     let states: Vec<StepState> = item.meta.steps.values().map(|s| s.state).collect();
                     if states.contains(&StepState::Running) {
                         theme::badge(ui, "Running", theme::blue());
+                    } else if states.contains(&StepState::Interrupted) {
+                        theme::badge(ui, "Interrupted", theme::amber());
                     } else if states.contains(&StepState::Fail) {
                         theme::badge(ui, "Failed", theme::red());
                     } else if states.contains(&StepState::Blocked) {
@@ -455,26 +933,47 @@ fn workitems(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, root: &Path) {
 fn item_detail(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem) {
     let id = c.plugin.manifest.id.clone();
     let m = &c.plugin.manifest;
+    let from_recipe_builder = item.meta.origin.kind == "recipe-builder" && item.meta.origin.from_plugin == "recipe-builder";
+    let source_plugin = (!from_recipe_builder && !item.meta.origin.from_plugin.is_empty())
+        .then(|| {
+            let source_id = item.meta.origin.from_plugin.clone();
+            let name = app
+                .plugins
+                .get(&source_id)
+                .map(|plugin| plugin.manifest.name.clone())
+                .unwrap_or_else(|| source_id.clone());
+            (source_id.clone(), name, app.plugins.view_of(&source_id))
+        });
+    let mut back_to_source = false;
     ui.horizontal(|ui| {
         ui.label(RichText::new(&item.meta.title).heading());
         if ui.small_button("\u{E838}  Open folder").clicked() {
             super::open_in_explorer(&item.dir);
         }
-        if ui
-            .small_button("\u{E70F}  Continue in Recipe Builder")
-            .on_hover_text("Use this request to create a reusable Yardstick recipe instead; the plugin work item is kept.")
-            .clicked()
+        if from_recipe_builder
+            && ui
+                .small_button("\u{E72B}  Back to Recipe Builder")
+                .on_hover_text("Return to the exact request that created this plugin work item.")
+                .clicked()
         {
-            let request = ystudio_core::read_text(&item.dir.join("ticket.md")).unwrap_or_default();
-            let notes = format!(
-                "Continued from {} work item '{}'.\n\n{}",
-                c.plugin.manifest.name,
-                item.name(),
-                request
-            );
-            crate::views::batch::add_plugin_work_item(app, &item.meta.title, &item.meta.reference, &notes);
+            back_to_source = true;
+        } else if let Some((_, name, Some(_))) = &source_plugin
+            && ui
+                .small_button(format!("\u{E72B}  Back to {name}"))
+                .on_hover_text("Return to the workflow that created this work item.")
+                .clicked()
+        {
+            back_to_source = true;
         }
     });
+    if back_to_source {
+        if from_recipe_builder {
+            crate::views::batch::open_plugin_handoff_source(app, &item.meta.origin.key, &item.dir);
+        } else if let Some((source_id, _, Some(view))) = source_plugin {
+            app.view = view;
+            app.notify(format!("Returned to {}.", app.plugins.get(&source_id).map(|plugin| plugin.manifest.name.as_str()).unwrap_or(&source_id)));
+        }
+    }
     let mut facts = vec![item.name()];
     if !item.meta.reference.is_empty() {
         facts.push(item.meta.reference.clone());
@@ -491,8 +990,31 @@ fn item_detail(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem) {
         theme::banner(ui, theme::amber(), |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("In use: {} by {} on {} since {} UTC.", holder.purpose, holder.user, holder.host, holder.since));
-                if ui.button("Clear").on_hover_text("Only if nothing is still running there, e.g. after a crash").clicked() {
-                    let _ = Lock::force_release(&item.dir);
+                if ui.button("Recover").on_hover_text("Clear the stale lock and make any orphaned running stage retryable").clicked() {
+                    match Lock::force_release(&item.dir) {
+                        Ok(()) => {
+                            match WorkItem::open(&item.dir) {
+                                Ok(mut recovered) => {
+                                    let changed = recovered.reconcile_running(None, SystemTime::now());
+                                    if changed
+                                        && let Err(e) = recovered.save()
+                                    {
+                                        app.error(format!("The lock was cleared, but interrupted state could not be saved: {e:#}"));
+                                    } else {
+                                        if changed {
+                                            sync_recipe_builder_origin(app, &id, &item.dir);
+                                        }
+                                        if let Some(root) = &c.root {
+                                            app.plugins.page(&id).refresh_items(root);
+                                        }
+                                        app.notify("Cleared the stale lock. Review any outputs, then retry the interrupted stage.");
+                                    }
+                                }
+                                Err(e) => app.error(format!("The lock was cleared, but the work item could not be opened: {e:#}")),
+                            }
+                        }
+                        Err(e) => app.error(format!("Could not clear the stale lock: {e:#}")),
+                    }
                 }
             });
         });
@@ -504,6 +1026,14 @@ fn item_detail(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem) {
             ui.label(text.as_str());
         });
     }
+    if item.meta.steps.values().any(|record| record.state == StepState::Interrupted) {
+        theme::banner(ui, theme::amber(), |ui| {
+            ui.label("This work was interrupted. Review any outputs from the interrupted stage, then retry it; completed stages remain valid.");
+        });
+        ui.add_space(8.0);
+    }
+    routing_panels(app, ui, c, item, running.is_some());
+    recipe_work_panels(app, ui, c, item);
     theme::section_heading(ui, "Pipeline");
     if m.agent.as_ref().is_some_and(|a| !a.tasks.is_empty()) {
         egui::CollapsingHeader::new("Agent options").id_salt(("plugin-agent-options", &id)).default_open(false).show(ui, |ui| {
@@ -515,6 +1045,10 @@ fn item_detail(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem) {
         });
     }
     let busy_elsewhere = if has_private_workspace(app, &id) { isolated_agent_conflict(app, &id) } else { crate::workflow::busy(app) };
+    if m.has_automatic_stages() {
+        automation_controls(app, ui, c, item, running.is_some(), busy_elsewhere);
+        ui.add_space(8.0);
+    }
     for stage in m.pipeline() {
         let rec = item.step(stage.id());
         let state = if running.as_ref().is_some_and(|(_, s)| s == stage.id()) { StepState::Running } else { rec.state };
@@ -535,7 +1069,7 @@ fn item_detail(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem) {
             if !rec.summary.is_empty() {
                 let color = match rec.state {
                     StepState::Fail => theme::red(),
-                    StepState::Warn | StepState::Blocked => theme::amber(),
+                    StepState::Warn | StepState::Blocked | StepState::Interrupted => theme::amber(),
                     _ => ui.visuals().text_color(),
                 };
                 ui.label(RichText::new(&rec.summary).color(color));
@@ -590,6 +1124,454 @@ fn item_detail(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem) {
     panels(app, ui, &id, c, &item.dir);
 }
 
+#[derive(Debug, Clone)]
+enum RoutingAction {
+    Route(usize),
+    Return(usize),
+    Confirm,
+    OpenRouted(String, String),
+}
+
+fn row_field(row: &Value, names: &[&str]) -> String {
+    names.iter().find_map(|name| row.get(*name).map(cell)).unwrap_or_default()
+}
+
+fn row_list(row: &Value, names: &[&str]) -> Vec<String> {
+    names
+        .iter()
+        .find_map(|name| row.get(*name))
+        .map(|value| match value {
+            Value::Array(values) => values.iter().map(cell).filter(|value| !value.is_empty()).collect(),
+            value => {
+                let value = cell(value);
+                if value.is_empty() { Vec::new() } else { vec![value] }
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn routed_product_id(row: &Value) -> String {
+    plugin::panel_recipe_id(row)
+}
+
+fn product_batch_item(c: &Ctx, item: &WorkItem, row: &Value) -> BatchItem {
+    let name = Some(row_field(row, &["name", "title", "app"])).filter(|value| !value.is_empty()).unwrap_or_else(|| "Untitled product".into());
+    let suggested_id = routed_product_id(row);
+    let reference = if item.meta.reference.is_empty() { item.name() } else { item.meta.reference.clone() };
+    let request = ystudio_core::read_text(&item.dir.join("ticket.md")).unwrap_or_default();
+    let details = serde_json::to_string_pretty(row).unwrap_or_else(|_| row.to_string());
+    let notes = format!(
+        "Routed from {} work item '{}'.\n\nProduct selected from the ticket:\n```json\n{}\n```\n\nOriginal request:\n{}",
+        c.plugin.manifest.name,
+        item.name(),
+        details,
+        request.trim()
+    );
+    BatchItem {
+        source: format!("{reference} · {name}"),
+        app: name,
+        publisher: row_field(row, &["publisher", "manufacturer"]),
+        version: row_field(row, &["version"]),
+        urls: row_list(row, &["links", "urls"]),
+        suggested_id,
+        notes,
+        request: RequestKind::New,
+        include: true,
+        confidence: 1.0,
+        handler_item: Some(item.dir.clone()),
+        ..Default::default()
+    }
+}
+
+fn ensure_recipe_work(app: &mut StudioApp, id: &str, dir: &Path, panel: &plugin::PanelDef, products: &[String]) -> bool {
+    let Some(c) = context(app, id) else { return false };
+    let Some(routing) = panel.recipe_builder.as_ref() else { return false };
+    let rows = match plugin::active_panel_rows(dir, panel) {
+        Ok(rows) => rows,
+        Err(e) => {
+            app.error(format!("Could not read products for Recipe Builder: {e:#}"));
+            return false;
+        }
+    };
+    let item = match WorkItem::open(dir) {
+        Ok(item) => item,
+        Err(e) => {
+            app.error(format!("Could not open the plugin work item: {e:#}"));
+            return false;
+        }
+    };
+    let mut requests = Vec::new();
+    for row in rows.iter().filter(|row| products.iter().any(|id| id == &routed_product_id(row))) {
+        let product_id = routed_product_id(row);
+        let mut request = product_batch_item(&c, &item, row);
+        request.handler_item = None;
+        request.notes = request.notes.replacen("Routed from", "Linked from", 1);
+        request.plugin_origins = vec![PluginRecipeOrigin {
+            plugin: id.to_string(),
+            work_item: dir.to_path_buf(),
+            product_id,
+            recipe_folder: routing.recipe_folder.clone(),
+            icon_folder: routing.icon_folder.clone(),
+        }];
+        requests.push(request);
+    }
+    if requests.is_empty() {
+        app.error("No matching plugin products were available for Recipe Builder.");
+        return false;
+    }
+    let batch_id = crate::views::batch::add_plugin_recipe_work(app, requests);
+    if batch_id.is_empty() {
+        app.error("Recipe Builder could not create a persistent working list.");
+        return false;
+    }
+    let mut item = match WorkItem::open(dir) {
+        Ok(item) => item,
+        Err(e) => {
+            app.error(format!("Could not record the Recipe Builder links: {e:#}"));
+            return false;
+        }
+    };
+    for product_id in products {
+        item.meta.recipe_work.entry(product_id.clone()).or_insert_with(|| RecipeWorkRecord {
+            state: RecipeWorkState::Pending,
+            batch_id: batch_id.clone(),
+            recipe_id: String::new(),
+            note: "Ready to complete in Recipe Builder.".into(),
+            updated: ystudio_core::intake::timestamp(),
+        });
+    }
+    if let Err(e) = item.save() {
+        app.error(format!("Could not save the Recipe Builder links: {e:#}"));
+        return false;
+    }
+    set_automation(
+        app,
+        id,
+        dir,
+        AutomationState::AwaitingAction,
+        format!("Complete {} linked recipe(s) in Recipe Builder. One-Off resumes after their safe checks pass.", products.len()),
+        false,
+    )
+}
+
+pub fn recipe_work_changed(app: &mut StudioApp, id: &str, dir: &Path) {
+    if let Some(c) = context(app, id)
+        && let Some(root) = c.root
+    {
+        app.plugins.page(id).refresh_items(&root);
+    }
+    if WorkItem::open(dir).is_ok_and(|item| item.meta.automation.state == AutomationState::AwaitingAction) {
+        advance_automation(app, id, dir);
+    }
+}
+
+fn set_routing_review(app: &mut StudioApp, id: &str, dir: &Path, panel: &str, reviewed: bool) -> bool {
+    let mut item = match WorkItem::open(dir) {
+        Ok(item) => item,
+        Err(e) => {
+            app.error(format!("Could not update the routing decision: {e:#}"));
+            return false;
+        }
+    };
+    if reviewed {
+        item.meta.routing_reviews.insert(panel.to_string());
+    } else {
+        item.meta.routing_reviews.remove(panel);
+    }
+    if let Err(e) = item.save() {
+        app.error(format!("Could not save the routing decision: {e:#}"));
+        return false;
+    }
+    if let Some(c) = context(app, id)
+        && let Some(root) = c.root
+    {
+        app.plugins.page(id).refresh_items(&root);
+    }
+    true
+}
+
+fn continue_after_routing(app: &mut StudioApp, id: &str, dir: &Path) {
+    if WorkItem::open(dir).is_ok_and(|item| item.meta.automation.state == AutomationState::AwaitingAction)
+        && set_automation(app, id, dir, AutomationState::Running, "Routing reviewed. Looking for the next safe stage.", false)
+    {
+        advance_automation(app, id, dir);
+    }
+}
+
+fn routing_row(ui: &mut Ui, row: &Value, button: &str, enabled: bool, secondary: Option<(&str, bool)>) -> (bool, bool) {
+    let name = Some(row_field(row, &["name", "title", "app"])).filter(|value| !value.is_empty()).unwrap_or_else(|| "Untitled product".into());
+    let version = row_field(row, &["version"]);
+    let status = row_field(row, &["status"]);
+    let notes = row_field(row, &["notes"]);
+    let mut clicked = false;
+    let mut secondary_clicked = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(name).semibold());
+        if !version.is_empty() {
+            theme::badge(ui, version, theme::grey());
+        }
+        if !status.is_empty() {
+            theme::badge(ui, status.replace('-', " "), theme::grey());
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            clicked = ui.add_enabled(enabled, egui::Button::new(button)).clicked();
+            if let Some((label, secondary_enabled)) = secondary {
+                secondary_clicked = ui.add_enabled(secondary_enabled, egui::Button::new(label).frame(false)).clicked();
+            }
+        });
+    });
+    if !notes.is_empty() {
+        ui.label(RichText::new(notes).small().weak());
+    }
+    (clicked, secondary_clicked)
+}
+
+fn routing_panels(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem, item_running: bool) {
+    let id = c.plugin.manifest.id.clone();
+    for panel in c.plugin.manifest.page.panels.iter().filter(|panel| panel.recipe_builder.is_some()) {
+        let (active, routed) = {
+            let Some(cache) = app.plugins.page(&id).panels.as_ref() else { continue };
+            (cache.tables.get(&panel.title).cloned(), cache.routed.get(&panel.title).cloned())
+        };
+        let Some(Ok(active)) = active else { continue };
+        let routed = routed.and_then(Result::ok).unwrap_or_default();
+        if active.is_empty() && routed.is_empty() {
+            continue;
+        }
+        let routing = panel.recipe_builder.as_ref().unwrap();
+        let stage_started = item.step(&routing.review_before).state != StepState::NotRun;
+        let busy = item_running || crate::workflow::busy(app) || Lock::holder(&item.dir).is_some();
+        let editable = !stage_started && !busy;
+        let needs_review = !active.is_empty() && (active.len() > 1 || !routed.is_empty()) && !item.meta.routing_reviews.contains(&panel.title);
+        let mut action = None;
+
+        theme::section_heading(ui, "Product routing");
+        ui.label(
+            RichText::new(format!(
+                "Keep products that belong in {} here. Send reusable applications to Recipe Builder before this workflow continues.",
+                c.plugin.manifest.name
+            ))
+            .weak(),
+        );
+        ui.add_space(6.0);
+        if needs_review {
+            theme::banner(ui, theme::amber(), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!(
+                        "This ticket contains {} products. Route each reusable app, then confirm what remains in {}.",
+                        active.len() + routed.len(),
+                        c.plugin.manifest.name
+                    ));
+                    let keep = if active.len() == 2 { "Keep both here".to_string() } else { format!("Keep {} here", active.len()) };
+                    if theme::primary(ui, editable, keep)
+                        .on_hover_text("Continue these products through the One-Off Packager pipeline.")
+                        .on_disabled_hover_text("Wait for current work to finish before changing routing.")
+                        .clicked()
+                    {
+                        action = Some(RoutingAction::Confirm);
+                    }
+                });
+            });
+            ui.add_space(6.0);
+        } else if stage_started {
+            ui.label(RichText::new(format!("Routing is locked because downstream {} work has started.", c.plugin.manifest.name)).small().weak());
+        } else if active.is_empty() {
+            theme::banner(ui, theme::green(), |ui| {
+                ui.label("Every product in this ticket is now handled by Recipe Builder.");
+            });
+        }
+
+        for (index, row) in active.iter().enumerate() {
+            if routing_row(ui, row, "Send to Recipe Builder", editable, None).0 {
+                action = Some(RoutingAction::Route(index));
+            }
+            ui.separator();
+        }
+        if !routed.is_empty() {
+            egui::CollapsingHeader::new(format!("In Recipe Builder ({})", routed.len()))
+                .id_salt(("plugin-routed-products", &id, &panel.title))
+                .default_open(true)
+                .show(ui, |ui| {
+                    for (index, row) in routed.iter().enumerate() {
+                        let product_id = routed_product_id(row);
+                        let batch_id = item.meta.routed_recipe_work.get(&product_id).cloned().unwrap_or_default();
+                        let return_label = format!("Return to {}", c.plugin.manifest.name);
+                        let (open, return_to_plugin) = routing_row(
+                            ui,
+                            row,
+                            "Open in Recipe Builder",
+                            true,
+                            Some((&return_label, editable)),
+                        );
+                        if open {
+                            action = Some(RoutingAction::OpenRouted(product_id, batch_id));
+                        } else if return_to_plugin {
+                            action = Some(RoutingAction::Return(index));
+                        }
+                        ui.separator();
+                    }
+                });
+        }
+        ui.add_space(10.0);
+
+        match action {
+            Some(RoutingAction::Route(index)) if set_routing_review(app, &id, &item.dir, &panel.title, false) => {
+                match plugin::move_panel_row(&item.dir, panel, index, true) {
+                    Ok(row) => {
+                        let product_id = routed_product_id(&row);
+                        let batch_id = crate::views::batch::add_plugin_product(app, product_batch_item(c, item, &row));
+                        if !batch_id.is_empty() {
+                            match WorkItem::open(&item.dir) {
+                                Ok(mut updated) => {
+                                    updated.meta.routed_recipe_work.insert(product_id, batch_id);
+                                    if let Err(e) = updated.save() {
+                                        app.error(format!("The product was routed, but its Recipe Builder return link could not be saved: {e:#}"));
+                                    }
+                                }
+                                Err(e) => app.error(format!("The product was routed, but its plugin work item could not be updated: {e:#}")),
+                            }
+                        }
+                        app.plugins.page(&id).panels = None;
+                        continue_after_routing(app, &id, &item.dir);
+                    }
+                    Err(e) => app.error(format!("Could not route the product: {e:#}")),
+                }
+            }
+            Some(RoutingAction::Return(index)) => {
+                let row = routed.get(index).cloned().unwrap_or(Value::Null);
+                let product_id = routed_product_id(&row);
+                match crate::views::batch::remove_plugin_product(app, &item.dir, &product_id) {
+                    Ok(()) if set_routing_review(app, &id, &item.dir, &panel.title, false) => {
+                        match plugin::move_panel_row(&item.dir, panel, index, false) {
+                            Ok(_) => {
+                                if let Ok(mut updated) = WorkItem::open(&item.dir) {
+                                    updated.meta.routed_recipe_work.remove(&product_id);
+                                    let _ = updated.save();
+                                }
+                                app.plugins.page(&id).panels = None;
+                                app.notify(format!("Returned the product to {}.", c.plugin.manifest.name));
+                                continue_after_routing(app, &id, &item.dir);
+                            }
+                            Err(e) => app.error(format!("Could not return the product: {e:#}")),
+                        }
+                    }
+                    Ok(()) => {}
+                    Err(e) => app.error(e),
+                }
+            }
+            Some(RoutingAction::Confirm) if set_routing_review(app, &id, &item.dir, &panel.title, true) => {
+                continue_after_routing(app, &id, &item.dir);
+            }
+            Some(RoutingAction::OpenRouted(product_id, batch_id)) => {
+                crate::views::batch::open_routed_plugin_product(app, &batch_id, &item.dir, &product_id);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn recipe_work_panels(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem) {
+    let mut open = None;
+    for panel in c.plugin.manifest.page.panels.iter().filter(|panel| {
+        panel.recipe_builder.as_ref().is_some_and(|routing| !routing.author_before.is_empty())
+    }) {
+        let rows = match plugin::active_panel_rows(&item.dir, panel) {
+            Ok(rows) if !rows.is_empty() => rows,
+            _ => continue,
+        };
+        theme::section_heading(ui, "Recipe Builder work");
+        ui.label(
+            RichText::new(format!(
+                "Recipe Builder owns research, recipe authoring and safe checks. {} receives the checked recipe and then continues its specialist workflow.",
+                c.plugin.manifest.name
+            ))
+            .weak(),
+        );
+        ui.add_space(6.0);
+        for row in rows {
+            let product_id = routed_product_id(&row);
+            let name = Some(row_field(&row, &["name", "title", "app"])).filter(|value| !value.is_empty()).unwrap_or_else(|| product_id.clone());
+            let record = item.meta.recipe_work.get(&product_id);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(name).semibold());
+                match record.map(|record| record.state) {
+                    Some(RecipeWorkState::Ready) => {
+                        theme::badge(ui, "Recipe ready", theme::green());
+                    }
+                    Some(RecipeWorkState::Running) => {
+                        theme::badge(ui, "Working", theme::blue());
+                    }
+                    Some(RecipeWorkState::Failed) => {
+                        theme::badge(ui, "Needs attention", theme::red());
+                    }
+                    Some(RecipeWorkState::Pending) => {
+                        theme::badge(ui, "Ready in Recipe Builder", theme::amber());
+                    }
+                    None => {
+                        theme::badge(ui, "Not started", theme::grey());
+                    }
+                }
+                if let Some(record) = record.filter(|record| !record.batch_id.is_empty())
+                    && ui.button("Open in Recipe Builder").clicked()
+                {
+                    open = Some((record.batch_id.clone(), product_id.clone()));
+                }
+            });
+            let note = record.map(|record| record.note.as_str()).filter(|note| !note.is_empty()).unwrap_or("The safe pipeline will create this linked recipe work after the plugin's read-only inventory.");
+            ui.label(RichText::new(note).small().weak());
+            ui.separator();
+        }
+        ui.add_space(8.0);
+    }
+    if let Some((batch_id, product_id)) = open {
+        crate::views::batch::open_plugin_recipe_work(app, &batch_id, &item.dir, Some(&product_id));
+    }
+}
+
+fn automation_controls(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem, item_running: bool, busy_elsewhere: bool) {
+    let id = c.plugin.manifest.id.clone();
+    let record = item.meta.automation.clone();
+    let color = match record.state {
+        AutomationState::Running => theme::blue(),
+        AutomationState::Complete => theme::green(),
+        AutomationState::AwaitingAction | AutomationState::Paused => theme::amber(),
+        AutomationState::Idle => theme::grey(),
+    };
+    let default_note = "Runs stages the plugin explicitly marks safe, one at a time. Stops before approvals, installs, tenant changes and manual work.";
+    let mut start = false;
+    let mut pause = false;
+    theme::banner(ui, color, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if record.state == AutomationState::Running && item_running {
+                ui.spinner();
+                ui.label(if record.note.is_empty() { "Running safe stagesâ€¦" } else { &record.note });
+                pause = ui.button("Pause after this stage").clicked();
+            } else {
+                let label = if record.state == AutomationState::Idle { "Run safe stages" } else { "Continue safe stages" };
+                let can_start = !item_running && !busy_elsewhere;
+                start = theme::primary(ui, can_start, format!("\u{E768}  {label}"))
+                    .on_disabled_hover_text(if item_running { "Wait for the current stage to finish." } else { "Another agent or test is running." })
+                    .clicked();
+                ui.label(if record.note.is_empty() { default_note } else { &record.note });
+            }
+        });
+    });
+    if pause {
+        set_automation(
+            app,
+            &id,
+            &item.dir,
+            AutomationState::Paused,
+            "Pausing after the current stage. Completed stages remain valid.",
+            false,
+        );
+    } else if start
+        && set_automation(app, &id, &item.dir, AutomationState::Running, "Looking for the next safe stage.", record.state == AutomationState::Idle)
+    {
+        advance_automation(app, &id, &item.dir);
+    }
+}
+
 /// A pipeline row's state, name, risk and gate.
 fn stage_heading(ui: &mut Ui, stage: Stage<'_>, state: StepState) {
     state_badge(ui, state);
@@ -629,7 +1611,11 @@ fn stage_button(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem, stag
             } else {
                 None
             };
-            let text = if state == StepState::NotRun { "\u{E99A}  Run agent" } else { "\u{E72C}  Run agent again" };
+            let text = match state {
+                StepState::NotRun => "\u{E99A}  Run agent",
+                StepState::Interrupted => "\u{E72C}  Retry interrupted agent task",
+                _ => "\u{E72C}  Run agent again",
+            };
             let resp = ui.add_enabled(why.is_none(), egui::Button::new(text));
             if let Some(why) = why {
                 resp.on_disabled_hover_text(why);
@@ -668,6 +1654,7 @@ fn step_button(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem, s: &S
     let text = match (&s.gate, approved, state) {
         (Gate::Hash { .. }, false, _) => "\u{E72E}  Review and approve…",
         (_, _, StepState::NotRun) => "\u{E768}  Run",
+        (_, _, StepState::Interrupted) => "\u{E72C}  Retry interrupted stage",
         _ => "\u{E72C}  Run again",
     };
     let resp = ui.add_enabled(why.is_none(), egui::Button::new(text));
@@ -873,7 +1860,7 @@ fn row_action(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, root: &Path, row: &Valu
                 start_with_gate(app, &c.plugin, &s, root, params, Purpose::Row(key.to_string()));
             }
         }
-        ActionKind::HandoffWorkItem { plugin: target, files, title } => {
+        ActionKind::HostPluginWorkItem { plugin: target, files, title } => {
             let target_ctx = context(app, target);
             let missing = app.plugins.registry.missing_requirements(&c.plugin);
             let why = match (&target_ctx, folder) {
@@ -894,7 +1881,7 @@ fn row_action(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, root: &Path, row: &Valu
                 start_handoff(app, &id, target, files, title, row, key, from);
             }
         }
-        ActionKind::HandoffRecipe { notes_file } => {
+        ActionKind::HostRecipeBuilder { notes_file } => {
             let why = if !app.writable() {
                 Some("Open a writable development workspace first.".to_string())
             } else if !app.ws_cache.has_skill {
@@ -930,6 +1917,7 @@ fn refresh_panels(app: &mut StudioApp, id: &str, c: &Ctx, dir: &Path, force: boo
         built: Instant::now(),
         request: ystudio_core::read_text(&dir.join("ticket.md")).ok().map(Arc::new),
         tables: HashMap::new(),
+        routed: HashMap::new(),
         markdown: HashMap::new(),
         files: HashMap::new(),
     };
@@ -950,6 +1938,9 @@ fn refresh_panels(app: &mut StudioApp, id: &str, c: &Ctx, dir: &Path, force: boo
                     })
                 });
                 cache.tables.insert(p.title.clone(), rows);
+                if p.recipe_builder.is_some() {
+                    cache.routed.insert(p.title.clone(), plugin::routed_panel_rows(dir, p).map_err(|e| format!("{e:#}")));
+                }
             }
             PanelKind::Markdown => {
                 let text = p.file.as_ref().and_then(|f| ystudio_core::read_text(&dir.join(f)).ok()).map(Arc::new);
@@ -965,6 +1956,9 @@ fn refresh_panels(app: &mut StudioApp, id: &str, c: &Ctx, dir: &Path, force: boo
 
 fn panels(app: &mut StudioApp, ui: &mut Ui, id: &str, c: &Ctx, dir: &Path) {
     for p in &c.plugin.manifest.page.panels {
+        if p.recipe_builder.is_some() {
+            continue;
+        }
         let page = app.plugins.page(id);
         let Some(cache) = page.panels.as_ref() else { return };
         match p.kind {
@@ -1311,7 +2305,7 @@ pub(crate) mod tests {
             std::fs::copy(src.join(rel), copy.join(rel)).unwrap();
         }
         let manifest = std::fs::read_to_string(copy.join("plugin.yaml")).unwrap().replace("\r\n", "\n");
-        let manifest = edit(manifest.replace("minVersion: 0.6.0", &format!("minVersion: {}", super::super::update::CURRENT_VERSION)).replace("id: sample-plugin", &format!("id: {id}")));
+        let manifest = edit(manifest.replace("minVersion: 0.7.0", &format!("minVersion: {}", super::super::update::CURRENT_VERSION)).replace("id: sample-plugin", &format!("id: {id}")));
         std::fs::write(copy.join("plugin.yaml"), manifest).unwrap();
         let pkg = plugin::Package::from_bytes(&plugin::zip_dir(&copy).unwrap()).unwrap();
         let plugins = dir.join("plugins");
@@ -1363,6 +2357,139 @@ pub(crate) mod tests {
         render(&mut app, "plugin-trust", 1315, 900);
     }
 
+    #[test]
+    fn host_settings_action_uses_the_global_plugin_settings_surface() {
+        let (dir, mut app) = fake_app();
+        install_sample(&mut app, dir.path(), "sample-plugin", |m| m);
+        app.settings.plugins.get_mut("sample-plugin").unwrap().values.remove("workRoot");
+        app.view = View::Plugin(0);
+
+        render(&mut app, "plugin-needs-global-settings", 1100, 680);
+        assert_eq!(app.view, View::Plugin(0), "rendering the recovery state does not silently navigate");
+
+        open_plugin_settings(&mut app, "sample-plugin");
+        assert_eq!(app.view, View::Settings);
+        assert_eq!(app.plugins_ui.open_settings.as_deref(), Some("sample-plugin"));
+        render(&mut app, "plugin-global-settings", 1100, 680);
+    }
+
+    #[test]
+    fn plugin_activity_center_reconciles_filters_and_opens_exact_work() {
+        let (dir, mut app) = fake_app();
+        let root = install_sample(&mut app, dir.path(), "sample-plugin", |m| m);
+
+        let mut interrupted = WorkItem::create(
+            &root,
+            "{date}-{slug}",
+            "Interrupted package",
+            "TASK-101",
+            Origin::default(),
+            SystemTime::now(),
+        )
+        .unwrap();
+        interrupted.meta.steps.insert(
+            "echo".into(),
+            plugin::StepRecord { state: StepState::Running, started: "earlier".into(), ..Default::default() },
+        );
+        interrupted.meta.automation = plugin::AutomationRecord {
+            state: AutomationState::Running,
+            note: "Running Echo.".into(),
+            ..Default::default()
+        };
+        interrupted.save().unwrap();
+
+        let mut waiting = WorkItem::create(
+            &root,
+            "{date}-{slug}",
+            "Approval needed",
+            "TASK-102",
+            Origin::default(),
+            SystemTime::now(),
+        )
+        .unwrap();
+        waiting.meta.automation = plugin::AutomationRecord {
+            state: AutomationState::AwaitingAction,
+            note: "Review the requested change before continuing.".into(),
+            ..Default::default()
+        };
+        waiting.save().unwrap();
+
+        let mut complete = WorkItem::create(
+            &root,
+            "{date}-{slug}",
+            "Finished package",
+            "TASK-103",
+            Origin::default(),
+            SystemTime::now(),
+        )
+        .unwrap();
+        complete.meta.automation.state = AutomationState::Complete;
+        complete.meta.automation.note = "All safe stages completed.".into();
+        complete.save().unwrap();
+
+        refresh_activity(&mut app, true);
+        assert_eq!(app.plugins.activity.len(), 3);
+        let recovered = app.plugins.activity.iter().find(|activity| activity.title == "Interrupted package").unwrap();
+        assert_eq!(recovered.state, PluginActivityState::Attention);
+        assert_eq!(WorkItem::open(&interrupted.dir).unwrap().step("echo").state, StepState::Interrupted);
+        assert_eq!(
+            app.plugins.activity.iter().find(|activity| activity.title == "Approval needed").unwrap().state,
+            PluginActivityState::Waiting
+        );
+        assert_eq!(
+            app.plugins.activity.iter().find(|activity| activity.title == "Finished package").unwrap().state,
+            PluginActivityState::Complete
+        );
+
+        app.view = View::Home;
+        render(&mut app, "home-plugin-attention", 1200, 820);
+        app.runs_ui.show_plugin_work();
+        app.view = View::Runs;
+        render(&mut app, "history-plugin-work", 1200, 820);
+        render(
+            &mut app,
+            "history-plugin-work-min",
+            crate::app::MIN_LAYOUT.x as u32,
+            crate::app::MIN_LAYOUT.y as u32,
+        );
+
+        let target = app.plugins.activity.iter().find(|activity| activity.title == "Approval needed").unwrap().clone();
+        open_activity(&mut app, &target);
+        assert_eq!(app.view, app.plugins.view_of("sample-plugin").unwrap());
+        assert_eq!(app.plugins.page("sample-plugin").selected.as_deref(), Some(waiting.dir.as_path()));
+    }
+
+    #[test]
+    fn opening_a_plugin_recovers_orphaned_running_stages() {
+        let (dir, mut app) = fake_app();
+        let root = install_sample(&mut app, dir.path(), "sample-plugin", |m| m);
+        let mut item = WorkItem::create(&root, "{date}-{slug}", "Interrupted ticket", "", Origin::default(), SystemTime::now()).unwrap();
+        item.meta.steps.insert("triage".into(), plugin::StepRecord { state: StepState::Ok, summary: "Ready".into(), ..Default::default() });
+        item.meta.steps.insert("echo".into(), plugin::StepRecord { state: StepState::Running, started: "2026-11-17 12:00:00".into(), ..Default::default() });
+        item.save().unwrap();
+        app.plugins.page("sample-plugin").selected = Some(item.dir.clone());
+        app.view = View::Plugin(0);
+
+        render(&mut app, "plugin-interrupted", 1100, 680);
+
+        let recovered = WorkItem::open(&item.dir).unwrap().step("echo");
+        assert_eq!(recovered.state, StepState::Interrupted);
+        assert!(recovered.summary.contains("retry"));
+        assert!(!app.jobs.iter().any(|job| job.proc.is_running()));
+    }
+
+    #[test]
+    fn a_plugin_step_does_not_start_when_running_state_cannot_be_saved() {
+        let (dir, mut app) = fake_app();
+        let root = install_sample(&mut app, dir.path(), "sample-plugin", |m| m);
+        let item = WorkItem::create(&root, "{date}-{slug}", "Unwritable state", "", Origin::default(), SystemTime::now()).unwrap();
+        std::fs::create_dir(item.dir.join("work-item.json.tmp")).unwrap();
+
+        assert!(!run_step(&mut app, "sample-plugin", &item.dir, "echo", Map::new(), false, Purpose::Item));
+        assert!(app.jobs.is_empty(), "no external process starts before durable state is saved");
+        assert_eq!(WorkItem::open(&item.dir).unwrap().step("echo").state, StepState::NotRun);
+    }
+
     /// The repository's One-Off Packager, installed and showing a ticket part-way through.
     #[test]
     fn the_oneoff_packager_page_renders_a_ticket_in_progress() {
@@ -1386,13 +2513,11 @@ pub(crate) mod tests {
         std::fs::write(item.dir.join("products.json"), r#"{"products":[
             {"id":"faststoneimageviewer","name":"FastStone Image Viewer","version":"8.5","status":"locally-validated","notes":"Vendor installer, unsigned"},
             {"id":"inphotocaptureps","name":"inPhoto Capture PS","version":"4.18.42","status":"needs-research","notes":"Vendor link in the ticket"}]}"#).unwrap();
-        std::fs::write(item.dir.join("research-and-status.md"), "# Research\n\nBoth installers come from the vendors' own sites.\n\n- FastStone: `/S` silent switch confirmed in the vendor FAQ.").unwrap();
         for (id, state, summary) in [
             ("parse-ticket", StepState::Ok, "2 link(s), 0 Dropbox, 1 asset tag(s)."),
             ("triage", StepState::Ok, "Finished: 1 file(s) changed."),
             ("runtime", StepState::Ok, "Created the runtime and proved its DELETE guard. YardstickDev commit 2a28d70a."),
             ("inventory", StepState::Ok, "Scanned 412 apps in Contoso: 0 possible existing app(s)."),
-            ("research", StepState::Ok, "Finished: 4 file(s) changed."),
             ("prepare-test", StepState::Warn, "Prepare test run 20261113-101500-001: faststoneimageviewer: WhatIf."),
         ] {
             let rec = item.meta.steps.entry(id.into()).or_default();
@@ -1400,18 +2525,85 @@ pub(crate) mod tests {
             rec.summary = summary.into();
             rec.finished = "2026-11-13 10:15:00".into();
         }
+        for product in ["faststoneimageviewer", "inphotocaptureps"] {
+            item.meta.recipe_work.insert(product.into(), RecipeWorkRecord {
+                state: RecipeWorkState::Ready,
+                batch_id: "recipe-builder-list".into(),
+                recipe_id: product.into(),
+                note: format!("{product} passed Recipe Builder's safe checks and was synced for One-Off packaging."),
+                updated: "2026-11-13 10:14:00".into(),
+            });
+        }
         item.save().unwrap();
         app.plugins.page("oneoff-packager").selected = Some(item.dir.clone());
         app.view = View::Plugin(0);
         render(&mut app, "oneoff-packager-ticket", 1500, 1500);
 
         // The pipeline is in the order the page lists it, and a step is ready only after what it needs.
-        let m = &app.plugins.get("oneoff-packager").unwrap().manifest;
+        let m = app.plugins.get("oneoff-packager").unwrap().manifest.clone();
         let order: Vec<&str> = m.pipeline().iter().map(|s| s.id()).collect();
-        assert_eq!(order, ["parse-ticket", "triage", "runtime", "inventory", "research", "prepare-test", "repair", "full-test-request", "full-test", "build", "prepare-live", "live-change"]);
+        assert_eq!(order, ["parse-ticket", "triage", "runtime", "inventory", "prepare-test", "full-test-request", "full-test", "build", "prepare-live", "live-change"]);
         let item = WorkItem::open(&item.dir).unwrap();
         assert!(item.satisfied(&m.step("full-test-request").unwrap().after), "Prepare finished with warnings, so the request can be written");
         assert!(!item.satisfied(&m.step("build").unwrap().after), "nothing is built before the install test");
+        assert!(matches!(m.next_automatic(&item), AutomationNext::Run(Stage::Step(step)) if step.id == "full-test-request"));
+        let fresh = WorkItem::create(&root, "{date}-{slug}", "Fresh request", "", Origin::default(), SystemTime::now()).unwrap();
+        assert!(matches!(m.next_automatic(&fresh), AutomationNext::Run(Stage::Step(step)) if step.id == "parse-ticket"));
+
+        let mut mixed = WorkItem::create(&root, "{date}-{slug}", "Mixed route request", "TASK-MIXED", Origin::default(), SystemTime::now()).unwrap();
+        std::fs::write(mixed.dir.join("ticket.md"), "Please package FastStone Image Viewer and QGIS.").unwrap();
+        std::fs::write(mixed.dir.join("products.json"), r#"{"products":[
+            {"id":"faststoneimageviewer","name":"FastStone Image Viewer","version":"8.5","status":"needs-research","notes":"Licensed lab request","links":[]},
+            {"id":"qgis","name":"QGIS","publisher":"QGIS.org","version":"3.40","status":"needs-research","notes":"Reusable open-source application","links":["https://qgis.org"]}
+        ]}"#).unwrap();
+        for stage in ["parse-ticket", "triage"] {
+            mixed.meta.steps.insert(stage.into(), plugin::StepRecord { state: StepState::Ok, ..Default::default() });
+        }
+        mixed.save().unwrap();
+        assert!(matches!(m.next_automatic(&mixed), AutomationNext::RoutingReview(panel, 2) if panel.title == "Products"));
+        app.plugins.page("oneoff-packager").selected = Some(mixed.dir.clone());
+        render(&mut app, "oneoff-product-routing", 1400, 1000);
+        render(&mut app, "oneoff-product-routing-min", 1100, 680);
+        render(&mut app, "oneoff-product-routing-small", 900, 680);
+
+        let c = context(&app, "oneoff-packager").unwrap();
+        let panel = c.plugin.manifest.page.panels.iter().find(|panel| panel.title == "Products").unwrap();
+        let row = plugin::move_panel_row(&mixed.dir, panel, 1, true).unwrap();
+        let routed_batch_id = crate::views::batch::add_plugin_product(&mut app, product_batch_item(&c, &mixed, &row));
+        let mut routed_work = WorkItem::open(&mixed.dir).unwrap();
+        routed_work.meta.routed_recipe_work.insert("qgis".into(), routed_batch_id.clone());
+        routed_work.save().unwrap();
+        app.plugins.page("oneoff-packager").panels = None;
+        render(&mut app, "oneoff-product-routed", 1400, 1000);
+        let routed = app.batch.batch.as_ref().unwrap().items.iter().find(|item| item.suggested_id == "qgis").unwrap();
+        assert_eq!((routed.app.as_str(), routed.publisher.as_str(), routed.version.as_str()), ("QGIS", "QGIS.org", "3.40"));
+        assert_eq!(routed.handler_item.as_deref(), Some(mixed.dir.as_path()));
+        assert_eq!(WorkItem::open(&mixed.dir).unwrap().meta.routed_recipe_work["qgis"], routed_batch_id);
+        assert!(crate::views::batch::open_routed_plugin_product(&mut app, &routed_batch_id, &mixed.dir, "qgis"));
+        assert_eq!(plugin::routed_panel_rows(&mixed.dir, panel).unwrap().len(), 1);
+        assert!(matches!(m.next_automatic(&mixed), AutomationNext::RoutingReview(_, 1)), "the remaining product still needs explicit confirmation");
+
+        let mut linked = WorkItem::open(&mixed.dir).unwrap();
+        linked.meta.routing_reviews.insert("Products".into());
+        for stage in ["runtime", "inventory"] {
+            linked.meta.steps.insert(stage.into(), plugin::StepRecord { state: StepState::Ok, ..Default::default() });
+        }
+        linked.save().unwrap();
+        assert!(matches!(m.next_automatic(&linked), AutomationNext::RecipeWorkNeeded(_, ids) if ids == ["faststoneimageviewer"]));
+        app.batch.batch.as_mut().unwrap().id = dir.path().join("linked-recipe-work").to_string_lossy().into_owned();
+        assert!(ensure_recipe_work(&mut app, "oneoff-packager", &linked.dir, panel, &["faststoneimageviewer".into()]));
+        let child = app.batch.batch.as_ref().unwrap().items.iter().find(|item| item.suggested_id == "faststoneimageviewer").unwrap();
+        assert!(child.plugin_origins.iter().any(|origin| origin.work_item == linked.dir && origin.product_id == "faststoneimageviewer"));
+        app.plugins.page("oneoff-packager").selected = Some(linked.dir.clone());
+        render(&mut app, "oneoff-recipe-builder-waiting", 1400, 1000);
+        let batch_id = app.batch.batch.as_ref().unwrap().id.clone();
+        assert!(crate::views::batch::open_plugin_recipe_work(
+            &mut app,
+            &batch_id,
+            &linked.dir,
+            Some("faststoneimageviewer"),
+        ));
+        render(&mut app, "recipe-builder-linked-plugin-work", 1400, 1000);
     }
 
     /// Installs the repository's plugins and gives them settings under `dir`.
@@ -1453,37 +2645,65 @@ pub(crate) mod tests {
         app.view = View::Settings;
         render(&mut app, "oneoff-private-clone-setting", 1400, 1900);
 
+        let mut source_batch = Batch::from_items(
+            "plugin-origin",
+            vec![BatchItem {
+                app: "Licensed Lab Tool".into(),
+                handler: "oneoff-packager".into(),
+                status: ItemStatus::Delegated,
+                status_note: "Started in One-Off Packager.".into(),
+                include: false,
+                ..Default::default()
+            }],
+        );
+        source_batch.items[0].handler = "oneoff-packager".into();
+        source_batch.items[0].include = false;
+        source_batch.id = dir.path().join("plugin-origin-batch").to_string_lossy().into_owned();
+        let batch_id = source_batch.id.clone();
+        app.batch.batch = Some(source_batch);
+        app.batch.selected = Some(0);
+
         let made = create_from_recipe_builder(
             &mut app,
             "oneoff-packager",
             "Licensed Lab Tool",
             "TASK-42",
             "Requester supplied licensed media.",
-            "batch:0",
+            &format!("{batch_id}:0"),
         )
         .unwrap();
+        app.batch.batch.as_mut().unwrap().items[0].handler_item = Some(made.clone());
+        app.batch.batch.as_ref().unwrap().save().unwrap();
         assert!(made.starts_with(&oneoff));
         assert_eq!(ystudio_core::read_text(&made.join("ticket.md")).unwrap(), "Requester supplied licensed media.");
         let item = WorkItem::open(&made).unwrap();
-        assert_eq!((item.meta.origin.kind.as_str(), item.meta.origin.from_plugin.as_str(), item.meta.origin.key.as_str()), ("recipe-builder", "recipe-builder", "batch:0"));
+        assert_eq!((item.meta.origin.kind.as_str(), item.meta.origin.from_plugin.as_str()), ("recipe-builder", "recipe-builder"));
+        assert_eq!(item.meta.origin.key, format!("{batch_id}:0"));
 
-        assert!(crate::views::batch::add_plugin_work_item(
-            &mut app,
-            &item.meta.title,
-            &item.meta.reference,
-            "Continued from One-Off Packager.",
-        ));
-        let returned = app.batch.batch.as_ref().unwrap().items.last().unwrap();
-        assert!(returned.is_recipe_work());
-        assert_eq!((returned.app.as_str(), returned.source.as_str()), ("Licensed Lab Tool", "TASK-42"));
+        app.plugins.page("oneoff-packager").selected = Some(made.clone());
+        render(&mut app, "oneoff-plugin-origin", 1400, 900);
+        assert!(crate::views::batch::open_plugin_handoff_source(&mut app, &item.meta.origin.key, &made));
+        assert_eq!(app.batch.selected, Some(0));
         render(&mut app, "recipe-builder-plugin-return", 1400, 900);
         render(&mut app, "recipe-builder-plugin-return-narrow", 900, 600);
-        let returned = app.batch.batch.as_mut().unwrap().items.last_mut().unwrap();
-        returned.handler = "oneoff-packager".into();
-        returned.handler_item = Some(made);
-        returned.include = false;
-        app.batch.selected = Some(app.batch.batch.as_ref().unwrap().items.len() - 1);
         render(&mut app, "recipe-builder-plugin-destination", 1400, 900);
+
+        let mut item = WorkItem::open(&made).unwrap();
+        item.meta.automation.state = AutomationState::Running;
+        item.meta.automation.note = "Running triage.".into();
+        item.save().unwrap();
+        sync_recipe_builder_origin(&mut app, "oneoff-packager", &made);
+        let source = &app.batch.batch.as_ref().unwrap().items[0];
+        assert_eq!(source.status, ItemStatus::Delegated);
+        assert!(source.status_note.starts_with("Running in One-Off Packager"), "{}", source.status_note);
+
+        item.meta.automation.state = AutomationState::Complete;
+        item.meta.automation.note = "All products were routed to Recipe Builder.".into();
+        item.save().unwrap();
+        sync_recipe_builder_origin(&mut app, "oneoff-packager", &made);
+        let source = &app.batch.batch.as_ref().unwrap().items[0];
+        assert_eq!(source.status, ItemStatus::Done);
+        assert!(source.status_note.starts_with("Complete in One-Off Packager"), "{}", source.status_note);
     }
 
     #[test]
@@ -1520,7 +2740,7 @@ pub(crate) mod tests {
 
         // The handoff starts a ticket in the One-Off Packager with the export and the content.
         let m = app.plugins.get("sccm-migration").unwrap().manifest.clone();
-        let Some(plugin::ActionDef { kind: ActionKind::HandoffWorkItem { plugin: target, files, title }, .. }) = m.actions.iter().find(|a| a.id == "to-oneoff").cloned() else { panic!("no to-oneoff action") };
+        let Some(plugin::ActionDef { kind: ActionKind::HostPluginWorkItem { plugin: target, files, title }, .. }) = m.actions.iter().find(|a| a.id == "to-oneoff").cloned() else { panic!("no to-oneoff action") };
         let row = serde_json::json!({"key":"ScopeId_X/Application_1/8","name":"Spectragryph 1.0.7"});
         assert!(start_handoff(&mut app, "sccm-migration", &target, &files, &title, &row, "ScopeId_X/Application_1/8", &folder));
         assert_eq!(app.view, oneoff_tab, "the One-Off Packager's tab opens");
@@ -1542,6 +2762,7 @@ pub(crate) mod tests {
         let (dir, mut app) = fake_app();
         install_sample(&mut app, dir.path(), "sample-catalog", |m| {
             m.replace("  type: workitems\n", "  type: catalog\n  query: search\n  columns: [name, version]\n")
+                .replace("  hostActions: [new-work, refresh, work-folder, settings]\n", "  hostActions: [work-folder, settings]\n")
                 .replace("steps:\n", "steps:\n  - id: search\n    label: Search\n    script: scripts/Echo.ps1\n    risk: local-read\n    scope: plugin\n")
                 .replace("actions:\n", "actions:\n  - id: export\n    label: Export\n    kind: step\n    step: echo\n")
                 .replace("  plugins:\n    - id: other-plugin\n      minVersion: 1.0.0\n", "  plugins:\n    - id: other-plugin\n")
@@ -1658,6 +2879,41 @@ pub(crate) mod tests {
         assert!(!run_step(&mut app, "sample-plugin", &item.dir, "confirmed", Map::new(), false, Purpose::Item));
         assert!(Lock::holder(&item.dir).is_none(), "a refused step leaves no lock");
     }
+
+    #[test]
+    fn safe_pipeline_runs_opted_in_work_and_stops_for_confirmation() {
+        let (dir, mut app) = fake_app();
+        let root = install_sample(&mut app, dir.path(), "sample-plugin", |m| {
+            m.replace("    after: [triage]\n  - id: confirmed", "    automatic: true\n  - id: confirmed")
+                .replace("  - id: confirmed\n", "  - id: confirmed\n    automatic: true\n")
+        });
+        let item = WorkItem::create(&root, "{date}-{ref}-{slug}", "Automatic echo", "", Origin::default(), SystemTime::now()).unwrap();
+
+        assert!(set_automation(
+            &mut app,
+            "sample-plugin",
+            &item.dir,
+            AutomationState::Running,
+            "Starting the safe pipeline.",
+            true,
+        ));
+        advance_automation(&mut app, "sample-plugin", &item.dir);
+        assert_eq!(WorkItem::open(&item.dir).unwrap().step("echo").state, StepState::Running);
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        while app.jobs.iter().any(|j| j.proc.is_running()) && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            app.poll_for_tests();
+        }
+        app.poll_for_tests();
+
+        let finished = WorkItem::open(&item.dir).unwrap();
+        assert_eq!(finished.step("echo").state, StepState::Ok);
+        assert_eq!(finished.step("confirmed").state, StepState::NotRun);
+        assert_eq!(finished.meta.automation.state, AutomationState::AwaitingAction);
+        assert!(finished.meta.automation.note.contains("Confirmed echo"), "{}", finished.meta.automation.note);
+        assert!(app.jobs.iter().all(|job| !job.proc.is_running()), "the consent-gated step did not start");
+    }
 }
 
 #[cfg(test)]
@@ -1741,6 +2997,7 @@ pub fn run_agent(app: &mut StudioApp, id: &str, dir: &Path, task_id: &str) -> bo
                 StepState::Warn => "passed with warnings",
                 StepState::Fail => "failed",
                 StepState::Blocked => "blocked",
+                StepState::Interrupted => "interrupted",
                 StepState::Running | StepState::NotRun => "not finished",
             };
             Some(Evidence { step: stage_label(&c, sid), state: state.into(), summary: rec.summary.clone(), result: rec.result.clone() })
@@ -1761,18 +3018,37 @@ pub fn run_agent(app: &mut StudioApp, id: &str, dir: &Path, task_id: &str) -> bo
             return false;
         }
     };
-    let kind = JobKind::PluginAgent { plugin: id.to_string(), dir: dir.to_path_buf(), task: task.id.clone(), before: Snapshot::of_dir(dir) };
-    let Some(job) = app.start_job(spec, kind) else { return false };
+    let before = Snapshot::of_dir(dir);
+    let mut item = match WorkItem::open(dir) {
+        Ok(item) => item,
+        Err(e) => {
+            app.error(format!("Could not record {} before it starts: {e:#}", task.label));
+            return false;
+        }
+    };
+    let rec = item.meta.steps.entry(task.id.clone()).or_default();
+    rec.state = StepState::Running;
+    rec.started = ystudio_core::intake::timestamp();
+    rec.finished.clear();
+    rec.summary.clear();
+    rec.result = None;
+    if task.automatic && matches!(item.meta.automation.state, AutomationState::AwaitingAction | AutomationState::Paused) {
+        item.meta.automation.state = AutomationState::Running;
+        item.meta.automation.updated = ystudio_core::intake::timestamp();
+        item.meta.automation.note = format!("Running {}.", task.label);
+    }
+    if let Err(e) = item.save() {
+        app.error(format!("Could not record {} before it starts: {e:#}. Nothing was run.", task.label));
+        return false;
+    }
+    let kind = JobKind::PluginAgent { plugin: id.to_string(), dir: dir.to_path_buf(), task: task.id.clone(), before };
+    let Some(job) = app.start_job(spec, kind) else {
+        mark_interrupted(app, id, dir, &task.id, "The agent process could not be started. Review the error, then retry this stage.");
+        return false;
+    };
     app.plugins.locks.insert(job, lock);
     app.plugins.page(id).agent_changes.remove(dir);
-    if let Ok(mut item) = WorkItem::open(dir) {
-        let rec = item.meta.steps.entry(task.id.clone()).or_default();
-        rec.state = StepState::Running;
-        rec.started = ystudio_core::intake::timestamp();
-        rec.finished.clear();
-        let _ = item.save();
-        app.plugins.page(id).refresh_items(&root);
-    }
+    app.plugins.page(id).refresh_items(&root);
     true
 }
 
@@ -1807,25 +3083,55 @@ pub fn agent_finished(app: &mut StudioApp, job: u64, id: &str, dir: &Path, task_
     } else {
         (StepState::Ok, format!("Finished: {n} file(s) changed."))
     };
-    if let Ok(mut item) = WorkItem::open(dir) {
-        let rec = item.meta.steps.entry(task_id.to_string()).or_default();
-        rec.state = state;
-        rec.finished = ystudio_core::intake::timestamp();
-        rec.summary = summary.clone();
-        let _ = item.save();
+    let mut save_error = None;
+    match WorkItem::open(dir) {
+        Ok(mut item) => {
+            let rec = item.meta.steps.entry(task_id.to_string()).or_default();
+            rec.state = state;
+            rec.finished = ystudio_core::intake::timestamp();
+            rec.summary = summary.clone();
+            if let Err(e) = item.save() {
+                save_error = Some(format!("its result could not be saved: {e:#}"));
+            }
+        }
+        Err(e) => save_error = Some(format!("its work item could not be opened: {e:#}")),
     }
-    let page = app.plugins.page(id);
-    page.agent_changes.insert(dir.to_path_buf(), changes);
-    page.panels = None;
-    if let Some(root) = &c.root {
-        page.refresh_items(root);
+    {
+        let page = app.plugins.page(id);
+        page.agent_changes.insert(dir.to_path_buf(), changes);
+        page.panels = None;
+        if let Some(root) = &c.root {
+            page.refresh_items(root);
+        }
     }
     let label = stage_label(&c, task_id);
     let msg = format!("{} · {label}: {summary}", c.plugin.manifest.name);
-    if matches!(state, StepState::Ok | StepState::Warn) {
+    if let Some(e) = &save_error {
+        app.error(format!("{label} finished, but {e}"));
+    } else if matches!(state, StepState::Ok | StepState::Warn) {
         app.notify(msg);
     } else {
         app.error(msg);
+    }
+    if save_error.is_none()
+        && let Ok(item) = WorkItem::open(dir)
+        && item.meta.automation.state == AutomationState::Running
+    {
+        if matches!(state, StepState::Ok | StepState::Warn) {
+            advance_automation(app, id, dir);
+        } else {
+            set_automation(
+                app,
+                id,
+                dir,
+                AutomationState::Paused,
+                format!("{label} did not finish successfully. Review or retry it, then continue safe stages."),
+                false,
+            );
+        }
+    }
+    if save_error.is_none() {
+        sync_recipe_builder_origin(app, id, dir);
     }
 }
 

@@ -58,6 +58,9 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         ui.label(RichText::new("Design, test and agentically author Yardstick recipes - without ever touching production.").weak());
         ui.add_space(20.0);
         super::tools::banner(app, ui);
+        if plugin_activity_card(app, ui) {
+            ui.add_space(theme::CARD_GAP);
+        }
         if app.ws.is_some() {
             launcher(app, ui);
             ui.add_space(theme::CARD_GAP);
@@ -81,6 +84,80 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         }
         ui.add_space(8.0);
     });
+}
+
+/// Work that would otherwise require visiting each plugin tab to discover.
+fn plugin_activity_card(app: &mut StudioApp, ui: &mut Ui) -> bool {
+    super::plugin_page::refresh_activity(app, false);
+    let mut active: Vec<_> = app
+        .plugins
+        .activity
+        .iter()
+        .filter(|activity| activity.state != super::plugin_page::PluginActivityState::Complete)
+        .cloned()
+        .collect();
+    if active.is_empty() {
+        return false;
+    }
+    active.sort_by_key(|activity| match activity.state {
+        super::plugin_page::PluginActivityState::Attention => 0,
+        super::plugin_page::PluginActivityState::Waiting => 1,
+        super::plugin_page::PluginActivityState::Running => 2,
+        super::plugin_page::PluginActivityState::Ready => 3,
+        super::plugin_page::PluginActivityState::Complete => 4,
+    });
+    let attention = active.iter().filter(|activity| activity.state.needs_attention()).count();
+    let running = active
+        .iter()
+        .filter(|activity| activity.state == super::plugin_page::PluginActivityState::Running)
+        .count();
+    let mut open = None;
+    let mut view_all = false;
+    theme::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            theme::section_heading(ui, "Plugin work");
+            if attention > 0 {
+                theme::badge(ui, format!("{attention} need attention"), theme::amber());
+            }
+            if running > 0 {
+                theme::badge(ui, format!("{running} running"), theme::blue());
+            }
+        });
+        ui.label(RichText::new("Continue interrupted, waiting and active plugin work without searching each plugin tab.").weak());
+        ui.add_space(8.0);
+        for activity in active.iter().take(3) {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(&activity.title).semibold());
+                theme::badge(ui, activity.state.label(), plugin_activity_color(activity.state));
+                ui.label(RichText::new(format!("{} · {}/{} stages", activity.plugin_name, activity.done, activity.total)).small().weak());
+                if ui.small_button("Open").clicked() {
+                    open = Some(activity.clone());
+                }
+            });
+            if !activity.note.is_empty() {
+                ui.label(RichText::new(&activity.note).small().weak());
+            }
+        }
+        ui.add_space(6.0);
+        view_all = ui.button(format!("View all plugin work ({})", active.len())).clicked();
+    });
+    if let Some(activity) = open {
+        super::plugin_page::open_activity(app, &activity);
+    } else if view_all {
+        app.runs_ui.show_plugin_work();
+        app.view = View::Runs;
+    }
+    true
+}
+
+pub(crate) fn plugin_activity_color(state: super::plugin_page::PluginActivityState) -> egui::Color32 {
+    match state {
+        super::plugin_page::PluginActivityState::Running => theme::blue(),
+        super::plugin_page::PluginActivityState::Waiting => theme::amber(),
+        super::plugin_page::PluginActivityState::Attention => theme::red(),
+        super::plugin_page::PluginActivityState::Ready => theme::grey(),
+        super::plugin_page::PluginActivityState::Complete => theme::green(),
+    }
 }
 
 /// A request's name: the file it came from, or what the Studio called it.

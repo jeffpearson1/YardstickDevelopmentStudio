@@ -81,6 +81,13 @@ dispatches on `JobKind`:
 - git fetch/pull jobs refresh the ahead/behind status (a pull also rescans recipes and reloads an
   unedited open recipe); shared-sync jobs rescan icons and re-lint.
 
+Plugin work-item stages are written as `Running` before their external process starts. If that
+state cannot be saved, nothing runs. When a plugin work root is first opened in a new Studio
+session, a persisted `Running` stage without a matching live job is reconciled to `Interrupted`;
+completed stages and output files remain intact, and the interrupted stage becomes retryable.
+Clearing a stale work-item lock performs the same recovery. Completion-state write failures are
+reported instead of being silently discarded.
+
 When a writable workspace opens, and on the library's *Refresh*, the Studio runs `git fetch`
 and Yardstick's `Sync-RecipeHarnessSharedContent` (only when `syncSharedContent: true`), each
 switchable in Settings. Production folders are never fetched or synced.
@@ -107,7 +114,7 @@ is `Pass`; it has not tested uninstall, post-uninstall detection or residue.
 3. **Agent extraction (optional).** The batch folder receives `digest.md` (the condensed records), `recipes.md` (the existing recipe ids and names), and `plugins.md` (installed work-item plugins and their declared purpose). The agent writes `agent-items.json`, which replaces the quick-scan items. Each item names Recipe Builder or an installed plugin as its handler; unknown handler ids are rejected back to Recipe Builder. The extract prompt allows writes only inside the batch folder.
 4. **Match.** Item names are normalised and compared with recipe ids and display names (`RecipeMeta`), to tell an *Update* or *Already packaged* item from a *New* one. The match also records whether the recipe's `iconFile` exists.
 5. **Run.** Selected items are queued. Each one becomes an `AgentTask::Create` or `AgentTask::Update` with the ticket context; if an icon was already saved, the agent is told to use it. Status, changed recipes and the log tail are stored on the item. The batch (`batch.json`) is saved after every change, and Running items are reset to Pending when a batch is loaded again.
-   Items routed to a work-item plugin are excluded from recipe authoring and test counts. Sending one creates the plugin item with its ticket and extracted context; plugin items can be returned to Recipe Builder as reusable-recipe requests without deleting the original work item.
+   Items routed to a work-item plugin are excluded from recipe authoring and test counts. Sending one creates the plugin item with its ticket and extracted context and marks the source **Delegated**, not done. Plugin automation rolls running, attention, approval and complete states back into that source item. Both surfaces retain exact contextual navigation instead of creating a second request or returning to an unselected list.
 6. **Test and repair (`workflow.rs`).** Studio runs Lint, Schema, Download, Package,
    DryRun and optionally Live for each authored Development recipe. A recipe failure is
    returned to an `AgentTask::Fix`, then all checks restart. The default limit is five
@@ -366,8 +373,13 @@ new page type needs one (`studio.hostApi` in the manifest says which kit it expe
   (a JSON table, markdown, a file list) bound to files in the folder.
 - **`catalog` pages** probe a connection, search an outside system (a step whose `rows`
   fill a table) and offer per-row actions: run a step, start a work item in another plugin
-  (`handoff.workitem`, which copies files into its `intake` folder), or pre-fill the New
-  Recipe Builder form (`handoff.recipe`).
+  (`host.plugin-workitem`, which copies files into its `intake` folder), or pre-fill the New
+  Recipe Builder form (`host.recipe-builder`). The old `handoff.*` names remain parse aliases.
+- **Host actions** keep Studio-owned controls out of plugin implementations. `page.hostActions`
+  may declare `new-work`, `import`, `refresh`, `work-folder` and `settings`; the host validates
+  that the page can support each one and renders them in the standard chrome. `settings`
+  always opens the plugin's card under global Settings rather than embedding a second settings
+  form. Host API 1-2 manifests with no list retain their inferred legacy actions.
 - **Steps** run as `pwsh -File <script> -StudioInput <input.json> -StudioResult <result.json>`.
   Only those paths are on the command line; settings, parameters, the Studio's version and
   workspace, and any approval go in `input.json`, and the script reports `status`, `summary`,
@@ -377,6 +389,42 @@ new page type needs one (`studio.hostApi` in the manifest says which kit it expe
   (`agent::build_plugin_command`). The prompt carries the Studio's rules, the plugin's
   `INSTRUCTIONS.md`, the task prompt and the results of the steps it takes evidence from; the
   plugin's reference files are copied to `<work item>\.studio\agent`.
+- **Safe pipeline runs** are explicitly opt-in: a task or step declares `automatic: true`.
+  The host walks opted-in stages in manifest order, honors `after`, and starts at most one
+  external process at a time. It never crosses a confirmation/hash gate, local install, or
+  tenant write without returning control to the user. Failure, interruption and an unmet
+  manual prerequisite pause the run. The work item's automation state and note are saved
+  beside its stage records, so a successful approved stage can continue the run and a
+  restarted Studio can recover it without replaying completed work.
+- **Per-row Recipe Builder routing** is a table-panel capability. A panel declares
+  `recipeBuilder.routedRows` and `reviewBefore`; the host pauses an automatic run at
+  that boundary when the active array contains several rows. Moving a row atomically
+  removes it from the plugin's active JSON array, retains the exact row in the declared
+  routed array, and creates a separate Recipe Builder item with its product fields and
+  original ticket context. Rows can be returned until the downstream plugin stage starts.
+  The confirmed review is stored on the work item. An empty active array completes the
+  plugin run without invoking steps that no longer have products to process.
+- **Linked Recipe Builder authoring** reuses the same panel declaration with `authorBefore`,
+  `recipeFolder` and `iconFolder`. At that boundary the host creates or reuses one Recipe
+  Builder item per active row and records the origin in both the batch item and plugin work
+  item. The plugin pipeline waits while authoring or checks run and stops with a direct link
+  when they need attention. A matching passed safe check atomically copies the exact
+  development recipe and referenced icon into the confined plugin work item, marks that
+  product ready, and resumes safe automation. Destination and recipe id are fixed in the
+  linked item so an edit cannot silently redirect synchronization.
+- **Cross-workflow lifecycle** keeps ownership explicit. A Recipe Builder handoff is
+  `Delegated` until its plugin automation reaches `Complete`; stage progress and recovery
+  notes are persisted back into the originating batch even when that list is not open.
+  Plugin work created by Recipe Builder carries its batch id and item index, with a path
+  fallback if rows move. The plugin header returns to that exact item, Recipe Builder opens
+  the exact plugin folder, and each routed product opens its own Recipe Builder row. Generic
+  “continue” and list-level navigation are omitted where a durable relationship exists.
+- **Cross-plugin activity** makes those durable states discoverable outside each plugin tab.
+  A three-second host cache scans resolved work roots, reconciles orphaned `Running` records
+  before presenting them, and classifies work as running, waiting for the user, needing
+  attention, ready to continue or complete. Home shows the most urgent active work; History's
+  Plugin work view filters the complete collection and opens the exact plugin item. Disabled,
+  unconfigured and non-work-item plugins do not contribute misleading entries.
 
 Distribution. Plugin sources live in `plugins\<id>\`; `build.ps1 -Task plugins` runs
 `plugins\Build-Plugins.ps1`, which packs each into `target\plugins\<id>-<version>.zip` plus a
@@ -391,13 +439,15 @@ name the plugin and version the release does. A plugin may name another reposito
 startup* is on) and on demand. A core test packs the sample plugin with the script and installs the
 result, so the packer and the Studio's validator cannot drift apart.
 
-Shipped plugins. **One-Off Packager** is a `workitems` plugin: a ticket folder with the
-pipeline in `plugin.yaml`; its scripts share `StudioPlugin.psm1` (the input/result protocol and
+Shipped plugins. **One-Off Packager** is a `workitems` plugin: its agent owns ticket triage,
+Recipe Builder owns recipe research/authoring/safe repair, and the plugin pipeline owns the
+isolated runtime, lifecycle test, package and Intune change. The ticket folder and stages are
+declared in `plugin.yaml`; its scripts share `StudioPlugin.psm1` (the input/result protocol and
 approval check) and `OneOffPackager.psm1` (inventory, packaging, change set and the resumable live
 change, with every tenant, group and path coming in as a setting or from the work item).
 **SCCM App Migration** is a `catalog` plugin: a connection check, a search whose rows fill the table,
-and per-row steps (export, copy content) and handoffs (`handoff.workitem` to the One-Off Packager,
-`handoff.recipe` into Recipe Builder's new-recipe form). A handoff's `files` may end in `?` for "if present", and
+and per-row steps (export, copy content) and host integrations (`host.plugin-workitem` to the One-Off Packager,
+`host.recipe-builder` into Recipe Builder's new-recipe form). A handoff's `files` may end in `?` for "if present", and
 folders are hard-linked where possible. The SCCM scripts only ever `SELECT`: a test fails the build if
 one calls a cmdlet that could change the site. Each plugin is a self-contained package, so
 `StudioPlugin.psm1` is duplicated, and a test checks the copies are identical.

@@ -1,15 +1,15 @@
 schema: 1
 id: sccm-migration
 name: SCCM App Migration
-version: 1.0.0
+version: 1.1.0
 publisher: Yardstick contributors
 description: Browse the applications in a Configuration Manager site and migrate one to Intune, either as a one-off package built from its content or as a Yardstick recipe. Read-only towards Configuration Manager.
 icon: E968
-studio: { minVersion: 0.6.0, hostApi: 1 }
+studio: { minVersion: 0.7.0, hostApi: 3 }
 source: { github: jeffpearson1/YardstickDevelopmentStudio, tagPrefix: plugin-sccm-migration-v }
 requires:
   plugins:
-    - { id: oneoff-packager, minVersion: 1.0.1 }
+    - { id: oneoff-packager, minVersion: 1.5.0 }
 settings:
   - key: smsProvider
     label: SMS Provider server
@@ -39,6 +39,7 @@ settings:
     help: Copying more than this is refused.
 page:
   type: catalog
+  hostActions: [work-folder, settings]
   noun: Application
   probe: connect
   query: search
@@ -87,12 +88,12 @@ actions:
   - id: to-oneoff
     label: Package as one-off
     description: Starts a One-Off Packager ticket from this export, with the copied content as the payload.
-    kind: handoff.workitem
+    kind: host.plugin-workitem
     plugin: oneoff-packager
     title: "SCCM migration: {name}"
     files: [export.md, sccm-export.json, intune-mapping.json, "icon.png?", "source-manifest.json?", "source?"]
   - id: to-recipe
-    label: Draft a Yardstick recipe
-    description: Opens the New recipe dialog with this application's details, for the recipe agent to research.
-    kind: handoff.recipe
+    label: Start in Recipe Builder
+    description: Opens Recipe Builder with this application's exported details, ready for its normal authoring and checks.
+    kind: host.recipe-builder
     notesFile: export.md

@@ -28,7 +28,7 @@ use crate::update::{Release, is_newer};
 
 /// The page and widget kit this Studio provides. A manifest asking for more
 /// needs a newer Studio.
-pub const HOST_API: u32 = 1;
+pub const HOST_API: u32 = 3;
 pub const MANIFEST: &str = "plugin.yaml";
 pub const WORK_ITEM_FILE: &str = "work-item.json";
 /// Every plugin declares this folder setting; work items live under it.
@@ -190,6 +190,30 @@ pub struct PageDef {
     /// Defaults to the order `after` implies, ties in declaration order.
     #[serde(default)]
     pub pipeline: Vec<String>,
+    /// Studio-owned actions rendered in the standard plugin chrome.
+    /// An empty list preserves the actions inferred by host API 1-2.
+    #[serde(default)]
+    pub host_actions: Vec<HostAction>,
+}
+
+impl PageDef {
+    pub fn effective_host_actions(&self) -> Vec<HostAction> {
+        if !self.host_actions.is_empty() {
+            return self.host_actions.clone();
+        }
+        let mut actions = Vec::new();
+        if self.kind == PageKind::Workitems {
+            if !self.intake.is_empty() {
+                actions.push(HostAction::NewWork);
+            }
+            if self.importer.is_some() {
+                actions.push(HostAction::Import);
+            }
+            actions.push(HostAction::Refresh);
+        }
+        actions.extend([HostAction::WorkFolder, HostAction::Settings]);
+        actions
+    }
 }
 
 fn default_noun() -> String {
@@ -209,6 +233,16 @@ pub enum PageKind {
     Catalog,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HostAction {
+    NewWork,
+    Import,
+    Refresh,
+    WorkFolder,
+    Settings,
+}
+
 /// A read-only view of files in the selected work item.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PanelDef {
@@ -226,7 +260,33 @@ pub struct PanelDef {
     /// Work-item-relative globs (files).
     #[serde(default)]
     pub globs: Vec<String>,
+    /// Lets a work-item table route individual rows into Recipe Builder.
+    /// Routed rows move out of `rows` and into `routedRows`, so plugin steps
+    /// naturally operate only on the rows that remain.
+    #[serde(default, rename = "recipeBuilder")]
+    pub recipe_builder: Option<RecipeBuilderRouteDef>,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeBuilderRouteDef {
+    /// A top-level JSON array in the panel file that retains routed rows.
+    pub routed_rows: String,
+    /// Automatic execution pauses before this stage while a multi-row ticket
+    /// still needs a routing decision.
+    pub review_before: String,
+    /// Before this stage, every active row must have a Recipe Builder recipe
+    /// whose safe checks passed and whose exact contents were synced back.
+    #[serde(default)]
+    pub author_before: String,
+    #[serde(default = "default_recipe_folder")]
+    pub recipe_folder: String,
+    #[serde(default = "default_icon_folder")]
+    pub icon_folder: String,
+}
+
+fn default_recipe_folder() -> String { "recipes".into() }
+fn default_icon_folder() -> String { "icons".into() }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -234,6 +294,77 @@ pub enum PanelKind {
     Table,
     Markdown,
     Files,
+}
+
+fn top_level_pointer(pointer: &str) -> Option<&str> {
+    let key = pointer.strip_prefix('/')?;
+    (!key.is_empty() && !key.contains('/') && key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))).then_some(key)
+}
+
+fn rows_at(dir: &Path, panel: &PanelDef, pointer: &str) -> Result<Vec<Value>> {
+    let file = panel.file.as_deref().ok_or_else(|| anyhow!("panel '{}' has no file", panel.title))?;
+    let path = dir.join(file);
+    let text = crate::read_text(&path).with_context(|| format!("reading {}", path.display()))?;
+    let document: Value = serde_json::from_str(&text).with_context(|| format!("reading {}", path.display()))?;
+    match document.pointer(pointer) {
+        Some(Value::Array(rows)) => Ok(rows.clone()),
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(_) => bail!("{} {} is not an array", path.display(), pointer),
+    }
+}
+
+fn panel_row_count(dir: &Path, panel: &PanelDef) -> Option<usize> {
+    rows_at(dir, panel, panel.rows.as_deref()?).ok().map(|rows| rows.len())
+}
+
+pub fn active_panel_rows(dir: &Path, panel: &PanelDef) -> Result<Vec<Value>> {
+    let pointer = panel.rows.as_deref().ok_or_else(|| anyhow!("panel '{}' has no rows", panel.title))?;
+    rows_at(dir, panel, pointer)
+}
+
+pub fn panel_recipe_id(row: &Value) -> String {
+    let field = |name: &str| row.get(name).and_then(Value::as_str).unwrap_or_default().trim();
+    let id = field("id");
+    if !id.is_empty() {
+        id.to_string()
+    } else if !field("recipeId").is_empty() {
+        field("recipeId").to_string()
+    } else {
+        crate::recipe::suggest_id([field("name"), field("title"), field("app")].into_iter().find(|value| !value.is_empty()).unwrap_or_default())
+    }
+}
+
+pub fn routed_panel_rows(dir: &Path, panel: &PanelDef) -> Result<Vec<Value>> {
+    let routing = panel.recipe_builder.as_ref().ok_or_else(|| anyhow!("panel '{}' has no Recipe Builder routing", panel.title))?;
+    rows_at(dir, panel, &routing.routed_rows)
+}
+
+/// Atomically moves one table row between a plugin's active and Recipe
+/// Builder-retained arrays. Returns the row that moved.
+pub fn move_panel_row(dir: &Path, panel: &PanelDef, index: usize, to_recipe_builder: bool) -> Result<Value> {
+    let file = panel.file.as_deref().ok_or_else(|| anyhow!("panel '{}' has no file", panel.title))?;
+    let active = panel.rows.as_deref().and_then(top_level_pointer).ok_or_else(|| anyhow!("panel '{}' has no routable rows", panel.title))?;
+    let routing = panel.recipe_builder.as_ref().ok_or_else(|| anyhow!("panel '{}' has no Recipe Builder routing", panel.title))?;
+    let routed = top_level_pointer(&routing.routed_rows).ok_or_else(|| anyhow!("panel '{}' has invalid routedRows", panel.title))?;
+    let (from, to) = if to_recipe_builder { (active, routed) } else { (routed, active) };
+    anyhow::ensure!(from != to, "panel '{}' routes rows back into the same array", panel.title);
+
+    let path = dir.join(file);
+    let text = crate::read_text(&path).with_context(|| format!("reading {}", path.display()))?;
+    let mut document: Value = serde_json::from_str(&text).with_context(|| format!("reading {}", path.display()))?;
+    let object = document.as_object_mut().ok_or_else(|| anyhow!("{} must contain a JSON object", path.display()))?;
+    let row = {
+        let source = object.get_mut(from).and_then(Value::as_array_mut).ok_or_else(|| anyhow!("{} /{} is not an array", path.display(), from))?;
+        anyhow::ensure!(index < source.len(), "row {} no longer exists in panel '{}'", index + 1, panel.title);
+        source.remove(index)
+    };
+    let destination = object.entry(to.to_string()).or_insert_with(|| Value::Array(Vec::new()));
+    destination.as_array_mut().ok_or_else(|| anyhow!("{} /{} is not an array", path.display(), to))?.push(row.clone());
+
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&document)?).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("saving {}", path.display()))?;
+    Ok(row)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -266,6 +397,10 @@ pub struct AgentTaskDef {
     /// Steps whose latest results are passed to the agent as evidence.
     #[serde(default)]
     pub evidence_from: Vec<String>,
+    /// The host may run this task as part of "Run safe stages". Tasks are
+    /// manual unless the plugin opts in explicitly.
+    #[serde(default)]
+    pub automatic: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -288,6 +423,10 @@ pub struct StepDef {
     pub gate: Gate,
     #[serde(default)]
     pub scope: Scope,
+    /// The host may run this step as part of "Run safe stages". Approval and
+    /// high-risk boundaries still always pause automation.
+    #[serde(default)]
+    pub automatic: bool,
 }
 
 impl StepDef {
@@ -408,6 +547,37 @@ impl<'a> Stage<'a> {
             Stage::Step(s) => &s.after,
         }
     }
+
+    pub fn automatic(&self) -> bool {
+        match self {
+            Stage::Task(t) => t.automatic,
+            Stage::Step(s) => s.automatic,
+        }
+    }
+
+    /// Automation never crosses a user-consent boundary, even if a plugin
+    /// accidentally marks the stage automatic.
+    pub fn needs_user_action(&self) -> bool {
+        match self {
+            Stage::Task(_) => false,
+            Stage::Step(s) => s.gate != Gate::None || matches!(s.risk, Risk::LocalInstall | Risk::TenantWrite),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum AutomationNext<'a> {
+    Run(Stage<'a>),
+    UserAction(Stage<'a>),
+    RoutingReview(&'a PanelDef, usize),
+    RoutedComplete(&'a PanelDef),
+    RecipeWorkNeeded(&'a PanelDef, Vec<String>),
+    RecipeWorkWaiting(&'a PanelDef, Vec<String>),
+    RecipeWorkStopped(&'a PanelDef, Vec<String>),
+    Waiting(Stage<'a>, Vec<String>),
+    Stopped(Stage<'a>, StepState),
+    Running(Stage<'a>),
+    Complete,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -428,16 +598,16 @@ pub enum ActionKind {
     #[serde(rename = "step")]
     Step { step: String },
     /// Starts a work item in another plugin, copying `files` into its `intake`.
-    #[serde(rename = "handoff.workitem")]
-    HandoffWorkItem {
+    #[serde(rename = "host.plugin-workitem", alias = "handoff.workitem")]
+    HostPluginWorkItem {
         plugin: String,
         files: Vec<String>,
         #[serde(default)]
         title: String,
     },
     /// Opens the Studio's recipe agent with notes from `notesFile`.
-    #[serde(rename = "handoff.recipe", rename_all = "camelCase")]
-    HandoffRecipe { notes_file: String },
+    #[serde(rename = "host.recipe-builder", alias = "handoff.recipe", rename_all = "camelCase")]
+    HostRecipeBuilder { notes_file: String },
 }
 
 impl Manifest {
@@ -481,6 +651,78 @@ impl Manifest {
             out.push(stage);
         }
         out
+    }
+
+    pub fn has_automatic_stages(&self) -> bool {
+        self.pipeline().iter().any(Stage::automatic)
+    }
+
+    /// The next explicitly automatic stage, respecting display order and
+    /// dependencies. Manual stages are skipped unless an automatic stage
+    /// names one as a prerequisite.
+    pub fn next_automatic<'a>(&'a self, item: &WorkItem) -> AutomationNext<'a> {
+        for stage in self.pipeline().into_iter().filter(Stage::automatic) {
+            let state = item.step(stage.id()).state;
+            if matches!(state, StepState::Ok | StepState::Warn) {
+                continue;
+            }
+            if state == StepState::Running {
+                return AutomationNext::Running(stage);
+            }
+            if matches!(state, StepState::Interrupted | StepState::Fail | StepState::Blocked) {
+                return AutomationNext::Stopped(stage, state);
+            }
+            let unmet: Vec<String> = stage.after().iter().filter(|id| !item.satisfied(std::slice::from_ref(id))).cloned().collect();
+            if !unmet.is_empty() {
+                return AutomationNext::Waiting(stage, unmet);
+            }
+            if let Some(panel) = self.page.panels.iter().find(|panel| {
+                panel.recipe_builder.as_ref().is_some_and(|routing| routing.review_before == stage.id())
+            })
+                && !item.meta.routing_reviews.contains(&panel.title)
+                && let Some(count) = panel_row_count(&item.dir, panel)
+            {
+                if count == 0 {
+                    return AutomationNext::RoutedComplete(panel);
+                }
+                let routed = routed_panel_rows(&item.dir, panel).map(|rows| rows.len()).unwrap_or(0);
+                if count > 1 || routed > 0 {
+                    return AutomationNext::RoutingReview(panel, count);
+                }
+            }
+            if let Some(panel) = self.page.panels.iter().find(|panel| {
+                panel.recipe_builder.as_ref().is_some_and(|routing| routing.author_before == stage.id())
+            })
+                && let Ok(rows) = active_panel_rows(&item.dir, panel)
+            {
+                let ids: Vec<String> = rows.iter().map(panel_recipe_id).filter(|id| !id.is_empty()).collect();
+                let missing: Vec<String> = ids.iter().filter(|id| !item.meta.recipe_work.contains_key(*id)).cloned().collect();
+                if !missing.is_empty() {
+                    return AutomationNext::RecipeWorkNeeded(panel, missing);
+                }
+                let failed: Vec<String> = ids
+                    .iter()
+                    .filter(|id| item.meta.recipe_work.get(*id).is_some_and(|record| record.state == RecipeWorkState::Failed))
+                    .cloned()
+                    .collect();
+                if !failed.is_empty() {
+                    return AutomationNext::RecipeWorkStopped(panel, failed);
+                }
+                let waiting: Vec<String> = ids
+                    .iter()
+                    .filter(|id| !item.meta.recipe_work.get(*id).is_some_and(|record| record.state == RecipeWorkState::Ready))
+                    .cloned()
+                    .collect();
+                if !waiting.is_empty() {
+                    return AutomationNext::RecipeWorkWaiting(panel, waiting);
+                }
+            }
+            if stage.needs_user_action() {
+                return AutomationNext::UserAction(stage);
+            }
+            return AutomationNext::Run(stage);
+        }
+        AutomationNext::Complete
     }
 
     /// Why this Studio cannot run the plugin, if it can't.
@@ -623,6 +865,27 @@ impl Manifest {
         if self.page.kind == PageKind::Catalog && self.page.query.is_none() {
             p("a catalog page needs a query step".into());
         }
+        let mut host_actions = BTreeSet::new();
+        for action in &self.page.host_actions {
+            if !host_actions.insert(*action) {
+                p(format!("page hostActions contains duplicate '{action:?}'"));
+            }
+            match action {
+                HostAction::NewWork if self.page.kind != PageKind::Workitems => {
+                    p("page host action 'new-work' is available only on work-item pages".into());
+                }
+                HostAction::NewWork if self.page.intake.is_empty() => {
+                    p("page host action 'new-work' needs at least one intake type".into());
+                }
+                HostAction::Import if self.page.kind != PageKind::Workitems || self.page.importer.is_none() => {
+                    p("page host action 'import' needs a work-item page importer".into());
+                }
+                HostAction::Refresh if self.page.kind != PageKind::Workitems => {
+                    p("page host action 'refresh' is available only on work-item pages".into());
+                }
+                _ => {}
+            }
+        }
         for panel in &self.page.panels {
             let rel = panel.file.iter().chain(&panel.globs);
             if rel.clone().any(|f| !safe_relative(f)) {
@@ -631,12 +894,35 @@ impl Manifest {
             if matches!(panel.kind, PanelKind::Table | PanelKind::Markdown) && panel.file.is_none() {
                 p(format!("panel '{}' needs a file", panel.title));
             }
+            if let Some(routing) = &panel.recipe_builder {
+                if panel.kind != PanelKind::Table {
+                    p(format!("panel '{}' can route to Recipe Builder only when it is a table", panel.title));
+                }
+                if panel.rows.as_deref().and_then(top_level_pointer).is_none() {
+                    p(format!("panel '{}' needs a top-level rows pointer for Recipe Builder routing", panel.title));
+                }
+                if top_level_pointer(&routing.routed_rows).is_none() {
+                    p(format!("panel '{}' routedRows must be a top-level JSON pointer", panel.title));
+                }
+                if self.task(&routing.review_before).is_none() && self.step(&routing.review_before).is_none() {
+                    p(format!("panel '{}' reviews routing before unknown stage '{}'", panel.title, routing.review_before));
+                }
+                if !routing.author_before.is_empty()
+                    && self.task(&routing.author_before).is_none()
+                    && self.step(&routing.author_before).is_none()
+                {
+                    p(format!("panel '{}' waits for Recipe Builder before unknown stage '{}'", panel.title, routing.author_before));
+                }
+                if !safe_relative(&routing.recipe_folder) || !safe_relative(&routing.icon_folder) {
+                    p(format!("panel '{}' Recipe Builder folders must be relative paths", panel.title));
+                }
+            }
         }
 
         for a in &self.actions {
             match &a.kind {
                 ActionKind::Step { step } if self.step(step).is_none() => p(format!("action {} runs unknown step '{step}'", a.id)),
-                ActionKind::HandoffWorkItem { plugin, files, .. } => {
+                ActionKind::HostPluginWorkItem { plugin, files, .. } => {
                     if !self.requires.plugins.iter().any(|r| &r.id == plugin) {
                         p(format!("action {} hands off to '{plugin}', which is not in requires.plugins", a.id));
                     }
@@ -644,7 +930,7 @@ impl Manifest {
                         p(format!("action {} file paths must be relative", a.id));
                     }
                 }
-                ActionKind::HandoffRecipe { notes_file } if !safe_relative(notes_file) => p(format!("action {} notesFile must be relative", a.id)),
+                ActionKind::HostRecipeBuilder { notes_file } if !safe_relative(notes_file) => p(format!("action {} notesFile must be relative", a.id)),
                 _ => {}
             }
         }
@@ -1162,10 +1448,53 @@ pub enum StepState {
     #[default]
     NotRun,
     Running,
+    /// The Studio closed or lost contact with a stage that had been running.
+    /// The user may review its outputs and retry it.
+    Interrupted,
     Ok,
     Warn,
     Fail,
     Blocked,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutomationState {
+    #[default]
+    Idle,
+    Running,
+    AwaitingAction,
+    Paused,
+    Complete,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AutomationRecord {
+    pub state: AutomationState,
+    pub started: String,
+    pub updated: String,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecipeWorkState {
+    #[default]
+    Pending,
+    Running,
+    Failed,
+    Ready,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RecipeWorkRecord {
+    pub state: RecipeWorkState,
+    pub batch_id: String,
+    pub recipe_id: String,
+    pub note: String,
+    pub updated: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1198,6 +1527,13 @@ pub struct WorkItemMeta {
     pub created: String,
     pub origin: Origin,
     pub steps: BTreeMap<String, StepRecord>,
+    pub automation: AutomationRecord,
+    /// Table-panel titles whose multi-row routing decision was confirmed.
+    pub routing_reviews: BTreeSet<String>,
+    /// Recipe Builder work linked by the plugin table row's recipe/product id.
+    pub recipe_work: BTreeMap<String, RecipeWorkRecord>,
+    /// Recipe Builder list ids for products routed out of this work item.
+    pub routed_recipe_work: BTreeMap<String, String>,
 }
 
 /// One unit of work: a folder under the plugin's work root.
@@ -1228,6 +1564,10 @@ impl WorkItem {
                 created: crate::intake::utc_timestamp(now),
                 origin,
                 steps: BTreeMap::new(),
+                automation: AutomationRecord::default(),
+                routing_reviews: BTreeSet::new(),
+                recipe_work: BTreeMap::new(),
+                routed_recipe_work: BTreeMap::new(),
             },
         };
         item.save()?;
@@ -1278,6 +1618,29 @@ impl WorkItem {
 
     pub fn step(&self, id: &str) -> StepRecord {
         self.meta.steps.get(id).cloned().unwrap_or_default()
+    }
+
+    /// Converts persisted `Running` records that have no matching live job to
+    /// `Interrupted`. `active` is the one stage the current Studio process is
+    /// still running in this item, if any. Returns whether metadata changed.
+    pub fn reconcile_running(&mut self, active: Option<&str>, now: SystemTime) -> bool {
+        let mut changed = false;
+        for (id, record) in &mut self.meta.steps {
+            if record.state != StepState::Running || active == Some(id.as_str()) {
+                continue;
+            }
+            record.state = StepState::Interrupted;
+            record.finished = crate::intake::utc_timestamp(now);
+            record.summary = "The Studio closed or lost contact before this stage finished. Review any outputs, then retry it.".into();
+            changed = true;
+        }
+        if self.meta.automation.state == AutomationState::Running && active.is_none() {
+            self.meta.automation.state = AutomationState::Paused;
+            self.meta.automation.updated = crate::intake::utc_timestamp(now);
+            self.meta.automation.note = "The automatic run was interrupted. Review any outputs, then continue the safe stages.".into();
+            changed = true;
+        }
+        changed
     }
 
     /// Whether everything `ids` names has finished well enough to go on.
@@ -1806,7 +2169,7 @@ mod tests {
     use std::io::Write as _;
     use std::time::Duration;
 
-    const VERSION: &str = "0.6.0";
+    const VERSION: &str = "0.7.0";
 
     fn fixture() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("plugins").join("sample")
@@ -1855,9 +2218,15 @@ mod tests {
         assert_eq!(m.step("approve").unwrap().gate, Gate::Hash { file: "change.json".into(), summary: Some("change.md".into()) });
         assert_eq!(m.step("echo").unwrap().gate, Gate::None);
         assert!(m.incompatibility(VERSION).is_none());
-        assert!(m.incompatibility("0.5.2").unwrap().contains("0.6.0"));
+        assert!(m.incompatibility("0.6.1").unwrap().contains("0.7.0"));
         let order: Vec<&str> = m.pipeline().iter().map(|s| s.id()).collect();
         assert_eq!(order, ["triage", "echo", "confirmed", "approve"]);
+        assert_eq!(
+            m.page.effective_host_actions(),
+            [HostAction::NewWork, HostAction::Refresh, HostAction::WorkFolder, HostAction::Settings],
+        );
+        let legacy = Manifest::parse(&fixture_manifest().replace("  hostActions: [new-work, refresh, work-folder, settings]\n", "")).unwrap();
+        assert_eq!(legacy.page.effective_host_actions(), m.page.effective_host_actions());
         let explicit = Manifest::parse(&fixture_manifest().replace("  intake: [text, files]", "  intake: [text, files]\n  pipeline: [confirmed, triage]")).unwrap();
         assert_eq!(explicit.pipeline().iter().map(|s| s.id()).collect::<Vec<_>>(), ["confirmed", "triage"]);
         assert!(invalid(&fixture_manifest().replace("  intake: [text, files]", "  intake: [text, files]\n  pipeline: [nope]")).contains("pipeline lists 'nope'"));
@@ -1879,6 +2248,8 @@ mod tests {
             ("key: workRoot", "key: root", "'workRoot' is required"),
             ("risk: tenant-write\n    gate: { kind: hash, file: change.json, summary: change.md }", "risk: tenant-write\n    gate: confirm", "must have a hash gate"),
             ("plugin: other-plugin", "plugin: stranger", "not in requires.plugins"),
+            ("hostActions: [new-work, refresh, work-folder, settings]", "hostActions: [import, work-folder, settings]", "needs a work-item page importer"),
+            ("hostActions: [new-work, refresh, work-folder, settings]", "hostActions: [settings, settings]", "duplicate"),
         ];
         for (from, to, expect) in cases {
             assert!(base.contains(from), "fixture lacks {from}");
@@ -1890,8 +2261,8 @@ mod tests {
             assert!(err.contains(expect), "{to}: {err}");
         }
         assert!(invalid(&base.replace("id: echo\n", "id: triage\n")).contains("duplicate"));
-        let newer = Manifest::parse(&base.replace("hostApi: 1", "hostApi: 2")).unwrap();
-        assert!(newer.incompatibility(VERSION).unwrap().contains("plugin API 2"));
+        let newer = Manifest::parse(&base.replace("hostApi: 3", "hostApi: 4")).unwrap();
+        assert!(newer.incompatibility(VERSION).unwrap().contains("plugin API 4"));
     }
 
     #[test]
@@ -1960,7 +2331,7 @@ mod tests {
         let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         w.start_file("readme.md", zip::write::SimpleFileOptions::default()).unwrap();
         assert!(Package::from_bytes(&w.finish().unwrap().into_inner()).unwrap_err().to_string().contains("no plugin.yaml"));
-        let incompatible = fixture_manifest().replace("hostApi: 1", "hostApi: 9");
+        let incompatible = fixture_manifest().replace("hostApi: 3", "hostApi: 9");
         let pkg = Package::from_bytes(&zip_dir(&fixture(), None, Some(&incompatible), &[])).unwrap();
         assert!(install(&pkg, tempfile::tempdir().unwrap().path(), VERSION, "x", false).is_err());
     }
@@ -1993,6 +2364,124 @@ mod tests {
         assert_eq!(Lock::holder(&item.dir).unwrap().purpose, "Echo");
         drop(lock);
         assert!(Lock::acquire(&item.dir, "again").is_ok());
+    }
+
+    #[test]
+    fn orphaned_running_stages_become_retryable_interruptions() {
+        let d = tempfile::tempdir().unwrap();
+        let started = SystemTime::UNIX_EPOCH + Duration::from_secs(1_794_600_000);
+        let recovered = started + Duration::from_secs(60);
+        let mut item = WorkItem::create(d.path(), "{date}-{slug}", "Interrupted", "", Origin::default(), started).unwrap();
+        item.meta.steps.insert("active".into(), StepRecord { state: StepState::Running, started: "earlier".into(), ..Default::default() });
+        item.meta.steps.insert("orphan".into(), StepRecord { state: StepState::Running, started: "earlier".into(), ..Default::default() });
+        item.meta.steps.insert("done".into(), StepRecord { state: StepState::Ok, summary: "kept".into(), ..Default::default() });
+        item.meta.automation = AutomationRecord { state: AutomationState::Running, started: "earlier".into(), ..Default::default() };
+
+        assert!(item.reconcile_running(Some("active"), recovered));
+        assert_eq!(item.step("active").state, StepState::Running);
+        assert_eq!(item.step("orphan").state, StepState::Interrupted);
+        assert!(item.step("orphan").summary.contains("retry"));
+        assert!(!item.step("orphan").finished.is_empty());
+        assert_eq!(item.step("done").summary, "kept");
+        assert_eq!(item.meta.automation.state, AutomationState::Running, "a live stage keeps its automatic run active");
+        assert!(!item.reconcile_running(Some("active"), recovered), "reconciliation is idempotent");
+        assert!(!item.satisfied(&["orphan".into()]));
+
+        assert!(item.reconcile_running(None, recovered));
+        assert_eq!(item.step("active").state, StepState::Interrupted);
+        assert_eq!(item.meta.automation.state, AutomationState::Paused);
+        assert!(item.meta.automation.note.contains("interrupted"));
+    }
+
+    #[test]
+    fn automatic_pipeline_stops_at_manual_and_consent_boundaries() {
+        let mut manifest = Manifest::parse(&fixture_manifest()).unwrap();
+        manifest.agent.as_mut().unwrap().tasks[0].automatic = true;
+        for step in &mut manifest.steps {
+            step.automatic = true;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let mut item = WorkItem::create(d.path(), "{date}-{slug}", "Automatic", "", Origin::default(), SystemTime::now()).unwrap();
+
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::Run(Stage::Task(task)) if task.id == "triage"));
+        item.meta.steps.insert("triage".into(), StepRecord { state: StepState::Ok, ..Default::default() });
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::Run(Stage::Step(step)) if step.id == "echo"));
+        item.meta.steps.insert("echo".into(), StepRecord { state: StepState::Ok, ..Default::default() });
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::UserAction(Stage::Step(step)) if step.id == "confirmed"));
+        item.meta.steps.insert("confirmed".into(), StepRecord { state: StepState::Ok, ..Default::default() });
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::UserAction(Stage::Step(step)) if step.id == "approve"));
+        item.meta.steps.insert("approve".into(), StepRecord { state: StepState::Ok, ..Default::default() });
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::Complete));
+
+        item.meta.steps.insert("echo".into(), StepRecord { state: StepState::Interrupted, ..Default::default() });
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::Stopped(Stage::Step(step), StepState::Interrupted) if step.id == "echo"));
+
+        manifest.agent.as_mut().unwrap().tasks[0].automatic = false;
+        item.meta.steps.remove("triage");
+        item.meta.steps.remove("echo");
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::Waiting(Stage::Step(step), unmet) if step.id == "echo" && unmet == ["triage"]));
+    }
+
+    #[test]
+    fn multi_row_routing_pauses_automation_and_moves_rows_reversibly() {
+        let mut manifest = Manifest::parse(&fixture_manifest()).unwrap();
+        manifest.agent.as_mut().unwrap().tasks[0].automatic = true;
+        manifest.steps[0].automatic = true;
+        manifest.page.panels.insert(0, serde_yaml::from_str(
+            "type: table\ntitle: Products\nfile: products.json\nrows: /products\ncolumns: [name]\nrecipeBuilder:\n  routedRows: /routedProducts\n  reviewBefore: echo\n",
+        ).unwrap());
+        let panel = &manifest.page.panels[0];
+        let d = tempfile::tempdir().unwrap();
+        let mut item = WorkItem::create(d.path(), "{date}-{slug}", "Mixed ticket", "", Origin::default(), SystemTime::now()).unwrap();
+        std::fs::write(item.dir.join("products.json"), r#"{"products":[{"id":"one","name":"One"},{"id":"two","name":"Two"}]}"#).unwrap();
+
+        item.meta.steps.insert("triage".into(), StepRecord { state: StepState::Ok, ..Default::default() });
+        assert_eq!(panel_row_count(&item.dir, panel), Some(2));
+        assert_eq!(panel.recipe_builder.as_ref().unwrap().review_before, "echo");
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::RoutingReview(p, 2) if p.title == "Products"));
+        item.meta.routing_reviews.insert("Products".into());
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::Run(Stage::Step(step)) if step.id == "echo"));
+
+        item.meta.routing_reviews.clear();
+        let moved = move_panel_row(&item.dir, panel, 0, true).unwrap();
+        assert_eq!(moved["id"], "one");
+        assert_eq!(panel_row_count(&item.dir, panel), Some(1));
+        assert_eq!(routed_panel_rows(&item.dir, panel).unwrap().len(), 1);
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::RoutingReview(_, 1)), "routing one product still needs confirmation for the remaining product");
+        item.meta.routing_reviews.insert("Products".into());
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::Run(Stage::Step(step)) if step.id == "echo"));
+
+        item.meta.routing_reviews.clear();
+        move_panel_row(&item.dir, panel, 0, true).unwrap();
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::RoutedComplete(p) if p.title == "Products"));
+        let restored = move_panel_row(&item.dir, panel, 0, false).unwrap();
+        assert_eq!(restored["id"], "one");
+        assert_eq!(panel_row_count(&item.dir, panel), Some(1));
+    }
+
+    #[test]
+    fn automatic_pipeline_waits_for_linked_recipe_builder_work() {
+        let mut manifest = Manifest::parse(&fixture_manifest()).unwrap();
+        manifest.agent.as_mut().unwrap().tasks[0].automatic = true;
+        manifest.steps[0].automatic = true;
+        manifest.steps[1].automatic = true;
+        manifest.page.panels.insert(0, serde_yaml::from_str(
+            "type: table\ntitle: Products\nfile: products.json\nrows: /products\ncolumns: [name]\nrecipeBuilder:\n  routedRows: /routedProducts\n  reviewBefore: echo\n  authorBefore: confirmed\n  recipeFolder: recipes\n  iconFolder: icons\n",
+        ).unwrap());
+        let d = tempfile::tempdir().unwrap();
+        let mut item = WorkItem::create(d.path(), "{date}-{slug}", "Recipe work", "", Origin::default(), SystemTime::now()).unwrap();
+        std::fs::write(item.dir.join("products.json"), r#"{"products":[{"id":"one","name":"One"}]}"#).unwrap();
+        for stage in ["triage", "echo"] {
+            item.meta.steps.insert(stage.into(), StepRecord { state: StepState::Ok, ..Default::default() });
+        }
+
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::RecipeWorkNeeded(panel, ids) if panel.title == "Products" && ids == ["one"]));
+        item.meta.recipe_work.insert("one".into(), RecipeWorkRecord { state: RecipeWorkState::Pending, ..Default::default() });
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::RecipeWorkWaiting(_, ids) if ids == ["one"]));
+        item.meta.recipe_work.get_mut("one").unwrap().state = RecipeWorkState::Failed;
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::RecipeWorkStopped(_, ids) if ids == ["one"]));
+        item.meta.recipe_work.get_mut("one").unwrap().state = RecipeWorkState::Ready;
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::UserAction(Stage::Step(step)) if step.id == "confirmed"));
     }
 
     #[test]

@@ -1,5 +1,7 @@
 Read `ticket.md`, `parsed-ticket.json` and anything in `intake/`. Then write `products.json`: one entry for each separate piece of software the ticket asks for.
 
+If `products.json` already contains `routedProducts`, preserve that array exactly and do not put those product IDs back into `products`. The user routed them to Recipe Builder in Studio.
+
 First read `.studio\agent\references\workflow.md`, section 1.
 
 ## How to read the ticket
@@ -42,4 +44,4 @@ When `intake\sccm-export.json` exists the request is one application: write exac
 - `requestedGroupId`: `null` unless the ticket names an approved Entra group by object ID.
 - Leave `status` as `needs-research` for every product at this stage.
 
-Write `products.json` and nothing else. If the ticket contains no software request, write `{ "products": [] }` and say why in your report.
+Write `products.json` and nothing else. Preserve `routedProducts` when it exists. If the ticket contains no software request, write `{ "products": [] }` and say why in your report.

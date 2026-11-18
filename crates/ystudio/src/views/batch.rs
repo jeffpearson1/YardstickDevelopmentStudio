@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 use eframe::egui::{self, RichText, Ui};
 use ystudio_core::agent::{self, AgentTask, Snapshot};
 use ystudio_core::icons;
-use ystudio_core::intake::{self, Batch, BatchCheck, BatchItem, ItemAction, ItemStatus, RequestKind};
+use ystudio_core::intake::{self, Batch, BatchCheck, BatchItem, ItemAction, ItemStatus, PluginRecipeOrigin, RequestKind};
+use ystudio_core::plugin::{self, RecipeWorkRecord, RecipeWorkState, WorkItem};
 use ystudio_core::recipe::{self, RecipeDoc};
+use ystudio_core::workspace::RecipeLocation;
 
 use crate::app::{JobKind, StudioApp, View, job_log};
 use crate::theme::{self, FluentText as _};
@@ -103,6 +105,12 @@ fn append_items(app: &mut StudioApp, items: Vec<BatchItem>) -> Vec<usize> {
                 existing.notes.push_str(item.notes.trim());
                 changed = true;
             }
+            for origin in item.plugin_origins {
+                if !existing.plugin_origins.contains(&origin) {
+                    existing.plugin_origins.push(origin);
+                    changed = true;
+                }
+            }
             continue;
         }
         let n = batch.items.len();
@@ -122,24 +130,224 @@ fn append_items(app: &mut StudioApp, items: Vec<BatchItem>) -> Vec<usize> {
     added
 }
 
-/// Brings a plugin work item back into the reusable-recipe workflow.
-pub fn add_plugin_work_item(app: &mut StudioApp, title: &str, reference: &str, notes: &str) -> bool {
-    let added = append_items(app, vec![BatchItem {
-        source: reference.to_string(),
-        app: title.to_string(),
-        notes: notes.to_string(),
-        request: RequestKind::New,
-        include: true,
-        ..Default::default()
-    }]);
-    if added.is_empty() {
-        app.notify(format!("{title} is already in Recipe Builder."));
-        false
+/// Adds one product split out of a plugin work item without navigating away,
+/// so several rows can be routed in one pass.
+pub fn add_plugin_product(app: &mut StudioApp, item: BatchItem) -> String {
+    let title = item.app.clone();
+    if append_items(app, vec![item]).is_empty() {
+        app.notify(format!("{title} is already in Recipe Builder; it was removed from the plugin's active work."));
     } else {
-        app.view = View::Batch;
-        app.notify(format!("Added {title} to Recipe Builder with its plugin context."));
-        true
+        app.notify(format!("Sent {title} to Recipe Builder."));
     }
+    app.batch.batch.as_ref().map(|batch| batch.id.clone()).unwrap_or_default()
+}
+
+/// Adds or links the Recipe Builder items that author recipes for products
+/// which remain in a plugin work item. Returns the persistent batch id.
+pub fn add_plugin_recipe_work(app: &mut StudioApp, items: Vec<BatchItem>) -> String {
+    append_items(app, items);
+    app.batch.batch.as_ref().map(|batch| batch.id.clone()).unwrap_or_default()
+}
+
+fn open_batch_id(app: &mut StudioApp, batch_id: &str) -> bool {
+    if app.batch.batch.as_ref().is_some_and(|batch| batch.id == batch_id) {
+        return true;
+    }
+    match Batch::load(&Batch::root().join(batch_id)) {
+        Ok(batch) => {
+            set_batch(app, batch);
+            true
+        }
+        Err(e) => {
+            app.error(format!("Could not open the linked Recipe Builder list: {e:#}"));
+            false
+        }
+    }
+}
+
+pub fn open_plugin_recipe_work(app: &mut StudioApp, batch_id: &str, work_item: &Path, product_id: Option<&str>) -> bool {
+    if app.batch.busy(app) {
+        app.error("Finish or cancel the active Recipe Builder run first.");
+        return false;
+    }
+    if !batch_id.is_empty() && !open_batch_id(app, batch_id) {
+        return false;
+    }
+    let selected = app.batch.batch.as_ref().and_then(|batch| {
+        batch.items.iter().position(|item| item.plugin_origins.iter().any(|origin| {
+            origin.work_item == work_item && product_id.is_none_or(|id| origin.product_id == id)
+        }))
+    });
+    let Some(selected) = selected else {
+        app.error("The linked Recipe Builder item is missing. Continue the safe stages to recreate it.");
+        return false;
+    };
+    app.batch.selected = Some(selected);
+    app.view = View::Batch;
+    true
+}
+
+/// Returns from a plugin work item to the exact Recipe Builder request that
+/// created it. Older items whose saved index moved are found by their link.
+pub fn open_plugin_handoff_source(app: &mut StudioApp, key: &str, work_item: &Path) -> bool {
+    if app.batch.busy(app) {
+        app.error("Finish or cancel the active Recipe Builder run first.");
+        return false;
+    }
+    let Some((batch_id, raw_index)) = key.rsplit_once(':') else {
+        app.error("This older plugin work item does not contain a Recipe Builder return link.");
+        return false;
+    };
+    let hinted = raw_index.parse::<usize>().ok();
+    if !open_batch_id(app, batch_id) {
+        return false;
+    }
+    let selected = app.batch.batch.as_ref().and_then(|batch| {
+        hinted
+            .filter(|index| batch.items.get(*index).is_some_and(|item| item.handler_item.as_deref() == Some(work_item)))
+            .or_else(|| batch.items.iter().position(|item| item.handler_item.as_deref() == Some(work_item)))
+    });
+    let Some(selected) = selected else {
+        app.error("The originating Recipe Builder request is no longer in its working list.");
+        return false;
+    };
+    app.batch.selected = Some(selected);
+    app.view = View::Batch;
+    true
+}
+
+/// Opens the exact Recipe Builder item that a plugin product was routed into.
+pub fn open_routed_plugin_product(app: &mut StudioApp, batch_id: &str, work_item: &Path, product_id: &str) -> bool {
+    if app.batch.busy(app) {
+        app.error("Finish or cancel the active Recipe Builder run first.");
+        return false;
+    }
+    if !batch_id.is_empty() && !open_batch_id(app, batch_id) {
+        return false;
+    }
+    let selected = app.batch.batch.as_ref().and_then(|batch| {
+        batch.items.iter().position(|item| {
+            item.handler_item.as_deref() == Some(work_item) && item.suggested_id.eq_ignore_ascii_case(product_id)
+        })
+    });
+    let Some(selected) = selected else {
+        app.error("The routed product is not in the open Recipe Builder list.");
+        return false;
+    };
+    app.batch.selected = Some(selected);
+    app.view = View::Batch;
+    true
+}
+
+fn plugin_recipe_item(app: &StudioApp, batch_id: &str, index: usize) -> Option<BatchItem> {
+    if let Some(batch) = app.batch.batch.as_ref().filter(|batch| batch.id == batch_id) {
+        return batch.items.get(index).cloned();
+    }
+    Batch::load(&Batch::root().join(batch_id)).ok()?.items.get(index).cloned()
+}
+
+fn copy_recipe_to_plugin(app: &StudioApp, origin: &PluginRecipeOrigin, item: &BatchItem) -> Result<String, String> {
+    if !plugin::safe_relative(&origin.recipe_folder) || !plugin::safe_relative(&origin.icon_folder) {
+        return Err("The plugin's recipe destination is not a safe relative path.".into());
+    }
+    if !recipe::is_valid_id(&origin.product_id) {
+        return Err(format!("'{}' is not a valid recipe id.", origin.product_id));
+    }
+    let installed = app.plugins.get(&origin.plugin).ok_or_else(|| format!("The {} plugin is not installed.", origin.plugin))?;
+    let values = app.settings.plugins.get(&origin.plugin).map(|prefs| prefs.values.clone()).unwrap_or_default();
+    let workspace = app.ws.as_ref().filter(|workspace| workspace.kind.is_writable()).ok_or_else(|| "Open a writable Yardstick development workspace first.".to_string())?;
+    let settings = plugin::resolve_settings(&installed.manifest, &values, Some(&workspace.root)).map_err(|problems| problems.join(" "))?;
+    let root = plugin::work_root(&settings).ok_or_else(|| format!("Set up {} in Settings first.", installed.manifest.name))?;
+    if !plugin::is_within(&origin.work_item, &root) {
+        return Err("The linked plugin work item is outside its configured work folder.".into());
+    }
+    if !item.recipes.iter().any(|id| id.eq_ignore_ascii_case(&origin.product_id)) {
+        return Err(format!("Recipe Builder did not report the expected '{}' recipe.", origin.product_id));
+    }
+    let recipe = app
+        .recipes
+        .iter()
+        .find(|recipe| recipe.id.eq_ignore_ascii_case(&origin.product_id) && recipe.location == RecipeLocation::Development)
+        .ok_or_else(|| format!("The '{}' development recipe could not be found.", origin.product_id))?;
+    let recipe_dir = origin.work_item.join(&origin.recipe_folder);
+    std::fs::create_dir_all(&recipe_dir).map_err(|e| format!("Could not create {}: {e}", recipe_dir.display()))?;
+    let destination = recipe_dir.join(format!("{}.yaml", origin.product_id));
+    let temporary = destination.with_extension("yaml.tmp");
+    std::fs::copy(&recipe.path, &temporary).map_err(|e| format!("Could not copy {}: {e}", recipe.path.display()))?;
+    std::fs::rename(&temporary, &destination).map_err(|e| format!("Could not save {}: {e}", destination.display()))?;
+
+    if !recipe.meta.icon_file.is_empty() && plugin::safe_relative(&recipe.meta.icon_file) {
+        let source = workspace.layout.icons.join(&recipe.meta.icon_file);
+        if source.is_file() {
+            let destination = origin.work_item.join(&origin.icon_folder).join(&recipe.meta.icon_file);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("Could not create {}: {e}", parent.display()))?;
+            }
+            std::fs::copy(&source, &destination).map_err(|e| format!("Could not copy {}: {e}", source.display()))?;
+        }
+    }
+    Ok(format!("{} passed Recipe Builder's safe checks and was synced for One-Off packaging.", origin.product_id))
+}
+
+fn sync_plugin_recipe_work(app: &mut StudioApp, batch_id: &str, index: usize) {
+    let Some(item) = plugin_recipe_item(app, batch_id, index) else { return };
+    let origins = item.plugin_origins.clone();
+    let mut changed = Vec::new();
+    for origin in origins {
+        let (state, recipe_id, note) = match item.status {
+            ItemStatus::Queued | ItemStatus::Running => (RecipeWorkState::Running, String::new(), item.status_note.clone()),
+            ItemStatus::Failed => (RecipeWorkState::Failed, String::new(), item.status_note.clone()),
+            ItemStatus::Done if item.checks.iter().any(|check| check.recipe.eq_ignore_ascii_case(&origin.product_id) && check.passed) => {
+                match copy_recipe_to_plugin(app, &origin, &item) {
+                    Ok(note) => (RecipeWorkState::Ready, origin.product_id.clone(), note),
+                    Err(note) => (RecipeWorkState::Failed, String::new(), note),
+                }
+            }
+            ItemStatus::Done => (RecipeWorkState::Pending, String::new(), "Recipe written; run its safe checks in Recipe Builder.".into()),
+            ItemStatus::Delegated => (RecipeWorkState::Failed, String::new(), "Linked recipe work cannot be delegated to another plugin.".into()),
+            ItemStatus::Skipped => (RecipeWorkState::Failed, String::new(), "Recipe Builder work was skipped.".into()),
+            ItemStatus::Pending => (RecipeWorkState::Pending, String::new(), "Ready to complete in Recipe Builder.".into()),
+        };
+        match WorkItem::open(&origin.work_item) {
+            Ok(mut work) => {
+                work.meta.recipe_work.insert(origin.product_id.clone(), RecipeWorkRecord {
+                    state,
+                    batch_id: batch_id.to_string(),
+                    recipe_id,
+                    note,
+                    updated: intake::timestamp(),
+                });
+                match work.save() {
+                    Ok(()) => changed.push((origin.plugin.clone(), origin.work_item.clone())),
+                    Err(e) => app.error(format!("Could not update linked plugin recipe work: {e:#}")),
+                }
+            }
+            Err(e) => app.error(format!("Could not open linked plugin work item: {e:#}")),
+        }
+    }
+    for (plugin, work_item) in changed {
+        crate::views::plugin_page::recipe_work_changed(app, &plugin, &work_item);
+    }
+}
+
+/// Removes a not-yet-started product when a routing decision is reversed.
+pub fn remove_plugin_product(app: &mut StudioApp, work_item: &Path, suggested_id: &str) -> Result<(), String> {
+    let Some(batch) = app.batch.batch.as_mut() else { return Ok(()) };
+    let Some(index) = batch.items.iter().position(|item| {
+        item.handler_item.as_deref() == Some(work_item) && item.suggested_id == suggested_id
+    }) else {
+        return Ok(());
+    };
+    let item = &batch.items[index];
+    if matches!(item.status, ItemStatus::Queued | ItemStatus::Running | ItemStatus::Done) || !item.recipes.is_empty() || !item.checks.is_empty() {
+        return Err(format!("{} has already started in Recipe Builder and cannot be returned to the plugin.", item.app));
+    }
+    batch.items.remove(index);
+    let retained_sources: BTreeSet<String> = batch.items.iter().map(|item| item.source.clone()).collect();
+    batch.records.retain(|record| retained_sources.contains(&record.reference));
+    app.batch.selected = None;
+    app.batch.dirty = true;
+    batch.save().map_err(|e| format!("Could not save Recipe Builder after returning the product: {e:#}"))
 }
 
 fn item_key(item: &BatchItem) -> String {
@@ -153,6 +361,7 @@ fn status_badge(ui: &mut Ui, s: ItemStatus) {
         ItemStatus::Pending => ("pending", theme::grey()),
         ItemStatus::Queued => ("queued", theme::blue()),
         ItemStatus::Running => ("running", theme::amber()),
+        ItemStatus::Delegated => ("in plugin", theme::blue()),
         ItemStatus::Done => ("done", theme::green()),
         ItemStatus::Failed => ("failed", theme::red()),
         ItemStatus::Skipped => ("skipped", theme::grey()),
@@ -163,11 +372,24 @@ fn status_badge(ui: &mut Ui, s: ItemStatus) {
 /// "done" covers both "the agent wrote a recipe" and "checks passed"; say which,
 /// and whether the recipe is complete (the contents that passed a live test).
 fn item_status_badge(app: &StudioApp, ui: &mut Ui, it: &BatchItem) {
+    if it.status == ItemStatus::Delegated {
+        let (text, color) = if it.status_note.starts_with("Needs attention") {
+            ("plugin needs attention", theme::red())
+        } else if it.status_note.starts_with("Waiting for you") {
+            ("waiting for you", theme::amber())
+        } else if it.status_note.starts_with("Running") {
+            ("running in plugin", theme::blue())
+        } else {
+            ("in plugin", theme::blue())
+        };
+        theme::badge(ui, text, color).on_hover_text("This request is owned by its linked plugin work item. Open it to continue or review progress.");
+        return;
+    }
     if it.status != ItemStatus::Done {
         return status_badge(ui, it.status);
     }
     if !it.is_recipe_work() {
-        theme::badge(ui, "sent to plugin", theme::green()).on_hover_text("This request is now a plugin work item and is excluded from Recipe Builder batch actions.");
+        theme::badge(ui, "complete in plugin", theme::green()).on_hover_text("The linked plugin workflow completed. This request remains excluded from Recipe Builder batch actions.");
         return;
     }
     match it.action {
@@ -746,6 +968,7 @@ pub fn agent_finished(app: &mut StudioApp, batch_id: &str, idx: usize, outcome: 
             };
         }
     });
+    sync_plugin_recipe_work(app, batch_id, idx);
     if app.batch.run_job.is_some_and(|j| app.job(j).is_some_and(|j| !j.proc.is_running())) {
         app.batch.run_job = None;
     }
@@ -761,6 +984,7 @@ pub fn check_finished(app: &mut StudioApp, batch_id: &str, idx: usize, check: Ba
             it.status = if it.checks.iter().all(|c| c.passed) { ItemStatus::Done } else { ItemStatus::Failed };
         }
     });
+    sync_plugin_recipe_work(app, batch_id, idx);
 }
 
 pub fn checks_started(app: &mut StudioApp, targets: &[crate::workflow::Target]) {
@@ -777,6 +1001,7 @@ pub fn checks_started(app: &mut StudioApp, targets: &[crate::workflow::Target]) 
                     it.status_note = "queued for harness checks".into();
                 }
             });
+            sync_plugin_recipe_work(app, batch_id, *idx);
         }
     }
 }
@@ -1527,11 +1752,13 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
     };
     let record = b.record(&it.source).cloned();
     let mut edit = it.clone();
+    let linked_origin = edit.plugin_origins.first().cloned();
     let mut run = false;
     let mut open_recipe = false;
     let mut icon = false;
     let mut handoff = false;
     let mut open_handoff = false;
+    let mut open_linked_plugin = false;
     let mut matches_for = None;
     let mut close = false;
     ui.add_enabled_ui(!busy, |ui| {
@@ -1545,6 +1772,34 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
             });
             });
         });
+        if let Some(origin) = &linked_origin {
+            let p = theme::palette();
+            egui::Frame::new()
+                .fill(p.info_bg)
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("\u{E946}").color(p.info));
+                        ui.label(
+                            RichText::new(format!(
+                                "Linked to {} product {}. Passing safe checks copies this development recipe back to the plugin work item.",
+                                origin.plugin, origin.product_id
+                            ))
+                            .color(p.info),
+                        );
+                        let name = handlers
+                            .iter()
+                            .find(|(id, _)| id == &origin.plugin)
+                            .map(|(_, name)| name.as_str())
+                            .unwrap_or("plugin");
+                        if ui.button(format!("Back to {name}")).clicked() {
+                            open_linked_plugin = true;
+                        }
+                    });
+                });
+            ui.add_space(6.0);
+        }
         egui::Grid::new("batch-item-form").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
             let w = ui.available_width().max(160.0);
             ui.label("Software");
@@ -1576,27 +1831,46 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
             } else {
                 handlers.iter().find(|(id, _)| id == &edit.handler).map(|(_, name)| name.clone()).unwrap_or_else(|| edit.handler.clone())
             };
-            egui::ComboBox::from_id_salt("batch-handler").selected_text(destination).show_ui(ui, |ui| {
-                ui.selectable_value(&mut edit.handler, String::new(), "Recipe Builder · reusable recipe");
-                for (id, name) in &handlers {
-                    ui.selectable_value(&mut edit.handler, id.clone(), name);
-                }
-            });
-            ui.end_row();
-            ui.label("Existing recipe");
-            egui::ComboBox::from_id_salt("batch-existing")
-                .selected_text(if edit.existing_recipe.is_empty() { "none".to_string() } else { edit.existing_recipe.clone() })
-                .height(400.0)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut edit.existing_recipe, String::new(), "none");
-                    for id in &ids {
-                        ui.selectable_value(&mut edit.existing_recipe, id.clone(), id);
+            let fixed_destination = linked_origin.is_some() || (!edit.is_recipe_work() && edit.handler_item.is_some());
+            if fixed_destination {
+                ui.label(RichText::new(destination).semibold())
+                    .on_hover_text("This destination owns linked work already. Open that work item to continue.");
+            } else {
+                egui::ComboBox::from_id_salt("batch-handler").selected_text(destination).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut edit.handler, String::new(), "Recipe Builder · reusable recipe");
+                    for (id, name) in &handlers {
+                        ui.selectable_value(&mut edit.handler, id.clone(), name);
                     }
                 });
+            }
             ui.end_row();
-            ui.label("New recipe id");
-            ui.add(egui::TextEdit::singleline(&mut edit.suggested_id).hint_text(ystudio_core::recipe::suggest_id(&edit.app)).desired_width(w));
-            ui.end_row();
+            if edit.is_recipe_work() {
+                ui.label("Existing recipe");
+                if linked_origin.is_some() {
+                    ui.label(if edit.existing_recipe.is_empty() { "none" } else { &edit.existing_recipe })
+                        .on_hover_text("The plugin product id determines which development recipe is synchronized.");
+                } else {
+                    egui::ComboBox::from_id_salt("batch-existing")
+                        .selected_text(if edit.existing_recipe.is_empty() { "none".to_string() } else { edit.existing_recipe.clone() })
+                        .height(400.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut edit.existing_recipe, String::new(), "none");
+                            for id in &ids {
+                                ui.selectable_value(&mut edit.existing_recipe, id.clone(), id);
+                            }
+                        });
+                }
+                ui.end_row();
+                ui.label("New recipe id");
+                ui.add_enabled(
+                    linked_origin.is_none(),
+                    egui::TextEdit::singleline(&mut edit.suggested_id)
+                        .hint_text(ystudio_core::recipe::suggest_id(&edit.app))
+                        .desired_width(w),
+                )
+                .on_disabled_hover_text("The linked plugin product id fixes this recipe id so synchronization cannot target the wrong product.");
+                ui.end_row();
+            }
             ui.label("Vendor page");
             ui.add(egui::TextEdit::singleline(&mut edit.vendor_url).desired_width(w));
             ui.end_row();
@@ -1643,14 +1917,19 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
             {
                 open_recipe = true;
             }
-            if ui.add_enabled(edit.request != RequestKind::NotSoftware && edit.is_recipe_work(), egui::Button::new("\u{E91B}  Find icon")).clicked() {
+            if edit.is_recipe_work()
+                && ui.add_enabled(edit.request != RequestKind::NotSoftware, egui::Button::new("\u{E91B}  Find icon")).clicked()
+            {
                 icon = true;
             }
             if edit.status == ItemStatus::Skipped {
                 if ui.button("Unskip").clicked() {
                     edit.status = ItemStatus::Pending;
                 }
-            } else if !matches!(edit.status, ItemStatus::Running | ItemStatus::Queued) && ui.button("Skip").clicked() {
+            } else if edit.handler_item.is_none()
+                && !matches!(edit.status, ItemStatus::Running | ItemStatus::Queued | ItemStatus::Delegated)
+                && ui.button("Skip").clicked()
+            {
                 edit.status = ItemStatus::Skipped;
                 edit.include = false;
             }
@@ -1678,13 +1957,17 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
         edit.existing_recipe = m.id;
     }
     if edit != it {
+        let sync_linked_work = !edit.plugin_origins.is_empty();
         if edit.handler != it.handler {
             edit.handler_item = None;
             edit.include = edit.is_recipe_work() && matches!(edit.request, RequestKind::New | RequestKind::Update);
+            edit.status = ItemStatus::Pending;
+            edit.status_note.clear();
         }
-        if edit.app != it.app || edit.version != it.version || edit.existing_recipe != it.existing_recipe
-            || edit.suggested_id != it.suggested_id || edit.vendor_url != it.vendor_url
-            || edit.notes != it.notes || edit.publisher != it.publisher
+        if edit.is_recipe_work()
+            && (edit.app != it.app || edit.version != it.version || edit.existing_recipe != it.existing_recipe
+                || edit.suggested_id != it.suggested_id || edit.vendor_url != it.vendor_url
+                || edit.notes != it.notes || edit.publisher != it.publisher)
         {
             edit.recipes.clear();
             edit.checks.clear();
@@ -1693,6 +1976,11 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
         }
         app.batch.batch.as_mut().unwrap().items[n] = edit.clone();
         save(app);
+        if sync_linked_work
+            && let Some(batch_id) = app.batch.batch.as_ref().map(|batch| batch.id.clone())
+        {
+            sync_plugin_recipe_work(app, &batch_id, n);
+        }
     }
     if close {
         app.batch.selected = None;
@@ -1723,10 +2011,15 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
                 &format!("{batch_id}:{n}"),
             ) {
                 Ok(path) => {
+                    let plugin_name = app
+                        .plugins
+                        .get(&current.handler)
+                        .map(|plugin| plugin.manifest.name.clone())
+                        .unwrap_or_else(|| current.handler.clone());
                     if let Some(item) = app.batch.batch.as_mut().and_then(|b| b.items.get_mut(n)) {
                         item.handler_item = Some(path);
-                        item.status = ItemStatus::Done;
-                        item.status_note = "sent to plugin".into();
+                        item.status = ItemStatus::Delegated;
+                        item.status_note = format!("Started in {plugin_name}. Open the linked work item to continue.");
                     }
                     save(app);
                 }
@@ -1742,11 +2035,20 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
         }
         app.view = view;
     }
+    if open_linked_plugin
+        && let Some(origin) = linked_origin
+        && let Some(view) = app.plugins.view_of(&origin.plugin)
+    {
+        app.plugins.page(&origin.plugin).selected = Some(origin.work_item);
+        app.view = view;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::views::plugin_page::tests::install_sample;
+    use crate::workflow::tests::fake_app;
 
     #[test]
     fn working_list_deduplicates_library_but_appends_every_batch_item() {
@@ -1776,6 +2078,62 @@ mod tests {
         assert_eq!(item_key(&items[1]), "one");
         assert_eq!(item_key(&items[2]), "two");
         assert!(app.batch.dirty);
+    }
+
+    #[test]
+    fn passing_recipe_builder_work_syncs_the_checked_recipe_back_to_its_plugin() {
+        let (dir, mut app) = fake_app();
+        let work_root = install_sample(&mut app, dir.path(), "sample-plugin", |manifest| manifest);
+        let work = WorkItem::create(
+            &work_root,
+            "{date}-{slug}",
+            "Linked recipe",
+            "TASK-1",
+            plugin::Origin::default(),
+            std::time::SystemTime::now(),
+        ).unwrap();
+        let workspace = app.ws.as_ref().unwrap();
+        std::fs::create_dir_all(&workspace.layout.development_recipes).unwrap();
+        std::fs::create_dir_all(&workspace.layout.icons).unwrap();
+        std::fs::write(
+            workspace.layout.development_recipes.join("one.yaml"),
+            "id: one\ndisplayName: One\npublisher: Test\niconFile: one.png\nurl: https://example.com\ninstallScript: one.exe /S\nuninstallScript: one.exe /U\ndetectionType: file\n",
+        ).unwrap();
+        std::fs::write(workspace.layout.icons.join("one.png"), b"icon").unwrap();
+        app.refresh_recipes();
+
+        let recipe_item = BatchItem {
+            app: "One".into(),
+            suggested_id: "one".into(),
+            status: ItemStatus::Done,
+            recipes: vec!["one".into()],
+            checks: vec![BatchCheck {
+                recipe: "one".into(),
+                passed: true,
+                note: "Safe checks passed".into(),
+                timestamp: intake::timestamp(),
+                summary_dir: None,
+                live: false,
+            }],
+            plugin_origins: vec![PluginRecipeOrigin {
+                plugin: "sample-plugin".into(),
+                work_item: work.dir.clone(),
+                product_id: "one".into(),
+                recipe_folder: "recipes".into(),
+                icon_folder: "icons".into(),
+            }],
+            ..Default::default()
+        };
+        let batch = Batch::from_items("linked", vec![recipe_item]);
+        let batch_id = batch.id.clone();
+        app.batch.batch = Some(batch);
+
+        sync_plugin_recipe_work(&mut app, &batch_id, 0);
+
+        let synced = WorkItem::open(&work.dir).unwrap();
+        assert_eq!(synced.meta.recipe_work["one"].state, RecipeWorkState::Ready, "{}", synced.meta.recipe_work["one"].note);
+        assert_eq!(std::fs::read_to_string(work.dir.join(r"recipes\one.yaml")).unwrap().lines().next(), Some("id: one"));
+        assert_eq!(std::fs::read(work.dir.join(r"icons\one.png")).unwrap(), b"icon");
     }
 
     #[test]

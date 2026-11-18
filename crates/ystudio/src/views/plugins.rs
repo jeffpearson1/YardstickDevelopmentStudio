@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn available_plugins_show_a_readable_description() {
-        let notes = "**SCCM App Migration** browses the applications in a Configuration Manager site and migrates one to Intune. It reads the site through the SMS Provider over CIM and `never` changes it.\n\nNeeds Studio 0.6.0.\n\n## 1.0.0\n- more";
+        let notes = "**SCCM App Migration** browses the applications in a Configuration Manager site and migrates one to Intune. It reads the site through the SMS Provider over CIM and `never` changes it.\n\nNeeds Studio 0.7.0.\n\n## 1.1.0\n- more";
         let short = release_summary(notes, 90);
         assert_eq!(short, "SCCM App Migration browses the applications in a Configuration Manager site and migrates…");
         let full = release_summary(notes, 400);
@@ -586,7 +586,7 @@ mod tests {
         let installed = app.plugins.registry.plugins.clone();
         assert_eq!(app.plugins_ui.available(&installed).map(|(id, _)| id.as_str()).collect::<Vec<_>>(), ["oneoff-packager"]);
 
-        app.plugins_ui.latest.get_mut("oneoff-packager").unwrap().notes = "**One-Off Packager** packages software requests that are not good candidates for a Yardstick recipe. An agent triages the ticket and drafts the recipe; everything that downloads, installs, packages or touches Intune is a separate step.\n\nNeeds Studio 0.6.0.".into();
+        app.plugins_ui.latest.get_mut("oneoff-packager").unwrap().notes = "**One-Off Packager** packages software requests that are not good candidates for a maintained Yardstick recipe. The agent triages the ticket, Recipe Builder owns recipe work, and guarded plugin stages package and publish it.\n\nNeeds Studio 0.7.0.".into();
         app.view = View::Settings;
         render(&mut app, "plugin-updates", 1315, 1900);
     }
