@@ -1,6 +1,6 @@
 # Intune inventory and change safety
 
-This is how the Studio's steps treat the tenant, so you can write research that fits it and explain it to the user.
+This is how the Studio's steps treat the tenant, so your triage can capture the constraints Recipe Builder and the packaging stages must follow.
 
 ## Read-only inventory
 

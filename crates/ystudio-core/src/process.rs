@@ -202,6 +202,9 @@ impl RunningProcess {
             match ev {
                 Event::Line(l) => self.lines.push(l),
                 Event::Exited(code) => {
+                    if self.exit.is_some() {
+                        continue;
+                    }
                     self.exit = Some(code);
                     self.finished_at = Some(Instant::now());
                     let text = match (code, self.cancelled) {
@@ -245,7 +248,21 @@ impl RunningProcess {
             use std::os::windows::process::CommandExt;
             kill.creation_flags(0x0800_0000);
         }
-        let _ = kill.status();
+        match kill.status() {
+            Ok(status) if status.success() => {
+                // `taskkill /T /F` has synchronously terminated the process
+                // tree. Do not keep the UI and workflow blocked while the
+                // background pipe readers notice their handles closing.
+                self.exit = Some(None);
+                self.finished_at = Some(Instant::now());
+                self.lines.push(LogLine { stream: Stream::Studio, text: "Cancelled.".into() });
+            }
+            Ok(status) => self.lines.push(LogLine {
+                stream: Stream::Studio,
+                text: format!("Could not stop the process tree (taskkill exit {}).", status.code().unwrap_or(-1)),
+            }),
+            Err(e) => self.lines.push(LogLine { stream: Stream::Studio, text: format!("Could not start taskkill: {e}") }),
+        }
     }
 
     pub fn text(&self) -> String {

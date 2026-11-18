@@ -5,7 +5,7 @@ version: 1.0.0
 publisher: Yardstick contributors
 description: A tiny plugin the Studio's tests install and run.
 icon: E8F1
-studio: { minVersion: 0.6.0, hostApi: 1 }
+studio: { minVersion: 0.6.0, hostApi: 3 }
 source: { github: jeffpearson1/YardstickDevelopmentStudio, tagPrefix: plugin-sample-plugin-v }
 requires:
   plugins:
@@ -30,6 +30,7 @@ settings:
     default: "true"
 page:
   type: workitems
+  hostActions: [new-work, refresh, work-folder, settings]
   noun: Ticket
   intake: [text, files]
   panels:
@@ -64,6 +65,6 @@ steps:
 actions:
   - id: send
     label: Send to the other plugin
-    kind: handoff.workitem
+    kind: host.plugin-workitem
     plugin: other-plugin
     files: [notes.md]

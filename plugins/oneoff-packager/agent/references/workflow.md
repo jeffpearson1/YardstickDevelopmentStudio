@@ -8,9 +8,9 @@ Who does what, in order. The steps in the **Studio** column are buttons the user
 | 2 | Triage the ticket | **Agent** | `products.json` |
 | 3 | Create the isolated runtime | Studio | `runtime\` |
 | 4 | Check Intune for existing apps | Studio | `inventory\intune-inventory.json` |
-| 5 | Research and draft recipes | **Agent** | `recipes\`, `icons\`, `research-and-status.md` |
+| 5 | Research, author and run safe checks | Recipe Builder | Yardstick development recipe and evidence |
 | 6 | Prepare test (installs nothing) | Studio | `artifacts\package-tests\<run>\` |
-| 7 | Fix a recipe from test results | **Agent** (when needed) | `recipes\` |
+| 7 | Fix a recipe from test results | Recipe Builder (when needed) | Updated recipe and evidence |
 | 8 | Install test, after the user approves it | Studio | `artifacts\package-tests\<run>\` |
 | 9 | Build the `.intunewin` packages | Studio | `local-packages\` |
 | 10 | Prepare the Intune change | Studio | `intune-upload\live-change-set.json` |
@@ -39,7 +39,7 @@ When no retrievable installer exists, report the staging location `<SoftwareDrop
 
 ## 4. Research and author
 
-Follow `research-and-recipe.md`. Record authoritative sources and decisions in `research-and-status.md`.
+Recipe Builder owns this work through Yardstick's recipe skill and syncs checked recipes back into the ticket. The plugin triage agent never authors or repairs recipes.
 
 ## 5. Local validation (the Studio's)
 

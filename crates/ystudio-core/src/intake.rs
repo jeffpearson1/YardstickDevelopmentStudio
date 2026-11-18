@@ -421,6 +421,8 @@ pub enum ItemStatus {
     Pending,
     Queued,
     Running,
+    /// Ownership moved to a plugin work item, which is still in progress.
+    Delegated,
     Done,
     Failed,
     Skipped,
@@ -494,6 +496,19 @@ pub struct BatchItem {
     pub evidence: String,
     /// Work item created in `handler`, when the request has been handed off.
     pub handler_item: Option<PathBuf>,
+    /// Plugin products whose recipe authoring is owned by this Recipe Builder
+    /// item. More than one origin may share an existing recipe request.
+    pub plugin_origins: Vec<PluginRecipeOrigin>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PluginRecipeOrigin {
+    pub plugin: String,
+    pub work_item: PathBuf,
+    pub product_id: String,
+    pub recipe_folder: String,
+    pub icon_folder: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1197,7 +1212,15 @@ impl Batch {
         let mut s = String::from("| Ticket | Software | Version | Outcome | Recipe | Notes |\n|---|---|---|---|---|---|\n");
         for it in &self.items {
             let outcome = if !it.is_recipe_work() {
-                if it.handler_item.is_some() { format!("sent to {}", it.handler) } else { format!("suggested for {}", it.handler) }
+                if it.handler_item.is_some() {
+                    match it.status {
+                        ItemStatus::Done => format!("completed in {}", it.handler),
+                        ItemStatus::Failed => format!("needs attention in {}", it.handler),
+                        _ => format!("delegated to {}", it.handler),
+                    }
+                } else {
+                    format!("suggested for {}", it.handler)
+                }
             } else if !it.checks.is_empty() {
                 it.checks.iter().map(|c| format!("{}: {}", c.recipe, c.note)).collect::<Vec<_>>().join("; ")
             } else { match it.status {
@@ -1477,6 +1500,23 @@ mod tests {
         assert_eq!(b.record("#1").unwrap().body, "per-user");
         assert_eq!(b.open_items(), 1);
         assert!(Batch::save_pasted("  ").is_err());
+    }
+
+    #[test]
+    fn plugin_handoffs_report_delegated_and_completed_lifecycles() {
+        let mut b = Batch::from_items("Plugin handoff", vec![BatchItem {
+            app: "Licensed Lab Tool".into(),
+            handler: "oneoff-packager".into(),
+            handler_item: Some(PathBuf::from(r"C:\work\ticket")),
+            status: ItemStatus::Delegated,
+            ..Default::default()
+        }]);
+        assert!(b.report().contains("delegated to oneoff-packager"));
+        let saved: Batch = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+        assert_eq!(saved.items[0].status, ItemStatus::Delegated);
+
+        b.items[0].status = ItemStatus::Done;
+        assert!(b.report().contains("completed in oneoff-packager"));
     }
 
     #[test]

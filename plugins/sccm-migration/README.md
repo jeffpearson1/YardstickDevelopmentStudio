@@ -4,14 +4,16 @@ Browse the applications in a Configuration Manager site and move one to Intune. 
 
 For each application it shows what SCCM says (deployment types, install and uninstall commands, install context, detection, where it is deployed) and works out what an Intune app would need. Then you pick the route for that application:
 
-- **Package as one-off** starts a ticket in the One-Off Packager with the export and, if you copied it, the application's content as the payload. The agent drafts the recipe from it; the install test, packaging and Intune upload are the One-Off Packager's steps, behind its approvals.
-- **Draft a Yardstick recipe** opens the New recipe dialog with the application's details, for the recipe agent to research. Choose this when the vendor offers a download of the version, because a recipe that fetches it is easier to keep up to date.
+- **Package as one-off** starts a ticket in the One-Off Packager with the export and, if you copied it, the application's content as the payload. Recipe Builder owns research, authoring and safe checks; the One-Off pipeline owns the lifecycle test, packaging and Intune upload behind its approvals.
+- **Start in Recipe Builder** opens Recipe Builder with the application's exported details. Choose this when the vendor offers a download of the version, because a maintained recipe is easier to keep up to date.
 
-Needs PowerShell 7 and the One-Off Packager plugin (1.0.1 or later).
+Needs PowerShell 7 and the integrated One-Off Packager plugin (1.5.0 or later).
 
 ## Set up
 
 In *Settings → Plugins → SCCM App Migration → Settings*:
+
+The plugin tab's **Plugin settings** action opens this same global Settings card; configuration is not duplicated inside the plugin page.
 
 | Setting | |
 |---------|--|

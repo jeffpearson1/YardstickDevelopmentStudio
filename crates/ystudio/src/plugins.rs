@@ -4,11 +4,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use ystudio_core::plugin::{self, Installed, Lock, Registry};
 
 use crate::app::View;
-use crate::views::plugin_page::PageState;
+use crate::views::plugin_page::{PageState, PluginActivity};
 use crate::views::update::CURRENT_VERSION;
 
 pub struct Host {
@@ -18,13 +19,25 @@ pub struct Host {
     /// for the session, so an uninstall never shifts another tab's index.
     pub tabs: Vec<String>,
     pub pages: HashMap<String, PageState>,
+    /// Cross-plugin work shown on Home and History. Disk-backed work roots
+    /// are refreshed on demand rather than touched during every UI frame.
+    pub activity: Vec<PluginActivity>,
+    pub activity_refreshed: Option<Instant>,
     /// Work-item locks of running steps, by job id; dropped when the job ends.
     pub locks: HashMap<u64, Lock>,
 }
 
 impl Host {
     pub fn load(dir: &Path) -> Self {
-        let mut host = Self { dir: dir.to_path_buf(), registry: Registry::default(), tabs: Vec::new(), pages: HashMap::new(), locks: HashMap::new() };
+        let mut host = Self {
+            dir: dir.to_path_buf(),
+            registry: Registry::default(),
+            tabs: Vec::new(),
+            pages: HashMap::new(),
+            activity: Vec::new(),
+            activity_refreshed: None,
+            locks: HashMap::new(),
+        };
         host.reload();
         host
     }
@@ -32,6 +45,7 @@ impl Host {
     /// Re-reads the plugins folder after an install, update or uninstall.
     pub fn reload(&mut self) {
         self.registry = Registry::discover(&self.dir, CURRENT_VERSION);
+        self.activity_refreshed = None;
         for p in &self.registry.plugins {
             if !self.tabs.contains(&p.manifest.id) {
                 self.tabs.push(p.manifest.id.clone());
@@ -54,6 +68,14 @@ impl Host {
 
 impl Default for Host {
     fn default() -> Self {
-        Self { dir: plugin::default_dir(), registry: Registry::default(), tabs: Vec::new(), pages: HashMap::new(), locks: HashMap::new() }
+        Self {
+            dir: plugin::default_dir(),
+            registry: Registry::default(),
+            tabs: Vec::new(),
+            pages: HashMap::new(),
+            activity: Vec::new(),
+            activity_refreshed: None,
+            locks: HashMap::new(),
+        }
     }
 }

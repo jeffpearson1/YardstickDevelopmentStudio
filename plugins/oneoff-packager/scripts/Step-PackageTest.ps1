@@ -14,7 +14,7 @@ Invoke-StudioStep -StudioInput $StudioInput -StudioResult $StudioResult -Body {
     $yardstickDev = Get-StudioSetting $in 'yardstickDevPath'
     if (-not $yardstickDev) { throw 'Set the YardstickDev folder in the plugin settings (or open a development workspace).' }
     $recipes = @(Get-ChildItem -LiteralPath (Join-Path $workItem 'recipes') -Filter *.yaml -File -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -ExpandProperty FullName)
-    if ($recipes.Count -eq 0) { throw 'There are no recipes in recipes\. Run the research task first.' }
+    if ($recipes.Count -eq 0) { throw 'There are no recipes in recipes\. Complete the linked Recipe Builder work first.' }
 
     $arguments = @{
         TicketRoot       = $workItem
