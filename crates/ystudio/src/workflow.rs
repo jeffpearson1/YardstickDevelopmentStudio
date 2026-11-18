@@ -1,4 +1,5 @@
-//! Studio-owned, sequential harness runs and bounded agent repairs.
+//! Studio-owned harness runs and bounded agent repairs: a test coordinator that
+//! runs one app through the harness at a time, with repair agents beside it.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -58,6 +59,9 @@ pub struct State {
     pub last_job: Option<u64>,
     pub message: String,
     advance_pending: bool,
+    /// Tests: repairs become in-process jobs the test finishes through these feeds.
+    #[cfg(test)]
+    fake_repairs: Option<Vec<ystudio_core::process::Feed>>,
 }
 
 /// Recipe counts by where their live test runs.
@@ -89,14 +93,32 @@ impl Contexts {
     }
 }
 
+/// One recipe waiting for, or going through, the test harness.
+#[derive(Clone, Debug)]
+struct TestJob {
+    target: Target,
+    attempt: u32,
+}
+
+/// The test coordinator. Test requests queue in arrival order and the harness
+/// takes one app at a time, because Windows runs one installation at a time.
+/// Repairs run as agents beside it: in parallel mode the harness moves on to
+/// the next app meanwhile and the repaired recipe rejoins the back of the
+/// queue; otherwise the harness waits for the repair and retests it next.
 struct Run {
     root: PathBuf,
-    queue: VecDeque<Target>,
-    current: Target,
+    queue: VecDeque<TestJob>,
+    /// The app in the harness now.
+    current: Option<TestJob>,
+    /// Recipes a repair agent is working on, by job id.
+    repairing: Vec<(u64, TestJob)>,
+    /// Repairs waiting for a free agent (parallel mode), with their evidence.
+    repair_waiting: VecDeque<(TestJob, String)>,
     options: Options,
     repair: bool,
     resume_batch: bool,
-    attempt: u32,
+    /// How many agents may run at once (research and repairs); 1 is sequential.
+    parallel: usize,
     step: usize,
     stopped: bool,
     cancelled: bool,
@@ -109,8 +131,19 @@ struct Run {
 }
 
 impl Run {
-    fn can_repair(&self, blocker: bool) -> bool {
-        !blocker && self.repair && !self.cancelled && self.attempt < self.options.attempts
+    fn can_repair(&self, job: &TestJob, blocker: bool) -> bool {
+        !blocker && self.repair && !self.cancelled && job.attempt < self.options.attempts
+    }
+
+    fn reset_step(&mut self) {
+        self.step = 0;
+        self.summary_dir = None;
+        self.warned = false;
+        self.elevated = None;
+    }
+
+    fn targets(&self) -> impl Iterator<Item = &Target> {
+        self.current.iter().chain(&self.queue).chain(self.repairing.iter().map(|(_, j)| j)).chain(self.repair_waiting.iter().map(|(j, _)| j)).map(|j| &j.target)
     }
 }
 
@@ -121,6 +154,16 @@ impl State {
 
     pub fn running(&self) -> bool {
         self.run.is_some()
+    }
+
+    /// The coordinator's queue, for the progress line: (testing now, waiting, being repaired).
+    pub fn queue_summary(&self) -> Option<(Option<String>, Vec<String>, Vec<String>)> {
+        let run = self.run.as_ref()?;
+        Some((
+            run.current.as_ref().map(|j| j.target.id.clone()),
+            run.queue.iter().map(|j| j.target.id.clone()).collect(),
+            run.repairing.iter().map(|(_, j)| &j.target.id).chain(run.repair_waiting.iter().map(|(j, _)| &j.target.id)).cloned().collect(),
+        ))
     }
 }
 
@@ -198,7 +241,7 @@ pub fn works_on(app: &StudioApp, batch_id: &str) -> bool {
     let agent = app.jobs.iter().any(|j| {
         j.proc.is_running() && matches!(&j.kind, JobKind::Agent { batch_item: Some((b, _)), .. } if b == batch_id)
     });
-    agent || app.workflow.run.as_ref().is_some_and(|r| std::iter::once(&r.current).chain(&r.queue).any(|t| t.items.iter().any(|(b, _)| b == batch_id)))
+    agent || app.workflow.run.as_ref().is_some_and(|r| r.targets().any(|t| t.items.iter().any(|(b, _)| b == batch_id)))
 }
 
 /// Shown when an agent stopped for an approval the run did not have.
@@ -325,6 +368,24 @@ fn copy_shipped_to_development(app: &mut StudioApp, targets: &[Target]) -> anyho
     Ok(())
 }
 
+/// How many agents may work at once: Multi-agent mode researches several apps
+/// in parallel; otherwise one.
+pub fn parallel_agents(app: &StudioApp) -> usize {
+    if app.settings.agent_multi && app.settings.agent_backend.supports_multi_agent() {
+        app.settings.agent_parallel.clamp(1, 8) as usize
+    } else {
+        1
+    }
+}
+
+/// Recipe Builder authoring agents and repair agents running now.
+pub fn agents_running(app: &StudioApp) -> usize {
+    app.jobs
+        .iter()
+        .filter(|j| j.proc.is_running() && matches!(j.kind, JobKind::Agent { batch_item: Some(_), .. } | JobKind::WorkflowRepair { .. }))
+        .count()
+}
+
 pub fn start(app: &mut StudioApp, targets: Vec<Target>, options: Options, repair: bool, resume_batch: bool) {
     if options.live && options.consent != Consent::Confirmed {
         app.error("Live automatic checks require explicit consent for this run.");
@@ -334,18 +395,39 @@ pub fn start(app: &mut StudioApp, targets: Vec<Target>, options: Options, repair
         app.error("No workspace is open for automatic checks.");
         return;
     };
-    crate::views::batch::checks_started(app, &targets);
-    let mut queue: VecDeque<_> = targets.into();
-    let Some(current) = queue.pop_front() else {
+    if targets.is_empty() {
         app.error("No recipe was produced or selected for testing.");
         return;
-    };
+    }
+    crate::views::batch::checks_started(app, &targets);
+    let queue: VecDeque<_> = targets.into_iter().map(|target| TestJob { target, attempt: 1 }).collect();
+    let parallel = parallel_agents(app);
     app.workflow.run = Some(Run {
-        root, queue, current, options, repair, resume_batch, attempt: 1, step: 0,
-        stopped: false, cancelled: false, summary_dir: None, warned: false, elevated: None, waiting_elevation: false,
+        root, queue, current: None, repairing: Vec::new(), repair_waiting: VecDeque::new(), options, repair, resume_batch, parallel,
+        step: 0, stopped: false, cancelled: false, summary_dir: None, warned: false, elevated: None, waiting_elevation: false,
     });
     app.workflow.advance_pending = false;
     advance(app);
+}
+
+/// Hands a test request to the coordinator: it joins the queue of a running
+/// coordinator, or starts one.
+pub fn enqueue(app: &mut StudioApp, target: Target, options: Options, repair: bool, resume_batch: bool) {
+    let same_root = app.ws.as_ref().zip(app.workflow.run.as_ref()).is_some_and(|(w, r)| ystudio_core::same_path(&w.root, &r.root));
+    if !same_root || app.workflow.run.as_ref().is_some_and(|r| r.stopped || r.cancelled) {
+        if app.workflow.run.is_none() {
+            start(app, vec![target], options, repair, resume_batch);
+        } else {
+            crate::views::batch::check_finished_all(app, &target, "Not tested: run stopped or cancelled");
+        }
+        return;
+    }
+    crate::views::batch::checks_started(app, std::slice::from_ref(&target));
+    let run = app.workflow.run.as_mut().unwrap();
+    run.queue.push_back(TestJob { target, attempt: 1 });
+    if run.current.is_none() && !run.waiting_elevation {
+        advance(app);
+    }
 }
 
 pub fn poll(app: &mut StudioApp) {
@@ -362,39 +444,69 @@ fn advance(app: &mut StudioApp) {
     loop {
         let Some(run) = &app.workflow.run else { return };
         if app.ws.as_ref().is_none_or(|w| !ystudio_core::same_path(&w.root, &run.root) || !w.is_writable()) {
-            finish(app, false, "Workspace changed; automatic checks stopped.".into());
+            end_run(app, Some("Workspace changed; automatic checks stopped."));
             return;
         }
         if run.cancelled {
-            finish(app, false, "Cancelled; live-test cleanup may need manual review.".into());
+            end_run(app, Some("Cancelled; live-test cleanup may need manual review."));
             return;
         }
+        if run.current.is_none() {
+            let run = app.workflow.run.as_mut().unwrap();
+            if run.stopped {
+                end_run(app, None);
+                return;
+            }
+            // Sequential: the harness waits for the repair, then retests that recipe.
+            if run.parallel <= 1 && !run.repairing.is_empty() {
+                return;
+            }
+            match run.queue.pop_front() {
+                Some(job) => {
+                    run.current = Some(job);
+                    run.reset_step();
+                }
+                None => {
+                    if run.repairing.is_empty() && run.repair_waiting.is_empty() {
+                        end_run(app, None);
+                    } else {
+                        app.workflow.message = "Waiting for repairs to finish".into();
+                    }
+                    return;
+                }
+            }
+            continue;
+        }
+        let run = app.workflow.run.as_ref().unwrap();
+        let job = run.current.as_ref().unwrap();
         let count = if run.options.live { Step::ALL.len() } else { Step::ALL.len() - 1 };
         if run.step == count {
             let note = if !run.options.live { "Safe checks passed; live test still required" }
                 else if run.warned { "Validated with warnings; review harness evidence" } else { "Validated" };
-            finish(app, true, note.into());
-            return;
+            complete_current(app, true, note.into());
+            continue;
         }
         let step = Step::ALL[run.step];
-        let id = run.current.id.clone();
-        let attempt = run.attempt;
-        app.workflow.message = format!("{}: {} (attempt {attempt}/{})", id, step.title(), run.options.attempts);
+        let id = job.target.id.clone();
+        let attempt = job.attempt;
+        let waiting = run.queue.len();
+        let queued = if waiting > 0 { format!(" · {waiting} waiting to test") } else { String::new() };
+        app.workflow.message = format!("{}: {} (attempt {attempt}/{}){queued}", id, step.title(), run.options.attempts);
         let consent = if step == Step::Live { run.options.consent } else { Consent::None };
         let Some(path) = recipe_path(app, &id, run.repair) else { return };
         if !ystudio_core::recipe::is_valid_id(&id) || !path.is_file() {
-            finish(app, false, format!("Recipe {id} is missing; create its Development copy first."));
-            return;
+            complete_current(app, false, format!("Recipe {id} is missing; create its Development copy first."));
+            continue;
         }
         if step == Step::Lint {
             app.bench.steps.retain(|(recipe_id, _), _| recipe_id != &id);
             let text = match ystudio_core::read_text(&path) {
                 Ok(text) => text,
-                Err(e) => { finish(app, false, format!("Could not read {id}: {e:#}")); return; }
+                Err(e) => { complete_current(app, false, format!("Could not read {id}: {e:#}")); continue; }
             };
             let diagnostics = match app.lint_diagnostics(&text, &id) {
                 Ok(diagnostics) => diagnostics,
-                Err(e) => { finish(app, false, e); return; }
+                Err(e) => { complete_current(app, false, e); continue; }
             };
             let failed = lint::count(&diagnostics, Severity::Error) > 0;
             let state = if failed { StepState::Fail } else if lint::count(&diagnostics, Severity::Warning) > 0 { StepState::Warn } else { StepState::Pass };
@@ -417,8 +529,8 @@ fn advance(app: &mut StudioApp) {
                     return;
                 }
                 crate::elevation::Live::Blocked(reason) => {
-                    finish(app, false, format!("Blocked: {reason} The system-context live test did not run."));
-                    return;
+                    complete_current(app, false, format!("Blocked: {reason} The system-context live test did not run."));
+                    continue;
                 }
             };
             app.workflow.run.as_mut().unwrap().elevated = Some(true);
@@ -438,7 +550,7 @@ fn advance(app: &mut StudioApp) {
         let Some(ws) = &app.ws else { return };
         let spec = match harness::build(ws, &action, consent, &app.pwsh()) {
             Ok(spec) => spec,
-            Err(e) => { finish(app, false, format!("Could not build harness command: {e:#}")); return; }
+            Err(e) => { complete_current(app, false, format!("Could not build harness command: {e:#}")); continue; }
         };
         let job = app.start_job(spec, JobKind::WorkflowHarness { step, recipe_id: id.clone() });
         let context = if step == Step::Live {
@@ -455,7 +567,7 @@ fn track(app: &mut StudioApp, id: String, step: Step, job: Option<u64>, context:
     app.workflow.last_job = job;
     app.bench.last_job = job;
     app.agent.job = job;
-    let items = app.workflow.run.as_ref().map(|r| r.current.items.clone()).unwrap_or_default();
+    let items = app.workflow.run.as_ref().and_then(|r| r.current.as_ref()).map(|j| j.target.items.clone()).unwrap_or_default();
     if !items.is_empty() {
         app.batch.run_job = job;
     }
@@ -464,7 +576,8 @@ fn track(app: &mut StudioApp, id: String, step: Step, job: Option<u64>, context:
         crate::views::batch::checks_progress(app, &items, &format!("{}{context}", step.title()));
         app.bench.steps.insert((id, step), StepState::Running);
     } else {
-        finish(app, false, "Could not start the harness; check the console.".into());
+        complete_current(app, false, "Could not start the harness; check the console.".into());
+        advance(app);
     }
 }
 
@@ -488,7 +601,7 @@ fn environmental(text: &str) -> bool {
 }
 
 pub fn harness_finished(app: &mut StudioApp, step: Step, id: &str, ok: bool, started: SystemTime, text: String) {
-    if app.workflow.run.is_none() { return; }
+    if app.workflow.run.as_ref().and_then(|r| r.current.as_ref()).is_none() { return; }
     let run = if matches!(step, Step::DryRun | Step::Live) {
         app.ws.as_ref().and_then(|w| results::newest_run_since(&w.layout.harness_artifacts, started))
     } else { None };
@@ -516,7 +629,7 @@ pub fn harness_finished(app: &mut StudioApp, step: Step, id: &str, ok: bool, sta
         app.bench.last_run = Some(run);
     }
     if app.workflow.run.as_ref().is_some_and(|r| r.cancelled) {
-        finish(app, false, "Cancelled; live-test cleanup may need manual review.".into());
+        end_run(app, Some("Cancelled; live-test cleanup may need manual review."));
     } else if passed {
         app.workflow.run.as_mut().unwrap().warned |= warning;
         app.workflow.run.as_mut().unwrap().step += 1;
@@ -536,38 +649,79 @@ fn last_error(text: &str) -> String {
     line.map_or_else(|| "no output".into(), |l| l.to_string())
 }
 
-/// `evidence` is the full record for the repair agent; `summary` is one line
-/// for status messages and batch notes.
+/// The current recipe failed a check. `evidence` is the full record for the
+/// repair agent; `summary` is one line for status messages and batch notes.
 fn fail(app: &mut StudioApp, evidence: String, summary: String, blocker: bool) {
     let Some(run) = &mut app.workflow.run else { return };
-    if !run.can_repair(blocker) {
+    let Some(job) = run.current.clone() else { return };
+    if !run.can_repair(&job, blocker) {
         let prefix = if blocker { "Blocked (environment or incomplete harness evidence)" } else { "Checks failed" };
-        finish(app, false, format!("{prefix}: {summary}"));
+        complete_current(app, false, format!("{prefix}: {summary}"));
+        advance(app);
         return;
     }
-    run.attempt += 1;
-    run.step = 0;
-    run.summary_dir = None;
-    run.warned = false;
-    let id = run.current.id.clone();
+    run.current = None;
+    run.reset_step();
+    let job = TestJob { attempt: job.attempt + 1, ..job };
+    let parallel = run.parallel;
+    if parallel > 1 && agents_running(app) >= parallel {
+        app.workflow.message = format!("{}: repair waiting for a free agent", job.target.id);
+        app.workflow.run.as_mut().unwrap().repair_waiting.push_back((job, evidence));
+    } else {
+        start_repair(app, job, evidence);
+    }
+    advance(app);
+}
+
+/// Starts a repair agent for `job`; a recipe that cannot be repaired is recorded as failed.
+fn start_repair(app: &mut StudioApp, job: TestJob, evidence: String) {
+    let id = job.target.id.clone();
     let task = AgentTask::Fix {
         id: id.clone(), evidence,
         notes: "Fix only this recipe's failure. Studio will re-run every check after your reply. Do not run live installs yourself. For environmental blockers report STUDIO-BLOCKED: <reason> without editing the recipe.".into(),
     };
-    let ws = app.ws.as_ref().unwrap();
-    let spec = match agent::build_command(ws, app.settings.agent_backend, &app.settings.agent_model, &app.settings.production_paths, &task, crate::views::settings::agent_options(app)) {
+    let Some(ws) = app.ws.as_ref() else { return };
+    #[cfg(test)]
+    if app.workflow.fake_repairs.is_some() {
+        let spec = ystudio_core::process::ProcessSpec::new(format!("fake repair {id}"), "agent", &ws.root);
+        let before = Snapshot::take(ws);
+        let (proc, feed) = ystudio_core::process::RunningProcess::remote(spec, "test", None, Box::new(|| {}));
+        app.workflow.fake_repairs.as_mut().unwrap().push(feed);
+        let jid = app.add_job(proc, JobKind::WorkflowRepair { before });
+        app.workflow.run.as_mut().unwrap().repairing.push((jid, job));
+        return;
+    }
+    let mut options = crate::views::settings::agent_options(app);
+    // The Studio runs the agents in parallel; each one works alone.
+    options.multi_agent &= parallel_agents(app) <= 1;
+    let spec = match agent::build_command(ws, app.settings.agent_backend, &app.settings.agent_model, &app.settings.production_paths, &task, options) {
         Ok(spec) => spec,
-        Err(e) => { finish(app, false, format!("Could not start repair: {e:#}")); return; }
+        Err(e) => { record_check(app, &job, false, format!("Could not start repair: {e:#}"), None, None); return; }
     };
     let before = Snapshot::take(ws);
-    app.workflow.message = format!("Repairing {id}; next test attempt {}", app.workflow.run.as_ref().unwrap().attempt);
-    let job = app.start_job(spec, JobKind::WorkflowRepair { before });
-    app.workflow.last_job = job;
-    app.agent.job = job;
-    if app.workflow.run.as_ref().is_some_and(|r| !r.current.items.is_empty()) {
-        app.batch.run_job = job;
+    app.workflow.message = format!("Repairing {id}; next test attempt {}", job.attempt);
+    let started = app.start_job(spec, JobKind::WorkflowRepair { before });
+    app.agent.job = started;
+    if !job.target.items.is_empty() {
+        app.batch.run_job = started;
+        crate::views::batch::checks_progress(app, &job.target.items, "Repairing");
     }
-    if job.is_none() { finish(app, false, "Could not start the repair agent.".into()); }
+    match started {
+        Some(jid) => app.workflow.run.as_mut().unwrap().repairing.push((jid, job)),
+        None => record_check(app, &job, false, "Could not start the repair agent.".into(), None, None),
+    }
+}
+
+/// Starts waiting repairs while agents are free (parallel mode).
+fn start_waiting_repairs(app: &mut StudioApp) {
+    loop {
+        let Some(run) = &app.workflow.run else { return };
+        if run.repair_waiting.is_empty() || run.cancelled || agents_running(app) >= run.parallel {
+            return;
+        }
+        let (job, evidence) = app.workflow.run.as_mut().unwrap().repair_waiting.pop_front().unwrap();
+        start_repair(app, job, evidence);
+    }
 }
 
 /// `text` on one line, cut to `limit` characters.
@@ -576,8 +730,10 @@ fn brief(text: &str, limit: usize) -> String {
     if line.chars().count() <= limit { line } else { format!("{}…", line.chars().take(limit).collect::<String>()) }
 }
 
-pub fn repair_finished(app: &mut StudioApp, before: Snapshot, ok: bool, text: &str) {
-    if app.workflow.run.is_none() { return; }
+pub fn repair_finished(app: &mut StudioApp, job_id: u64, before: Snapshot, ok: bool, text: &str) {
+    let Some(run) = &mut app.workflow.run else { return };
+    let Some(pos) = run.repairing.iter().position(|(j, _)| *j == job_id) else { return };
+    let (_, job) = run.repairing.remove(pos);
     let mut reload = None;
     if let Some(ws) = &app.ws {
         let changes = before.diff(&Snapshot::take(ws));
@@ -587,69 +743,99 @@ pub fn repair_finished(app: &mut StudioApp, before: Snapshot, ok: bool, text: &s
     }
     app.refresh_recipes();
     if let Some(path) = reload { app.open_recipe(&path); }
-    if app.workflow.run.as_ref().is_some_and(|r| r.cancelled) {
-        finish(app, false, "Cancelled.".into());
+    let cancelled = app.workflow.run.as_ref().is_some_and(|r| r.cancelled || r.stopped);
+    if cancelled {
+        record_check(app, &job, false, "Not tested: run stopped or cancelled".into(), None, None);
     } else if agent::needs_approval(text) {
-        finish(app, false, format!("Repair agent stopped: {NEEDS_APPROVAL_NOTE}"));
+        record_check(app, &job, false, format!("Repair agent stopped: {NEEDS_APPROVAL_NOTE}"), None, None);
     } else if !ok || agent::blocked_reason(text).is_some() {
         let why = agent::blocked_reason(text).unwrap_or_else(|| "it exited with an error; see the console".into());
-        finish(app, false, format!("Repair agent stopped: {why}"));
+        record_check(app, &job, false, format!("Repair agent stopped: {why}"), None, None);
     } else {
+        if !job.target.items.is_empty() {
+            crate::views::batch::checks_progress(app, &job.target.items, "Waiting to test");
+        }
+        // Sequential: the repaired recipe is tested next. Parallel: after the
+        // requests that arrived while it was being repaired.
+        let run = app.workflow.run.as_mut().unwrap();
+        if run.parallel > 1 { run.queue.push_back(job) } else { run.queue.push_front(job) }
+    }
+    start_waiting_repairs(app);
+    if app.workflow.run.as_ref().is_some_and(|r| r.parallel > 1) {
+        crate::views::batch::start_next(app);
+    }
+    if app.workflow.run.as_ref().is_some_and(|r| r.current.is_none() && !r.waiting_elevation) {
         advance(app);
     }
 }
 
-fn finish(app: &mut StudioApp, passed: bool, note: String) {
-    let Some(mut run) = app.workflow.run.take() else { return };
-    // Notes appear in the progress line, batch rows and the copied report.
+/// Records a check result on every batch item that asked for `job`'s recipe.
+fn record_check(app: &mut StudioApp, job: &TestJob, passed: bool, note: String, summary_dir: Option<PathBuf>, elevated: Option<bool>) {
     let note = brief(&note, 400);
-    app.workflow.message = format!("{}: {note}", run.current.id);
-    let context = match run.elevated {
+    let context = match elevated {
         Some(true) => ", live test elevated",
         Some(false) => ", live test unelevated",
         None => "",
     };
+    let live = passed && app.workflow.run.as_ref().is_some_and(|r| r.options.live);
     let check = BatchCheck {
-        recipe: run.current.id.clone(), passed, note: format!("{note} ({} test attempt(s){context})", run.attempt),
-        timestamp: ystudio_core::intake::timestamp(), summary_dir: run.summary_dir.clone(), live: passed && run.options.live,
+        recipe: job.target.id.clone(), passed, note: format!("{note} ({} test attempt(s){context})", job.attempt),
+        timestamp: ystudio_core::intake::timestamp(), summary_dir, live,
     };
-    for (batch_id, idx) in &run.current.items {
+    for (batch_id, idx) in &job.target.items {
         crate::views::batch::check_finished(app, batch_id, *idx, check.clone());
     }
+    app.workflow.message = format!("{}: {note}", job.target.id);
     if passed { app.notify(app.workflow.message.clone()); } else { app.error(app.workflow.message.clone()); }
-    if !run.stopped && !run.cancelled && let Some(next) = run.queue.pop_front() {
-        run.current = next;
-        run.attempt = 1;
-        run.step = 0;
-        run.summary_dir = None;
-        run.warned = false;
-        run.elevated = None;
-        app.workflow.run = Some(run);
-        app.workflow.advance_pending = true;
-        (app.waker)();
-    } else if run.resume_batch && !run.cancelled {
+}
+
+/// The app in the harness is done: record it and free the harness for the next.
+fn complete_current(app: &mut StudioApp, passed: bool, note: String) {
+    let Some(run) = &mut app.workflow.run else { return };
+    let Some(job) = run.current.take() else { return };
+    let (summary_dir, elevated) = (run.summary_dir.take(), run.elevated);
+    run.reset_step();
+    record_check(app, &job, passed, note, summary_dir, elevated);
+}
+
+/// Ends the coordinator. Anything still queued or being repaired is recorded
+/// as not tested; with `note`, the app in the harness fails with that note.
+fn end_run(app: &mut StudioApp, note: Option<&str>) {
+    if let Some(note) = note {
+        complete_current(app, false, note.into());
+    }
+    let Some(run) = app.workflow.run.take() else { return };
+    let message = app.workflow.message.clone();
+    let leftovers: Vec<TestJob> = run.current.into_iter().chain(run.queue).chain(run.repairing.into_iter().map(|(_, j)| j))
+        .chain(run.repair_waiting.into_iter().map(|(j, _)| j)).collect();
+    for job in &leftovers {
+        crate::views::batch::check_finished_all(app, &job.target, "Not tested: run stopped or cancelled");
+    }
+    if !message.is_empty() {
+        app.workflow.message = message;
+    }
+    if run.resume_batch && !run.cancelled && !run.stopped {
         crate::views::batch::start_next(app);
-    } else {
-        for target in run.queue {
-            for (batch_id, idx) in target.items {
-                crate::views::batch::check_finished(app, &batch_id, idx, BatchCheck {
-                    recipe: target.id.clone(), passed: false, note: "Not tested: run stopped or cancelled".into(),
-                    timestamp: ystudio_core::intake::timestamp(), summary_dir: None, live: false,
-                });
-            }
-        }
     }
 }
 
 pub fn stop(app: &mut StudioApp, cancel: bool) {
+    let mut repairs = Vec::new();
     if let Some(run) = &mut app.workflow.run {
         run.stopped = true;
         run.cancelled |= cancel;
         // Nothing is running that could finish; let advance() see the cancellation.
-        app.workflow.advance_pending |= cancel && run.waiting_elevation;
+        app.workflow.advance_pending |= cancel && run.waiting_elevation || run.current.is_none();
+        if cancel {
+            repairs = run.repairing.iter().map(|(j, _)| *j).collect();
+        }
     }
-    if cancel && let Some(id) = app.workflow.last_job && let Some(job) = app.job_mut(id) {
-        job.proc.cancel();
+    if cancel {
+        for id in app.workflow.last_job.into_iter().chain(repairs) {
+            if let Some(job) = app.job_mut(id) {
+                job.proc.cancel();
+            }
+        }
     }
     crate::views::batch::stop_queue(app);
 }
@@ -676,6 +862,23 @@ pub fn progress(app: &mut StudioApp, ui: &mut Ui) {
         }
         message(ui, &app.workflow.message);
     });
+    // In parallel mode, who is where: the harness takes one app at a time.
+    if app.workflow.run.as_ref().is_some_and(|r| r.parallel > 1)
+        && let Some((testing, waiting, repairing)) = app.workflow.queue_summary()
+    {
+        let researching = app.jobs.iter().filter(|j| j.proc.is_running() && matches!(j.kind, JobKind::Agent { batch_item: Some(_), .. })).count();
+        let mut parts = vec![format!("Testing: {}", testing.unwrap_or_else(|| "none".into()))];
+        if !waiting.is_empty() {
+            parts.push(format!("waiting: {}", waiting.join(", ")));
+        }
+        if !repairing.is_empty() {
+            parts.push(format!("repairing: {}", repairing.join(", ")));
+        }
+        if researching > 0 {
+            parts.push(format!("researching: {researching}"));
+        }
+        ui.label(RichText::new(parts.join(" · ")).small().weak());
+    }
 }
 
 #[cfg(test)]
@@ -713,23 +916,24 @@ pub(crate) mod tests {
 
     #[test]
     fn five_attempts_allow_exactly_four_repairs_and_never_repair_blockers() {
+        let mut job = TestJob { target: Target { id: "test".into(), items: Vec::new() }, attempt: 1 };
         let mut run = Run {
-            root: PathBuf::new(), queue: VecDeque::new(), current: Target { id: "test".into(), items: Vec::new() },
-            options: Options::default(), repair: true, resume_batch: false, attempt: 1, step: 0,
+            root: PathBuf::new(), queue: VecDeque::new(), current: Some(job.clone()), repairing: Vec::new(), repair_waiting: VecDeque::new(),
+            options: Options::default(), repair: true, resume_batch: false, parallel: 1, step: 0,
             stopped: false, cancelled: false, summary_dir: None, warned: false, elevated: None, waiting_elevation: false,
         };
         for expected in 1..=5 {
-            assert_eq!(run.attempt, expected);
-            assert!(!run.can_repair(true));
-            assert_eq!(run.can_repair(false), expected < 5);
-            if run.can_repair(false) { run.attempt += 1; }
+            assert_eq!(job.attempt, expected);
+            assert!(!run.can_repair(&job, true));
+            assert_eq!(run.can_repair(&job, false), expected < 5);
+            if run.can_repair(&job, false) { job.attempt += 1; }
         }
-        run.attempt = 1;
+        job.attempt = 1;
         run.cancelled = true;
-        assert!(!run.can_repair(false));
+        assert!(!run.can_repair(&job, false));
         run.cancelled = false;
         run.repair = false;
-        assert!(!run.can_repair(false));
+        assert!(!run.can_repair(&job, false));
     }
 
     #[test]
@@ -971,6 +1175,76 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         assert!(app.workflow.message.contains("live test still required"));
     }
 
+    /// Polls until no harness job runs (repairs are fake jobs the test finishes).
+    fn settle(app: &mut StudioApp) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while app.jobs.iter().any(|j| j.proc.is_running() && matches!(j.kind, JobKind::WorkflowHarness { .. })) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            app.poll_for_tests();
+        }
+        app.poll_for_tests();
+    }
+
+    #[test]
+    fn multi_agent_mode_tests_the_next_app_while_a_failed_one_is_repaired() {
+        let (_dir, mut app) = fake_app();
+        app.settings.agent_multi = true;
+        app.settings.agent_backend = ystudio_core::agent::AgentBackend::ClaudeCode;
+        app.settings.agent_parallel = 3;
+        assert_eq!(parallel_agents(&app), 3);
+        app.workflow.fake_repairs = Some(Vec::new());
+        let targets = vec![Target { id: "broken".into(), items: Vec::new() }, Target { id: "app".into(), items: Vec::new() }];
+        start(&mut app, targets, Options { live: false, attempts: 2, ..Options::default() }, true, false);
+        settle(&mut app);
+        // broken failed its schema check and went to a repair agent; the harness
+        // moved on and finished app meanwhile instead of waiting.
+        let run = app.workflow.run.as_ref().expect("the coordinator waits for the repair");
+        assert!(run.current.is_none() && run.queue.is_empty());
+        assert_eq!(run.repairing.iter().map(|(_, j)| (j.target.id.as_str(), j.attempt)).collect::<Vec<_>>(), [("broken", 2)]);
+        assert_eq!(app.step_state("app", Step::DryRun), Some(StepState::Pass));
+        assert_eq!(agents_running(&app), 1);
+
+        // The repair ends: broken rejoins the queue and is tested again; with
+        // two attempts it then fails for good and the coordinator ends.
+        let feed = app.workflow.fake_repairs.as_mut().unwrap().remove(0);
+        feed.exited(Some(0));
+        app.poll_for_tests();
+        settle(&mut app);
+        assert!(app.workflow.run.is_none(), "{}", app.workflow.message);
+        assert!(app.workflow.message.starts_with("broken: Checks failed"), "{}", app.workflow.message);
+    }
+
+    #[test]
+    fn sequential_mode_waits_for_the_repair_before_testing_the_next_app() {
+        let (_dir, mut app) = fake_app();
+        assert_eq!(parallel_agents(&app), 1);
+        app.workflow.fake_repairs = Some(Vec::new());
+        let targets = vec![Target { id: "broken".into(), items: Vec::new() }, Target { id: "app".into(), items: Vec::new() }];
+        start(&mut app, targets, Options { live: false, attempts: 2, ..Options::default() }, true, false);
+        settle(&mut app);
+        let run = app.workflow.run.as_ref().unwrap();
+        assert_eq!(run.queue.iter().map(|j| j.target.id.as_str()).collect::<Vec<_>>(), ["app"], "app waits");
+        assert_eq!(app.step_state("app", Step::DryRun), None);
+        app.workflow.fake_repairs.as_mut().unwrap().remove(0).exited(Some(0));
+        app.poll_for_tests();
+        settle(&mut app);
+        assert!(app.workflow.run.is_none());
+        assert_eq!(app.step_state("app", Step::DryRun), Some(StepState::Pass));
+    }
+
+    #[test]
+    fn only_backends_with_multi_agent_support_run_in_parallel() {
+        let (_dir, mut app) = fake_app();
+        app.settings.agent_multi = true;
+        app.settings.agent_parallel = 4;
+        app.settings.agent_backend = ystudio_core::agent::AgentBackend::Codex;
+        assert_eq!(parallel_agents(&app), 1);
+        app.settings.agent_backend = ystudio_core::agent::AgentBackend::CopilotCli;
+        assert_eq!(parallel_agents(&app), 4);
+        app.settings.agent_parallel = 50;
+        assert_eq!(parallel_agents(&app), 8);
+    }
+
     #[test]
     fn cancelling_a_harness_job_never_starts_a_repair_or_the_next_recipe() {
         let (_dir, mut app) = fake_app();
@@ -1100,8 +1374,10 @@ New-Item -ItemType Directory -Path $dir -Force | Out-Null
         app.elevation = crate::elevation::State::Waiting { rx, since: std::time::Instant::now() };
         app.workflow.request = None;
         app.workflow.run = Some(Run {
-            root: app.ws.as_ref().unwrap().root.clone(), queue: VecDeque::new(), current: Target { id: "app".into(), items: Vec::new() },
-            options: Options::default(), repair: false, resume_batch: false, attempt: 1, step: 5,
+            root: app.ws.as_ref().unwrap().root.clone(), queue: VecDeque::new(),
+            current: Some(TestJob { target: Target { id: "app".into(), items: Vec::new() }, attempt: 1 }),
+            repairing: Vec::new(), repair_waiting: VecDeque::new(), parallel: 1,
+            options: Options::default(), repair: false, resume_batch: false, step: 5,
             stopped: false, cancelled: false, summary_dir: None, warned: false, elevated: None, waiting_elevation: true,
         });
         app.workflow.message = "app: waiting for UAC approval to run the system-context live test".into();

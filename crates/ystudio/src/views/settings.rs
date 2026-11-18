@@ -421,14 +421,22 @@ pub fn agent_picker(app: &mut StudioApp, ui: &mut Ui, salt: &str) {
         save |= if multi {
             checkbox
                 .on_hover_text(
-                    "A coordinating agent splits the work into parts (download source, switches, detection, icon) and runs them \
-                     as parallel subagents, then writes the recipe itself. Faster on big recipes, but uses more AI credits.",
+                    "For one recipe, a coordinating agent splits the work into parts (download source, switches, detection, icon) \
+                     and runs them as parallel subagents. In Recipe Builder, the Studio researches several apps at once instead, \
+                     and a test coordinator runs them through the harness one at a time (Windows installs one thing at a time). \
+                     Faster, but uses more AI credits.",
                 )
                 .changed()
         } else {
             checkbox.on_disabled_hover_text(format!("{} runs one agent, so there is nothing to coordinate.", backend.label()));
             false
         };
+        if multi && app.settings.agent_multi {
+            save |= ui
+                .add(egui::DragValue::new(&mut app.settings.agent_parallel).range(2..=8).suffix(" apps at once"))
+                .on_hover_text("How many apps Recipe Builder researches in parallel. Repairs share these agents; testing stays one app at a time.")
+                .changed();
+        }
         if !backend.enforces_denied_commands() {
             ui.label(RichText::new("\u{E946}").color(theme::amber())).on_hover_text(format!(
                 "{} has a workspace sandbox (it can write only in the work folder) but no per-run list of commands to refuse, \

@@ -870,20 +870,33 @@ pub fn start_authoring(app: &mut StudioApp, indices: Vec<usize>, options: crate:
     start_next(app);
 }
 
-/// Starts the next queued item, if any.
+/// Starts the next queued item, if any. In Multi-agent mode it fills every
+/// free agent slot: several apps are researched at once while the test
+/// coordinator runs one of them through the harness at a time.
 pub fn start_next(app: &mut StudioApp) {
-    if any_agent_running(app) {
+    let parallel = crate::workflow::parallel_agents(app);
+    if parallel <= 1 && any_agent_running(app) {
+        return;
+    }
+    // Other agents (the Agent tab, an extraction) still run alone.
+    if parallel > 1
+        && app.jobs.iter().any(|j| j.proc.is_running() && matches!(j.kind, JobKind::Agent { batch_item: None, .. } | JobKind::BatchExtract { .. }))
+    {
         return;
     }
     let Some(ws) = app.ws.clone() else {
         app.batch.queue.clear();
         return;
     };
-    while let Some(idx) = app.batch.queue.pop_front() {
+    let mut started_any = false;
+    while let Some(idx) = (parallel <= 1 || crate::workflow::agents_running(app) < parallel).then(|| app.batch.queue.pop_front()).flatten() {
         let Some(b) = app.batch.batch.as_ref() else { break };
         let Some(task) = task_for(app, b, idx) else { continue };
         let batch_id = b.id.clone();
-        match agent::build_command(&ws, app.settings.agent_backend, &app.settings.agent_model, &app.settings.production_paths, &task, super::settings::agent_options(app)) {
+        let mut options = super::settings::agent_options(app);
+        // The Studio runs the agents in parallel; each one works alone.
+        options.multi_agent &= parallel <= 1;
+        match agent::build_command(&ws, app.settings.agent_backend, &app.settings.agent_model, &app.settings.production_paths, &task, options) {
             Ok(spec) => {
                 let before = Snapshot::take(&ws);
                 let verification = app.batch.verification.clone().and_then(|options| crate::workflow::task_id(&task)
@@ -900,7 +913,10 @@ pub fn start_next(app: &mut StudioApp) {
                 }
                 save(app);
                 if job.is_some() {
-                    return;
+                    if parallel <= 1 {
+                        return;
+                    }
+                    started_any = true;
                 }
             }
             Err(e) => {
@@ -910,9 +926,23 @@ pub fn start_next(app: &mut StudioApp) {
             }
         }
     }
+    // Slots are full but items are still queued: the next finished agent starts them.
+    if started_any || !app.batch.queue.is_empty() {
+        return;
+    }
     reset_queued(app);
     app.batch.verification = None;
     save(app);
+}
+
+/// Records the same failed check on every batch item that asked for `target`.
+pub fn check_finished_all(app: &mut StudioApp, target: &crate::workflow::Target, note: &str) {
+    for (batch_id, idx) in &target.items {
+        check_finished(app, batch_id, *idx, BatchCheck {
+            recipe: target.id.clone(), passed: false, note: note.to_string(),
+            timestamp: intake::timestamp(), summary_dir: None, live: false,
+        });
+    }
 }
 
 fn reset_queued(app: &mut StudioApp) {
@@ -956,6 +986,10 @@ fn with_batch(app: &mut StudioApp, batch_id: &str, f: impl FnOnce(&mut Batch)) {
 pub fn agent_finished(app: &mut StudioApp, batch_id: &str, idx: usize, outcome: Result<(), String>, verifying: bool) {
     let ok = outcome.is_ok();
     let mut ids = app.agent.reported.clone();
+    // With several agents writing at once, the workspace diff also holds the
+    // others' recipes: then only this item's own recipe counts from it.
+    let parallel = crate::workflow::parallel_agents(app) > 1;
+    let own = app.batch.batch.as_ref().filter(|b| b.id == batch_id).and_then(|b| b.items.get(idx)).map(item_key);
     for c in &app.agent.changes {
         let p = c.path();
         let is_recipe = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("yaml") || e.eq_ignore_ascii_case("yml"))
@@ -963,6 +997,7 @@ pub fn agent_finished(app: &mut StudioApp, batch_id: &str, idx: usize, outcome: 
         if is_recipe
             && let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().into_owned())
             && !ids.iter().any(|i| i.eq_ignore_ascii_case(&stem))
+            && (!parallel || own.as_ref().is_some_and(|o| o.eq_ignore_ascii_case(&stem)))
         {
             ids.push(stem);
         }
