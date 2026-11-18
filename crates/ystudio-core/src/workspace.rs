@@ -259,6 +259,57 @@ impl Workspace {
         Ok(dest)
     }
 
+    /// Renames a development recipe: the file and its `id` together, since the two
+    /// must match. `text` is the recipe's current contents (unsaved edits included);
+    /// the renamed file is written with them and the old file is removed. With
+    /// `rename_icon`, an `iconFile` named after the old id is renamed to match.
+    pub fn rename_development_recipe(&self, path: &Path, text: &str, new_id: &str, rename_icon: bool) -> Result<Renamed> {
+        self.ensure_writable("rename recipes")?;
+        if !path.parent().is_some_and(|p| same_path(p, &self.layout.development_recipes)) {
+            bail!("Only development recipes can be renamed. Copy a shipped recipe to Development first.");
+        }
+        let old_id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let new_id = new_id.trim();
+        if !crate::recipe::is_valid_id(new_id) {
+            bail!("'{new_id}' is not a valid id: use lowercase letters, digits, '.', '-' or '_'.");
+        }
+        if new_id == old_id {
+            bail!("The recipe is already called {new_id}.");
+        }
+        let dest = self.development_recipe_path(new_id);
+        // ids are lowercase, so a differently-cased existing file is the same recipe only when ids match.
+        if dest.exists() && !new_id.eq_ignore_ascii_case(&old_id) {
+            bail!("{} already exists.", dest.display());
+        }
+        if let Some(shipped) = self.find_recipe(new_id).filter(|p| !same_path(p, path) && !same_path(p, &dest)) {
+            bail!("A shipped recipe is already called {new_id} ({}); a development recipe with that id would replace it.", shipped.display());
+        }
+        let mut text = crate::recipe::set_top_level_scalar(text, "id", new_id);
+        let mut icon = None;
+        if rename_icon && let Some(from) = renamable_icon(text.as_str(), &old_id) {
+            let ext = Path::new(&from).extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "png".into());
+            let to = format!("{new_id}.{ext}");
+            let (src, dst) = (self.layout.icons.join(&from), self.layout.icons.join(&to));
+            if dst.exists() {
+                bail!("{} already exists; choose another id or leave the icon as it is.", dst.display());
+            }
+            std::fs::rename(&src, &dst).with_context(|| format!("renaming {}", src.display()))?;
+            text = crate::recipe::set_top_level_scalar(&text, "iconFile", &to);
+            icon = Some((from, to));
+        }
+        let written = std::fs::write(&dest, &text).with_context(|| format!("writing {}", dest.display()));
+        if let Err(e) = written {
+            if let Some((from, to)) = &icon {
+                let _ = std::fs::rename(self.layout.icons.join(to), self.layout.icons.join(from));
+            }
+            return Err(e);
+        }
+        if !same_path(path, &dest) {
+            std::fs::remove_file(path).with_context(|| format!("removing {} after writing {}", path.display(), dest.display()))?;
+        }
+        Ok(Renamed { old_id, path: dest, text, icon })
+    }
+
     pub fn icon_exists(&self, icon_file: &str) -> bool {
         !icon_file.trim().is_empty() && self.layout.icons.join(icon_file.trim()).is_file()
     }
@@ -443,6 +494,25 @@ pub fn discover_default(production: &Path) -> Option<PathBuf> {
     candidates.into_iter().next().or_else(|| is_yardstick_root(production).then(|| production.to_path_buf()))
 }
 
+/// The result of [`Workspace::rename_development_recipe`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Renamed {
+    pub old_id: String,
+    pub path: PathBuf,
+    /// The contents as written, with the new `id` (and `iconFile`).
+    pub text: String,
+    /// The icon file renamed, from and to.
+    pub icon: Option<(String, String)>,
+}
+
+/// The recipe's `iconFile`, when it is named after `id` and can follow a rename.
+pub fn renamable_icon(text: &str, id: &str) -> Option<String> {
+    let doc = crate::recipe::RecipeDoc::parse(text).ok()?;
+    let file = doc.get_str("iconFile")?.trim().to_string();
+    let stem = Path::new(&file).file_stem()?.to_string_lossy().into_owned();
+    (stem.eq_ignore_ascii_case(id) && !file.contains(['\\', '/', ':'])).then_some(file)
+}
+
 #[cfg(test)]
 pub(crate) use tests::fake_workspace;
 
@@ -479,6 +549,46 @@ mod tests {
         let m = parse_project_psd1("@{\n  RecipesPath = 'Recipes'\n  HarnessPath = \"Tests\\RecipeHarness\"\n}");
         assert_eq!(m["RecipesPath"], "Recipes");
         assert_eq!(m["HarnessPath"], r"Tests\RecipeHarness");
+    }
+
+    #[test]
+    fn renaming_moves_the_file_id_and_icon_together() {
+        let d = fake_workspace(None);
+        let root = d.path();
+        let ws = Workspace::open(root, &[], &[]).unwrap();
+        std::fs::write(root.join(r"Icons\brave.png"), [1u8]).unwrap();
+        let old = root.join(r"Recipes\Development\brave.yaml");
+        // Unsaved edits travel with the rename.
+        let edited = "id: brave\ndisplayName: Brave Browser\niconFile: brave.png\n";
+        let r = ws.rename_development_recipe(&old, edited, "brave-browser", true).unwrap();
+        assert_eq!(r.old_id, "brave");
+        assert_eq!(r.path, root.join(r"Recipes\Development\brave-browser.yaml"));
+        assert!(!old.exists());
+        let written = std::fs::read_to_string(&r.path).unwrap();
+        assert_eq!(written, "id: brave-browser\ndisplayName: Brave Browser\niconFile: brave-browser.png\n");
+        assert_eq!(r.icon, Some(("brave.png".into(), "brave-browser.png".into())));
+        assert!(root.join(r"Icons\brave-browser.png").is_file() && !root.join(r"Icons\brave.png").exists());
+    }
+
+    #[test]
+    fn renaming_refuses_shipped_recipes_bad_ids_and_collisions() {
+        let d = fake_workspace(None);
+        let root = d.path();
+        let ws = Workspace::open(root, &[], &[]).unwrap();
+        let dev = root.join(r"Recipes\Development\brave.yaml");
+        let err = |p: &Path, id: &str| format!("{:#}", ws.rename_development_recipe(p, "id: x\n", id, false).unwrap_err());
+        assert!(err(&root.join(r"Recipes\7zip.yaml"), "sevenzip").contains("Only development recipes"));
+        assert!(err(&dev, "Brave Browser").contains("not a valid id"));
+        assert!(err(&dev, "brave").contains("already called"));
+        assert!(err(&dev, "7zip").contains("shipped recipe is already called 7zip"));
+        std::fs::write(root.join(r"Recipes\Development\other.yaml"), "id: other\n").unwrap();
+        assert!(err(&dev, "other").contains("already exists"));
+        // An icon that is not named after the recipe stays put.
+        let kept = ws.rename_development_recipe(&dev, "id: brave\niconFile: shared.png\n", "brave2", true).unwrap();
+        assert_eq!(kept.icon, None);
+        assert!(kept.text.contains("iconFile: shared.png"));
+        let prod = Workspace::open(root, &[root.to_path_buf()], &[]).unwrap();
+        assert!(prod.rename_development_recipe(&kept.path, "id: brave2\n", "brave3", false).is_err());
     }
 
     #[test]

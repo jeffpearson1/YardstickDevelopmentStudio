@@ -234,7 +234,7 @@ The YAML text is the source of truth. The Designer parses it into an ordered `Re
 and writes it back keeping the original key order. New keys are appended in catalogue
 order, and scripts are written as literal blocks. YAML comments can't survive that round
 trip, so the Designer warns first; the YAML Editor edits the raw text, comments included.
-*Copy to Development* is a plain file copy. The linter (`lint.rs`) gives instant
+*Copy to Development* is a plain file copy. *Rename* (beside the id in the recipe header, and on the Design tab's `id` field) changes a development recipe's file name and `id` together (`Workspace::rename_development_recipe`), carrying unsaved edits and, optionally, an `iconFile` named after the old id. The open working list, the Agent tab's draft and the Icon tab follow the new id; a rename is refused while agents or checks run, onto an existing or shipped id, and for ids that a plugin-linked item fixes. The linter (`lint.rs`) gives instant
 feedback, while the harness's `Test-RecipeSchema.ps1` remains the authoritative validator.
 
 ## Safety model

@@ -185,6 +185,8 @@ pub struct OpenRecipe {
     pub accept_comment_loss: bool,
     pub section: usize,
     pub show_all_fields: bool,
+    /// The Rename dialog, while it is open.
+    pub rename: Option<crate::views::RenameDraft>,
     /// The parse of `text` at some revision; see [`OpenRecipe::take_parsed`].
     pub parsed: Option<ParsedRecipe>,
 }
@@ -794,6 +796,7 @@ impl StudioApp {
             section: 0,
             show_all_fields: false,
             parsed: None,
+            rename: None,
         });
         self.relint();
     }
@@ -1784,6 +1787,7 @@ impl StudioApp {
         }
 
         self.pending_modal(&ctx);
+        views::rename_modal(self, &ctx);
         views::recipes::windows(self, &ctx);
         views::batch::paste_window(self, &ctx);
         views::batch::modals(self, &ctx);
