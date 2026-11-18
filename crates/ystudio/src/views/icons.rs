@@ -10,7 +10,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::SystemTime;
 
 use eframe::egui::{self, Color32, RichText, TextureHandle, Ui};
-use ystudio_core::icons::{self, Candidate, IconQuery, Process, RgbaImage, SearchEvent};
+use ystudio_core::icons::{self, Candidate, IconQuery, Process, RgbaImage, SearchEvent, SharedState};
 
 use crate::app::StudioApp;
 use crate::theme::{self, FluentText as _};
@@ -25,6 +25,9 @@ enum Backdrop {
     Dark,
     Light,
 }
+
+/// A comparison of `Icons` with the shared folder, or why it could not run.
+type SharedScan = Result<Vec<(String, SharedState)>, String>;
 
 #[derive(Default)]
 pub struct IconsState {
@@ -54,6 +57,12 @@ pub struct IconsState {
     current: Option<CurrentIcon>,
     /// Start a search on the next frame (set by other views' hooks).
     pub auto_search: bool,
+    /// How `Icons\` compares with the shared icon folder; `None` until scanned.
+    shared: Option<SharedScan>,
+    shared_rx: Option<Receiver<SharedScan>>,
+    /// Pushes in flight: each result is (file, copied or why not).
+    push_rx: Option<Receiver<(String, Result<bool, String>)>>,
+    pushing: Vec<String>,
 }
 
 /// What the last save wrote, so the Save button can show that the preview on screen
@@ -106,6 +115,45 @@ impl IconsState {
 
     pub fn searching(&self) -> bool {
         self.rx.is_some()
+    }
+
+    /// Compares `Icons\` with the shared folder on a worker thread (it may be a
+    /// slow network share).
+    fn scan_shared(&mut self, local: PathBuf, shared: PathBuf, waker: ystudio_core::process::Waker) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(icons::compare_shared(&local, &shared).map_err(|e| format!("{e:#}")));
+            waker();
+        });
+        self.shared_rx = Some(rx);
+    }
+
+    /// Copies icons to the shared folder on a worker thread, one result each.
+    fn push(&mut self, local: PathBuf, shared: PathBuf, files: Vec<(String, bool)>, waker: ystudio_core::process::Waker) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.pushing.extend(files.iter().map(|(f, _)| f.clone()));
+        std::thread::spawn(move || {
+            for (file, replace) in files {
+                let r = icons::push_shared(&local, &shared, &file, replace).map_err(|e| format!("{e:#}"));
+                let _ = tx.send((file, r));
+                waker();
+            }
+        });
+        self.push_rx = Some(rx);
+    }
+
+    fn shared_state(&self, file: &str) -> Option<SharedState> {
+        let list = self.shared.as_ref()?.as_ref().ok()?;
+        Some(list.iter().find(|(n, _)| n.eq_ignore_ascii_case(file)).map_or(SharedState::Missing, |(_, s)| *s))
+    }
+
+    fn set_shared(&mut self, file: &str, state: SharedState) {
+        if let Some(Ok(list)) = &mut self.shared {
+            match list.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(file)) {
+                Some(entry) => entry.1 = state,
+                None => list.push((file.to_string(), state)),
+            }
+        }
     }
 
     fn stop(&mut self) {
@@ -260,8 +308,90 @@ pub fn prepare_for_recipe(app: &mut StudioApp, id: &str) {
     app.icons.recipe_id = Some(id.to_string());
 }
 
+/// Opens the library-wide Icons page (the sidebar entry): no recipe or Builder
+/// item, and a fresh comparison with the shared folder.
+pub fn open_library(app: &mut StudioApp) {
+    if app.icons.batch_item.is_some() || app.icons.recipe_id.is_some() {
+        app.icons.prepare("", "", "", "");
+    }
+    app.icons.shared = None;
+}
+
+/// Drains the shared-folder scan and pushes.
+fn poll_shared(app: &mut StudioApp) {
+    if let Some(rx) = &app.icons.shared_rx
+        && let Ok(result) = rx.try_recv()
+    {
+        app.icons.shared = Some(result);
+        app.icons.shared_rx = None;
+    }
+    let mut done = Vec::new();
+    if let Some(rx) = &app.icons.push_rx {
+        loop {
+            match rx.try_recv() {
+                Ok(r) => done.push(r),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    app.icons.push_rx = None;
+                    break;
+                }
+            }
+        }
+    }
+    let (mut copied, mut failed) = (Vec::new(), Vec::new());
+    for (file, result) in done {
+        app.icons.pushing.retain(|f| f != &file);
+        match result {
+            Ok(_) => {
+                app.icons.set_shared(&file, SharedState::Same);
+                copied.push(file);
+            }
+            Err(e) => failed.push(e),
+        }
+    }
+    if let Some(e) = failed.first() {
+        app.error(if failed.len() == 1 { e.clone() } else { format!("{e} ({} more failed)", failed.len() - 1) });
+    } else if !copied.is_empty() {
+        let what = if copied.len() == 1 { copied[0].clone() } else { format!("{} icons", copied.len()) };
+        app.notify(format!("Pushed {what} to the shared icon folder; production Yardstick picks it up on its next sync."));
+    }
+}
+
+/// Starts pushing `files` (name, replace a different file) to the shared folder.
+fn push_icons(app: &mut StudioApp, files: Vec<(String, bool)>) {
+    let Some(ws) = &app.ws else { return };
+    if let Err(e) = ws.ensure_writable("push icons from") {
+        let msg = format!("{e:#}");
+        app.error(msg);
+        return;
+    }
+    let Some(shared) = ws.shared_icons.clone() else {
+        app.error("No shared icon folder (SharedIcons) is set in Local\\preferences.yaml.");
+        return;
+    };
+    let local = ws.layout.icons.clone();
+    let files: Vec<_> = files.into_iter().filter(|(f, _)| !app.icons.pushing.contains(f)).collect();
+    if !files.is_empty() {
+        let waker = app.waker.clone();
+        app.icons.push(local, shared, files, waker);
+    }
+}
+
+/// Starts (or restarts) the comparison with the shared folder.
+fn rescan_shared(app: &mut StudioApp) {
+    let Some(ws) = &app.ws else { return };
+    let Some(shared) = ws.shared_icons.clone() else { return };
+    let local = ws.layout.icons.clone();
+    let waker = app.waker.clone();
+    app.icons.scan_shared(local, shared, waker);
+}
+
 pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     app.icons.poll();
+    poll_shared(app);
+    if app.icons.shared.is_none() && app.icons.shared_rx.is_none() {
+        rescan_shared(app);
+    }
     if app.icons.auto_search {
         app.icons.auto_search = false;
         app.icons.start(app.waker.clone());
@@ -273,8 +403,8 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         super::recipe_header(app, ui);
     } else {
         ui.horizontal_wrapped(|ui| {
-            theme::page_title(ui, "Icon finder");
-            ui.label(RichText::new("installer resources · Wikidata · Chocolatey · vendor site · image search").weak());
+            theme::page_title(ui, "Icons");
+            ui.label(RichText::new("find, clean up and share recipe icons: installer resources · Wikidata · Chocolatey · vendor site · image search").weak());
         });
         egui::Panel::left("icons-missing").resizable(true).default_size(260.0).frame(theme::pane_frame()).show(ui, |ui| missing_panel(app, ui));
     }
@@ -298,7 +428,8 @@ fn missing_panel(app: &mut StudioApp, ui: &mut Ui) {
     ui.add(egui::TextEdit::singleline(&mut app.icons.filter).hint_text("filter").desired_width(f32::INFINITY));
     let f = app.icons.filter.to_lowercase();
     let mut pick = None;
-    egui::ScrollArea::vertical().id_salt("icons-missing-scroll").show(ui, |ui| {
+    let list_height = (ui.available_height() * 0.45).max(120.0);
+    egui::ScrollArea::vertical().id_salt("icons-missing-scroll").max_height(list_height).show(ui, |ui| {
         for (id, why) in missing.iter().filter(|(id, _)| f.is_empty() || id.to_lowercase().contains(&f)) {
             let selected = app.icons.recipe_id.as_deref() == Some(id.as_str());
             let resp = ui.add(egui::Button::selectable(selected, RichText::new(id).monospace())).on_hover_text(why);
@@ -312,6 +443,100 @@ fn missing_panel(app: &mut StudioApp, ui: &mut Ui) {
     });
     if let Some(id) = pick {
         prepare_for_recipe(app, &id);
+    }
+    ui.add_space(10.0);
+    server_panel(app, ui);
+}
+
+/// Icons that production cannot see yet: those missing from, or different in,
+/// the shared icon folder, with Push / Replace.
+fn server_panel(app: &mut StudioApp, ui: &mut Ui) {
+    let Some(share) = app.ws.as_ref().and_then(|w| w.shared_icons.clone()) else {
+        theme::section_heading(ui, "On the server");
+        ui.label(RichText::new("No shared icon folder (SharedIcons) is set in Local\\preferences.yaml, so icons cannot reach production from here.").small().weak());
+        return;
+    };
+    let writable = app.writable();
+    let mut push: Vec<(String, bool)> = Vec::new();
+    let mut rescan = false;
+    let st = &app.icons;
+    let (missing, differs): (Vec<String>, Vec<String>) = match &st.shared {
+        Some(Ok(list)) => (
+            list.iter().filter(|(_, s)| *s == SharedState::Missing).map(|(n, _)| n.clone()).collect(),
+            list.iter().filter(|(_, s)| *s == SharedState::Differs).map(|(n, _)| n.clone()).collect(),
+        ),
+        _ => (Vec::new(), Vec::new()),
+    };
+    ui.horizontal(|ui| {
+        theme::section_heading(ui, "On the server");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let busy = st.shared_rx.is_some();
+            if ui.add_enabled(!busy, egui::Button::new("\u{E72C}").frame(false)).on_hover_text("Compare again").clicked() {
+                rescan = true;
+            }
+        });
+    });
+    ui.label(RichText::new(share.display().to_string()).small().weak()).on_hover_text("SharedIcons: production Yardstick syncs icons from this folder.");
+    match &st.shared {
+        None => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("Comparing with the shared folder…").weak());
+            });
+        }
+        Some(Err(e)) => {
+            ui.colored_label(theme::amber(), e);
+        }
+        Some(Ok(_)) => {
+            if missing.is_empty() && differs.is_empty() {
+                ui.colored_label(theme::green(), "\u{E73E}  Every icon is on the server.");
+            } else {
+                let mut parts = Vec::new();
+                if !missing.is_empty() {
+                    parts.push(format!("{} not there yet", missing.len()));
+                }
+                if !differs.is_empty() {
+                    parts.push(format!("{} different", differs.len()));
+                }
+                ui.label(RichText::new(parts.join(" · ")).color(theme::amber()));
+            }
+            if !missing.is_empty()
+                && ui
+                    .add_enabled(writable && st.pushing.is_empty(), egui::Button::new(format!("\u{E898}  Push {} to the server", missing.len())))
+                    .on_hover_text("Copy every icon the shared folder does not have yet. Different files already there are left alone.")
+                    .clicked()
+            {
+                push.extend(missing.iter().map(|f| (f.clone(), false)));
+            }
+            egui::ScrollArea::vertical().id_salt("icons-server-scroll").show(ui, |ui| {
+                for (file, replace) in missing.iter().map(|f| (f, false)).chain(differs.iter().map(|f| (f, true))) {
+                    ui.horizontal(|ui| {
+                        if st.pushing.contains(file) {
+                            ui.spinner();
+                        } else {
+                            let (label, hover) = if replace {
+                                ("Replace", "The shared folder has a different file with this name; replace it with this one.")
+                            } else {
+                                ("Push", "Copy this icon to the shared folder.")
+                            };
+                            if ui.add_enabled(writable, egui::Button::new(label).small()).on_hover_text(hover).clicked() {
+                                push.push((file.clone(), replace));
+                            }
+                        }
+                        ui.label(RichText::new(file).monospace());
+                        if replace {
+                            theme::badge(ui, "differs", theme::amber());
+                        }
+                    });
+                }
+            });
+        }
+    }
+    if rescan {
+        rescan_shared(app);
+    }
+    if !push.is_empty() {
+        push_icons(app, push);
     }
 }
 
@@ -468,6 +693,10 @@ fn current_icon_path(app: &StudioApp) -> Option<PathBuf> {
         .and_then(|id| app.recipes.iter().find(|r| &r.id == id))
         .map(|r| r.meta.icon_file.trim().to_string())
         .filter(|f| !f.is_empty());
+    // With no recipe and no application named yet there is nothing to compare with.
+    if from_recipe.is_none() && app.icons.name.trim().is_empty() && app.icons.preview.is_none() {
+        return None;
+    }
     let file = from_recipe.unwrap_or_else(|| app.icons.file_name.trim().to_string());
     (!file.is_empty() && !file.contains(['\\', '/', ':'])).then(|| ws.layout.icons.join(file))
 }
@@ -628,9 +857,18 @@ fn preview_panel(app: &mut StudioApp, ui: &mut Ui) {
                 replaced: exists,
             });
             app.refresh_recipes();
+            if app.icons.shared_state(&file) == Some(SharedState::Same) {
+                app.icons.set_shared(&file, SharedState::Differs);
+            } else {
+                app.icons.set_shared(&file, SharedState::Missing);
+            }
+            rescan_shared(app);
             if let Some((batch_id, idx)) = app.icons.batch_item.clone() {
                 super::batch::icon_saved(app, &batch_id, idx, &file);
             }
+        }
+        if let Some(m) = app.icons.last_saved.as_ref().filter(|m| m.file == file) {
+            shared_line(app, ui, &m.file.clone());
         }
         if app.icons.last_saved.as_ref().is_some_and(|m| m.file == file)
             && let Some(id) = app.icons.recipe_id.clone()
@@ -648,6 +886,45 @@ fn preview_panel(app: &mut StudioApp, ui: &mut Ui) {
                 .small()
                 .weak(),
         );
+    });
+}
+
+/// After a save: whether the shared icon folder has this icon, with Push.
+fn shared_line(app: &mut StudioApp, ui: &mut Ui, file: &str) {
+    if app.ws.as_ref().is_none_or(|w| w.shared_icons.is_none()) {
+        ui.label(RichText::new("No shared icon folder (SharedIcons) is set, so this icon stays local.").small().weak());
+        return;
+    }
+    let state = app.icons.shared_state(file);
+    let pushing = app.icons.pushing.iter().any(|f| f == file);
+    ui.horizontal_wrapped(|ui| {
+        if pushing {
+            ui.spinner();
+            ui.label("Pushing to the server…");
+            return;
+        }
+        match state {
+            Some(SharedState::Same) => {
+                ui.colored_label(theme::green(), "\u{E73E}  On the server");
+            }
+            None => {
+                ui.spinner();
+                ui.label(RichText::new("Checking the server…").weak());
+            }
+            Some(s) => {
+                let replace = s == SharedState::Differs;
+                let label = if replace { "\u{E898}  Replace on the server" } else { "\u{E898}  Push to the server" };
+                let hover = if replace {
+                    "The shared icon folder has a different file with this name. Production uses that one until you replace it."
+                } else {
+                    "Copy this icon to the shared icon folder so production Yardstick picks it up."
+                };
+                if ui.add_enabled(app.writable(), egui::Button::new(label)).on_hover_text(hover).clicked() {
+                    push_icons(app, vec![(file.to_string(), replace)]);
+                }
+                ui.label(RichText::new(if replace { "differs from the server" } else { "not on the server yet" }).small().color(theme::amber()));
+            }
+        }
     });
 }
 
@@ -675,5 +952,49 @@ fn set_icon_file(app: &mut StudioApp, id: &str, file: &str) {
             app.refresh_recipes();
         }
         Err(e) => app.error(format!("Could not update {}: {e:#}", path.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::View;
+    use crate::workflow::tests::{fake_app, render};
+
+    fn wait(app: &mut StudioApp, done: impl Fn(&StudioApp) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done(app) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            poll_shared(app);
+        }
+        assert!(done(app), "timed out");
+    }
+
+    #[test]
+    fn the_icons_page_pushes_icons_production_cannot_see_yet() {
+        let (dir, mut app) = fake_app();
+        let share = dir.path().join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        std::fs::write(dir.path().join("Icons").join("other.png"), [9, 9]).unwrap();
+        std::fs::write(share.join("other.png"), [1]).unwrap();
+        app.ws.as_mut().unwrap().shared_icons = Some(share.clone());
+        // The recipe's Icon tab, then the sidebar entry: the library-wide page.
+        assert!(app.open_recipe_by_id("app"));
+        crate::views::open_recipe_tab(&mut app, View::Icons);
+        app.icons.auto_search = false;
+        open_library(&mut app);
+        app.view = View::Icons;
+        assert_eq!((app.icons.recipe_id.clone(), app.icons.batch_item.clone()), (None, None));
+        rescan_shared(&mut app);
+        wait(&mut app, |a| a.icons.shared.is_some());
+        assert_eq!(app.icons.shared_state("app.png"), Some(SharedState::Missing));
+        assert_eq!(app.icons.shared_state("other.png"), Some(SharedState::Differs));
+        render(&mut app, "icons-page", 1400, 820);
+
+        push_icons(&mut app, vec![("app.png".into(), false)]);
+        wait(&mut app, |a| a.icons.pushing.is_empty() && a.icons.push_rx.is_none());
+        assert!(share.join("app.png").is_file());
+        assert_eq!(app.icons.shared_state("app.png"), Some(SharedState::Same));
+        assert_eq!(std::fs::read(share.join("other.png")).unwrap(), [1], "a different file is only replaced on request");
     }
 }

@@ -1195,9 +1195,111 @@ pub fn search_all(query: IconQuery) -> (Vec<Candidate>, Vec<String>) {
     (list, log)
 }
 
+// ---- shared icon folder ----------------------------------------------------
+
+/// How a local icon compares with the shared icon folder (`SharedIcons`), which
+/// production Yardstick syncs from. Icons are not kept in git, so this folder is
+/// how a new icon reaches production.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedState {
+    /// The shared folder has the same file.
+    Same,
+    /// The shared folder has a different file under this name.
+    Differs,
+    /// The shared folder has no file under this name.
+    Missing,
+}
+
+fn is_icon_file(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.ends_with(".png") || n.ends_with(".jpg") || n.ends_with(".jpeg")
+}
+
+/// Compares every icon in `local` with `shared`. Files with the same size are
+/// compared byte for byte; this reads the share, so call it off the UI thread.
+pub fn compare_shared(local: &Path, shared: &Path) -> Result<Vec<(String, SharedState)>> {
+    if !shared.is_dir() {
+        bail!("The shared icon folder {} cannot be reached.", shared.display());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(local).with_context(|| format!("reading {}", local.display()))?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !entry.path().is_file() || !is_icon_file(&name) {
+            continue;
+        }
+        out.push((name.clone(), shared_state(&entry.path(), &shared.join(&name))));
+    }
+    out.sort_by_key(|(n, _)| n.to_lowercase());
+    Ok(out)
+}
+
+fn shared_state(local: &Path, remote: &Path) -> SharedState {
+    let (Ok(l), Ok(r)) = (std::fs::metadata(local), std::fs::metadata(remote)) else { return SharedState::Missing };
+    if l.len() != r.len() {
+        return SharedState::Differs;
+    }
+    match (std::fs::read(local), std::fs::read(remote)) {
+        (Ok(a), Ok(b)) if a == b => SharedState::Same,
+        _ => SharedState::Differs,
+    }
+}
+
+/// Copies `Icons\<file>` to the shared icon folder. Returns false when the share
+/// already had the same file. A different file is replaced only with `replace`.
+pub fn push_shared(local_dir: &Path, shared: &Path, file: &str, replace: bool) -> Result<bool> {
+    if file.contains(['\\', '/', ':']) || !is_icon_file(file) {
+        bail!("{file} is not an icon file name.");
+    }
+    if !shared.is_dir() {
+        bail!("The shared icon folder {} cannot be reached.", shared.display());
+    }
+    let (src, dest) = (local_dir.join(file), shared.join(file));
+    match shared_state(&src, &dest) {
+        SharedState::Same => return Ok(false),
+        SharedState::Differs if !replace => bail!("{} already has a different {file}.", shared.display()),
+        _ => {}
+    }
+    // Copy beside the target first so a reader never sees a half-written icon.
+    let tmp = shared.join(format!(".{file}.studio-tmp"));
+    std::fs::copy(&src, &tmp).with_context(|| format!("copying {} to {}", src.display(), shared.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("replacing {}", dest.display()));
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compares_and_pushes_icons_to_the_shared_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let (local, shared) = (dir.path().join("Icons"), dir.path().join("share"));
+        std::fs::create_dir_all(&local).unwrap();
+        assert!(compare_shared(&local, &shared).unwrap_err().to_string().contains("cannot be reached"));
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(local.join("new.png"), [1, 2]).unwrap();
+        std::fs::write(local.join("same.png"), [3]).unwrap();
+        std::fs::write(shared.join("same.png"), [3]).unwrap();
+        std::fs::write(local.join("changed.png"), [4]).unwrap();
+        std::fs::write(shared.join("changed.png"), [5]).unwrap();
+        std::fs::write(local.join("notes.txt"), "x").unwrap();
+        assert_eq!(compare_shared(&local, &shared).unwrap(), [
+            ("changed.png".to_string(), SharedState::Differs),
+            ("new.png".to_string(), SharedState::Missing),
+            ("same.png".to_string(), SharedState::Same),
+        ]);
+        assert!(push_shared(&local, &shared, "new.png", false).unwrap());
+        assert_eq!(std::fs::read(shared.join("new.png")).unwrap(), [1, 2]);
+        assert!(!push_shared(&local, &shared, "same.png", false).unwrap(), "nothing to copy");
+        assert!(push_shared(&local, &shared, "changed.png", false).unwrap_err().to_string().contains("different"));
+        assert!(push_shared(&local, &shared, "changed.png", true).unwrap());
+        assert_eq!(std::fs::read(shared.join("changed.png")).unwrap(), [4]);
+        assert!(push_shared(&local, &shared, "..\\evil.png", true).is_err());
+        assert!(!std::fs::read_dir(&shared).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains("studio-tmp")));
+    }
 
     fn tile(bg: [u8; 4], fg: [u8; 4], size: u32, inset: u32) -> RgbaImage {
         RgbaImage::from_fn(size, size, |x, y| if x >= inset && y >= inset && x < size - inset && y < size - inset { Rgba(fg) } else { Rgba(bg) })

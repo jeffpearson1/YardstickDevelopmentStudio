@@ -219,6 +219,15 @@ unavailable, with the reason and attempted sources documented by the agent.
 
 ### Icon engine (`icons.rs`)
 
+The sidebar's **Icons** page is the library-wide finder (an open recipe's Icon tab and Recipe
+Builder items use the same view in place). Beside the recipes with missing icons it compares
+`Icons\` with the shared icon folder (`SharedIcons`, which production Yardstick syncs from) on a
+worker thread, since that folder is usually a network share: *Push* copies an icon the share lacks,
+*Replace* overwrites a different one only on request, and *Push N to the server* copies every
+missing one. After a save the preview says whether the server has the icon, with the same Push
+button. Pushes run on a worker thread and write a temporary file beside the target first, so
+Yardstick never syncs a half-written icon.
+
 It replaces `Get-YardstickIcon.ps1`, fixing these problems:
 
 | Old tool | Studio |
@@ -385,8 +394,8 @@ Enforcement:
 
 ## Plugins
 
-A plugin adds a tab after Publish in the sidebar (Home, Recipe Library, Recipe Builder,
-Publish, *plugins*, History, Settings, Help). It is a zip with a `plugin.yaml` manifest,
+A plugin adds a tab after Icons in the sidebar (Home, Recipe Library, Recipe Builder,
+Publish, Icons, *plugins*, History, Settings, Help). It is a zip with a `plugin.yaml` manifest,
 PowerShell step scripts and agent instructions, installed to
 `%APPDATA%\YardstickStudio\plugins\<id>\`. There is no native code: a page is drawn by one of
 the Studio's built-in page types, so a plugin can change without a Studio release, and a
