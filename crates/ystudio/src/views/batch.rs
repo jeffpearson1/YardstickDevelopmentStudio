@@ -1013,6 +1013,49 @@ fn settle_checks(it: &mut BatchItem, latest: &str) {
     it.status = if it.checks.iter().all(|c| c.passed) { ItemStatus::Done } else { ItemStatus::Failed };
 }
 
+/// Whether a working-list item linked to a plugin work item names `id`; those
+/// links fix the recipe id, so renaming would silently break them.
+pub fn linked_to_plugin(app: &StudioApp, id: &str) -> bool {
+    app.batch.batch.as_ref().is_some_and(|b| {
+        b.items.iter().any(|it| !it.plugin_origins.is_empty() && names_recipe(it, id))
+    })
+}
+
+fn names_recipe(it: &BatchItem, id: &str) -> bool {
+    [&it.existing_recipe, &it.suggested_id].iter().any(|s| s.trim().eq_ignore_ascii_case(id))
+        || it.recipes.iter().any(|r| r.eq_ignore_ascii_case(id))
+}
+
+/// A recipe was renamed: the open working list's items follow it.
+pub fn recipe_renamed(app: &mut StudioApp, old: &str, new: &str) {
+    let Some(b) = app.batch.batch.as_mut() else { return };
+    let mut changed = false;
+    for it in &mut b.items {
+        if !names_recipe(it, old) {
+            continue;
+        }
+        for field in [&mut it.existing_recipe, &mut it.suggested_id] {
+            if field.trim().eq_ignore_ascii_case(old) {
+                *field = new.to_string();
+            }
+        }
+        for r in &mut it.recipes {
+            if r.eq_ignore_ascii_case(old) {
+                *r = new.to_string();
+            }
+        }
+        for c in &mut it.checks {
+            if c.recipe.eq_ignore_ascii_case(old) {
+                c.recipe = new.to_string();
+            }
+        }
+        changed = true;
+    }
+    if changed {
+        save(app);
+    }
+}
+
 /// A live install test validated `id` (from any view). Items of the open working
 /// list that use the recipe and are not mid-run record the passing check, so a
 /// recipe that was fixed elsewhere stops reading "failed".

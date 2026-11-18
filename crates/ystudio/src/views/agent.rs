@@ -114,6 +114,22 @@ impl AgentState {
         self.target_id = id.to_string();
     }
 
+    /// A recipe was renamed: its draft and latest run follow it.
+    pub fn rename(&mut self, old: &str, new: &str) {
+        if self.target_id.eq_ignore_ascii_case(old) {
+            self.target_id = new.to_string();
+        }
+        if self.job_recipe.eq_ignore_ascii_case(old) {
+            self.job_recipe = new.to_string();
+        }
+        if let Some(d) = self.drafts.remove(&old.to_lowercase()) {
+            self.drafts.insert(new.to_lowercase(), d);
+        }
+        if let Some(j) = self.last_jobs.remove(&old.to_lowercase()) {
+            self.last_jobs.insert(new.to_lowercase(), j);
+        }
+    }
+
     pub fn prepare_fix(&mut self, id: &str, evidence: String) {
         self.focus(id);
         self.draft.kind = TaskKind::Fix;

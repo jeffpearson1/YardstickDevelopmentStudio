@@ -129,7 +129,8 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
 
     let mut changed: Vec<String> = Vec::new();
     let assigned = ystudio_core::lint::script_assignments(&doc);
-    let editor = EditorOpts { icons: &icons, font_size, dark, line_numbers };
+    let can_rename = !r.read_only && r.location == ystudio_core::workspace::RecipeLocation::Development;
+    let editor = EditorOpts { icons: &icons, font_size, dark, line_numbers, can_rename };
     theme::pane(ui, |ui| {
         egui::ScrollArea::vertical().id_salt(("designer-fields", r.section)).auto_shrink(false).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -197,6 +198,9 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         app.settings.line_numbers = line_numbers;
         app.save_settings();
     }
+    if ui.ctx().data_mut(|d| d.remove_temp::<bool>(egui::Id::unique(RENAME))).unwrap_or(false) {
+        super::open_rename(app);
+    }
     if ui.ctx().data_mut(|d| d.remove_temp::<bool>(egui::Id::unique(FIND_ICON))).unwrap_or(false) {
         find_icon(app);
         return;
@@ -212,6 +216,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
 }
 
 const FIND_ICON: &str = "designer-find-icon";
+const RENAME: &str = "designer-rename";
 
 /// Opens the Icon finder for the open recipe, using its current (unsaved) fields.
 fn find_icon(app: &mut StudioApp) {
@@ -266,6 +271,8 @@ struct EditorOpts<'a> {
     font_size: f32,
     dark: bool,
     line_numbers: bool,
+    /// The open recipe is a writable development recipe.
+    can_rename: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -346,6 +353,17 @@ fn field_input(ui: &mut Ui, spec: &FieldSpec, buf: &mut String, width: f32, opts
                     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique(FIND_ICON), true));
                 }
             });
+        }
+        FieldKind::Text if spec.name == "id" => {
+            changed |= ui.add(egui::TextEdit::singleline(buf).desired_width(width)).changed();
+            if opts.can_rename
+                && ui
+                    .button("\u{E8AC}  Rename file and id\u{2026}")
+                    .on_hover_text("The id must equal the file name; this renames both, and the icon when it is named after the recipe.")
+                    .clicked()
+            {
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique(RENAME), true));
+            }
         }
         FieldKind::Text | FieldKind::Int => {
             changed |= ui.add(egui::TextEdit::singleline(buf).desired_width(width)).changed();
