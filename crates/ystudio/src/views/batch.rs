@@ -385,6 +385,16 @@ fn item_status_badge(app: &StudioApp, ui: &mut Ui, it: &BatchItem) {
         theme::badge(ui, text, color).on_hover_text("This request is owned by its linked plugin work item. Open it to continue or review progress.");
         return;
     }
+    // A failed item whose recipes have since passed a live test (in a working list
+    // that was not open at the time) is complete; the recipe, not the old run, decides.
+    let fixed_since = it.status == ItemStatus::Failed
+        && it.is_recipe_work()
+        && item_recipe_ids(it).iter().all(|id| app.completion(id).is_complete());
+    if fixed_since {
+        theme::badge(ui, "complete · not published", theme::green())
+            .on_hover_text("This item failed earlier, but its recipe has since passed a live install test and is unchanged. Ready to publish.");
+        return;
+    }
     if it.status != ItemStatus::Done {
         return status_badge(ui, it.status);
     }
@@ -980,11 +990,65 @@ pub fn check_finished(app: &mut StudioApp, batch_id: &str, idx: usize, check: Ba
         if let Some(it) = b.items.get_mut(idx) {
             it.checks.retain(|c| !c.recipe.eq_ignore_ascii_case(&check.recipe));
             it.status_note = check.note.clone();
+            let latest = check.recipe.clone();
             it.checks.push(check);
-            it.status = if it.checks.iter().all(|c| c.passed) { ItemStatus::Done } else { ItemStatus::Failed };
+            settle_checks(it, &latest);
         }
     });
     sync_plugin_recipe_work(app, batch_id, idx);
+}
+
+/// The recipe ids an item stands for: the ones its agent reported, else its own.
+fn item_recipe_ids(it: &BatchItem) -> Vec<String> {
+    if it.recipes.is_empty() { vec![it.recipe_id()] } else { it.recipes.clone() }
+}
+
+/// Drops checks of recipes the item no longer names (a repair can rename or
+/// replace the recipe), then derives Done/Failed from the checks that remain, so an
+/// old failure cannot outlive the recipe it was about.
+/// `latest` is the recipe just checked and is always kept.
+fn settle_checks(it: &mut BatchItem, latest: &str) {
+    let ids = item_recipe_ids(it);
+    it.checks.retain(|c| c.recipe.eq_ignore_ascii_case(latest) || ids.iter().any(|id| id.eq_ignore_ascii_case(&c.recipe)));
+    it.status = if it.checks.iter().all(|c| c.passed) { ItemStatus::Done } else { ItemStatus::Failed };
+}
+
+/// A live install test validated `id` (from any view). Items of the open working
+/// list that use the recipe and are not mid-run record the passing check, so a
+/// recipe that was fixed elsewhere stops reading "failed".
+pub fn recipe_validated(app: &mut StudioApp, id: &str, timestamp: &str, summary_dir: &std::path::Path) {
+    let Some(b) = app.batch.batch.as_mut() else { return };
+    let batch_id = b.id.clone();
+    let mut touched = Vec::new();
+    for (idx, it) in b.items.iter_mut().enumerate() {
+        if !it.is_recipe_work()
+            || !matches!(it.status, ItemStatus::Failed | ItemStatus::Done)
+            || !item_recipe_ids(it).iter().any(|r| r.eq_ignore_ascii_case(id))
+        {
+            continue;
+        }
+        it.checks.retain(|c| !c.recipe.eq_ignore_ascii_case(id));
+        it.checks.push(BatchCheck {
+            recipe: id.to_string(),
+            passed: true,
+            note: "Validated by a live install test".into(),
+            timestamp: timestamp.to_string(),
+            summary_dir: Some(summary_dir.to_path_buf()),
+            live: true,
+        });
+        settle_checks(it, id);
+        if it.status == ItemStatus::Done {
+            it.status_note = format!("{id} validated by a live install test.");
+        }
+        touched.push(idx);
+    }
+    if touched.is_empty() {
+        return;
+    }
+    save(app);
+    for idx in touched {
+        sync_plugin_recipe_work(app, &batch_id, idx);
+    }
 }
 
 pub fn checks_started(app: &mut StudioApp, targets: &[crate::workflow::Target]) {
@@ -1944,8 +2008,7 @@ fn detail(app: &mut StudioApp, ui: &mut Ui) {
                     ui.label(RichText::new(v).small());
                 });
             }
-            let mut body = r.body.clone();
-            ui.add(egui::TextEdit::multiline(&mut body).desired_rows(12).desired_width(f32::INFINITY).interactive(false));
+            ui.add(egui::TextEdit::multiline(&mut r.body.as_str()).desired_rows(12).desired_width(f32::INFINITY));
         }
     });
     if let Some(name) = matches_for
@@ -2238,5 +2301,50 @@ mod tests {
         assert_eq!(ids(&app, &batch), ["broken", "safeonly", "shipped"]);
         app.workflow.options.live = false;
         assert_eq!(ids(&app, &batch), ["broken", "shipped"]);
+    }
+
+    fn failed_check(recipe: &str) -> BatchCheck {
+        BatchCheck { recipe: recipe.into(), passed: false, note: "Checks failed".into(), timestamp: String::new(), summary_dir: None, live: false }
+    }
+
+    fn app_with_list(items: Vec<BatchItem>) -> (tempfile::TempDir, StudioApp) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("Yardstick.Project.psd1"), "@{\nRuntimeRoot = '.'\nRecipesPath = 'Recipes'\nDevelopmentRecipes = 'Recipes\\Development'\n}\n").unwrap();
+        std::fs::write(root.join("Yardstick.ps1"), "# never executed").unwrap();
+        std::fs::create_dir_all(root.join(r"Recipes\Development")).unwrap();
+        let ws = ystudio_core::workspace::Workspace::open(root, &[], &[]).unwrap();
+        let mut app = StudioApp::isolated_for_tests(ws);
+        let mut working = Batch::from_items("working", items);
+        working.id = root.join("working-list").to_string_lossy().into_owned();
+        app.batch.batch = Some(working);
+        (dir, app)
+    }
+
+    #[test]
+    fn a_live_pass_from_another_view_clears_a_failed_item_but_not_a_running_one() {
+        let failed = BatchItem { app: "Broken".into(), existing_recipe: "broken".into(), recipes: vec!["broken".into()], status: ItemStatus::Failed, checks: vec![failed_check("broken")], ..Default::default() };
+        let running = BatchItem { status: ItemStatus::Running, ..failed.clone() };
+        let other = BatchItem { app: "Other".into(), existing_recipe: "other".into(), recipes: vec!["other".into()], status: ItemStatus::Failed, checks: vec![failed_check("other")], ..Default::default() };
+        let (dir, mut app) = app_with_list(vec![failed, running, other]);
+        recipe_validated(&mut app, "BROKEN", "2026-11-18 10:00:00", dir.path());
+        let items = &app.batch.batch.as_ref().unwrap().items;
+        assert_eq!(items[0].status, ItemStatus::Done);
+        assert!(items[0].checks.iter().all(|c| c.passed && c.live), "{:?}", items[0].checks);
+        assert_eq!(items[1].status, ItemStatus::Running, "a run in progress owns its own status");
+        assert_eq!(items[2].status, ItemStatus::Failed, "other recipes are untouched");
+    }
+
+    #[test]
+    fn a_check_drops_failures_of_recipes_the_item_no_longer_uses() {
+        // The repair agent replaced `old` with `new`; the old failure must not keep the item failed.
+        let item = BatchItem { app: "App".into(), recipes: vec!["new".into()], status: ItemStatus::Running, checks: vec![failed_check("old")], ..Default::default() };
+        let (_dir, mut app) = app_with_list(vec![item]);
+        let id = app.batch.batch.as_ref().unwrap().id.clone();
+        let pass = BatchCheck { recipe: "new".into(), passed: true, note: "Validated".into(), timestamp: String::new(), summary_dir: None, live: true };
+        check_finished(&mut app, &id, 0, pass);
+        let it = &app.batch.batch.as_ref().unwrap().items[0];
+        assert_eq!(it.status, ItemStatus::Done);
+        assert_eq!(it.checks.len(), 1);
     }
 }

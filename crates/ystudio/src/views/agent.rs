@@ -203,8 +203,9 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             if st.show_prompt
                 && let Ok(t) = &task
             {
-                let mut prompt = agent::full_prompt(&ws, &app.settings.production_paths, t, super::settings::agent_options(app));
-                ui.add(egui::TextEdit::multiline(&mut prompt).code_editor().desired_rows(10).desired_width(ui.available_width()).interactive(false));
+                let prompt = agent::full_prompt(&ws, &app.settings.production_paths, t, super::settings::agent_options(app));
+                // `&mut &str` is a read-only buffer that can still be selected and copied.
+                ui.add(egui::TextEdit::multiline(&mut prompt.as_str()).code_editor().desired_rows(10).desired_width(ui.available_width()));
             }
             ui.add_space(6.0);
             if let Err(why) = &task {
