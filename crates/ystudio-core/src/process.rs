@@ -15,6 +15,28 @@ pub enum Stream {
     Stderr,
     /// Lines the Studio itself writes into the log (command echo, notes).
     Studio,
+    /// An agent's reasoning, from a structured stream (Claude Code's thinking).
+    Thinking,
+    /// An agent's tool call or tool error, from a structured stream.
+    Tool,
+}
+
+impl Stream {
+    /// Narration of an agent's work rather than its output: never parsed for
+    /// reports such as `STUDIO-RECIPES:`.
+    pub fn is_narration(self) -> bool {
+        matches!(self, Stream::Thinking | Stream::Tool)
+    }
+}
+
+/// How a process writes its standard output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputFormat {
+    #[default]
+    Plain,
+    /// Claude Code's `--output-format stream-json`: one JSON event per line,
+    /// rendered into readable text, thinking and tool lines as it arrives.
+    ClaudeStream,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +67,7 @@ pub struct ProcessSpec {
     pub stderr_is_progress: bool,
     /// An agent run's usage statistics, read when it ends.
     pub usage: Option<crate::usage::Pending>,
+    pub stdout_format: OutputFormat,
 }
 
 impl ProcessSpec {
@@ -58,7 +81,13 @@ impl ProcessSpec {
             new_console: false,
             stderr_is_progress: false,
             usage: None,
+            stdout_format: OutputFormat::Plain,
         }
+    }
+
+    pub fn stdout_format(mut self, format: OutputFormat) -> Self {
+        self.stdout_format = format;
+        self
     }
 
     pub fn stderr_is_progress(mut self) -> Self {
@@ -166,8 +195,8 @@ impl RunningProcess {
 
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
-        let t_out = pump(stdout, Stream::Stdout, tx.clone(), waker.clone());
-        let t_err = pump(stderr, Stream::Stderr, tx.clone(), waker.clone());
+        let t_out = pump(stdout, Stream::Stdout, spec.stdout_format, tx.clone(), waker.clone());
+        let t_err = pump(stderr, Stream::Stderr, OutputFormat::Plain, tx.clone(), waker.clone());
         std::thread::spawn(move || {
             let status = child.wait().ok().and_then(|s| s.code());
             let _ = t_out.join();
@@ -268,6 +297,12 @@ impl RunningProcess {
     pub fn text(&self) -> String {
         self.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n")
     }
+
+    /// The output without agent narration (thinking, tool calls): what reports
+    /// and failure summaries are read from.
+    pub fn report_text(&self) -> String {
+        self.lines.iter().filter(|l| !l.stream.is_narration()).map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n")
+    }
 }
 
 /// Runs a short command to completion without a window and returns its stdout.
@@ -335,6 +370,7 @@ pub fn spawn_console(spec: &ProcessSpec) -> Result<std::process::Child> {
 fn pump<R: Read + Send + 'static>(
     reader: R,
     stream: Stream,
+    format: OutputFormat,
     tx: Sender<Event>,
     waker: Option<Waker>,
 ) -> std::thread::JoinHandle<()> {
@@ -346,8 +382,11 @@ fn pump<R: Read + Send + 'static>(
             match reader.read_until(b'\n', &mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
-                    let text = clean_line(&decode(&buf));
-                    if tx.send(Event::Line(LogLine { stream, text })).is_err() {
+                    let lines = match format {
+                        OutputFormat::Plain => vec![LogLine { stream, text: clean_line(&decode(&buf)) }],
+                        OutputFormat::ClaudeStream => crate::agent_stream::claude_lines(&decode(&buf)),
+                    };
+                    if lines.into_iter().any(|l| tx.send(Event::Line(LogLine { text: clean_line(&l.text), ..l })).is_err()) {
                         break;
                     }
                     if let Some(w) = &waker {

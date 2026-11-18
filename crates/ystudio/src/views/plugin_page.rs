@@ -3056,7 +3056,7 @@ pub fn run_agent(app: &mut StudioApp, id: &str, dir: &Path, task_id: &str) -> bo
 /// whether it wrote what the task expects.
 pub fn agent_finished(app: &mut StudioApp, job: u64, id: &str, dir: &Path, task_id: &str, before: Snapshot) {
     app.plugins.locks.remove(&job);
-    let (ok, cancelled, text) = app.job(job).map(|j| (j.proc.succeeded(), j.proc.cancelled, j.proc.text())).unwrap_or((false, false, String::new()));
+    let (ok, cancelled, text) = app.job(job).map(|j| (j.proc.succeeded(), j.proc.cancelled, j.proc.report_text())).unwrap_or((false, false, String::new()));
     let Some(c) = context(app, id) else { return };
     let mut changes = before.diff(&Snapshot::of_dir(dir));
     changes.sort_by(|a, b| a.path().cmp(b.path()));

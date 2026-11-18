@@ -50,6 +50,20 @@ pub struct Settings {
     pub diagnostic_logging: bool,
     /// Per installed plugin, by id. Kept when a plugin is uninstalled.
     pub plugins: BTreeMap<String, PluginPrefs>,
+    /// Prompts started from the Agent tab, newest first.
+    pub agent_prompt_history: Vec<PromptRecord>,
+}
+
+/// One prompt started from the Agent tab.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct PromptRecord {
+    /// The recipe it was for.
+    pub recipe: String,
+    /// The task kind: Fix, Update or Freeform.
+    pub kind: String,
+    pub text: String,
+    pub at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -94,6 +108,7 @@ impl Default for Settings {
             agent_multi: false,
             diagnostic_logging: false,
             plugins: BTreeMap::new(),
+            agent_prompt_history: Vec::new(),
         }
     }
 }

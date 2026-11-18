@@ -107,7 +107,7 @@ pub fn open_recipe_tab(app: &mut StudioApp, view: View) {
             let file = app.recipes.iter().find(|r| r.id == id).map(|r| r.meta.icon_file.clone()).unwrap_or_default();
             app.icons.auto_search = file.is_empty() || !app.ws_cache.icons.iter().any(|i| i.eq_ignore_ascii_case(&file));
         }
-        View::Agent => app.agent.target_id = id,
+        View::Agent => app.agent.focus(&id),
         _ => {}
     }
     app.view = view;

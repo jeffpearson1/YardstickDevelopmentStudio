@@ -19,6 +19,19 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
+    fn name(self) -> &'static str {
+        match self {
+            TaskKind::Fix => "Fix",
+            TaskKind::Review => "Review",
+            TaskKind::Update => "Update",
+            TaskKind::Freeform => "Freeform",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        [TaskKind::Fix, TaskKind::Review, TaskKind::Update, TaskKind::Freeform].into_iter().find(|k| k.name() == name)
+    }
+
     const ALL: [(TaskKind, &'static str, &'static str); 4] = [
         (TaskKind::Fix, "\u{E90F}  Fix", "Diagnose a failing recipe from harness evidence and fix it."),
         (TaskKind::Review, "\u{E721}  Review", "Read-only review against the skill; no files change."),
@@ -27,14 +40,46 @@ impl TaskKind {
     ];
 }
 
-pub struct AgentState {
+/// What the user is writing for one recipe's agent task. Each recipe keeps its
+/// own, so switching recipes never carries a prompt across.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Draft {
     pub kind: TaskKind,
     pub notes: String,
-    pub target_id: String,
     pub evidence: String,
     pub freeform: String,
+}
+
+impl Draft {
+    /// The text the user wrote for this task kind (not the pasted evidence).
+    fn prompt_text(&self) -> &str {
+        match self.kind {
+            TaskKind::Freeform => &self.freeform,
+            TaskKind::Review => "",
+            _ => &self.notes,
+        }
+    }
+
+    fn clear_prompt(&mut self) {
+        self.notes.clear();
+        self.evidence.clear();
+        self.freeform.clear();
+    }
+}
+
+pub struct AgentState {
+    /// The open recipe's draft; others wait in `drafts`.
+    pub draft: Draft,
+    drafts: std::collections::HashMap<String, Draft>,
+    /// The recipe `draft` belongs to.
+    pub target_id: String,
     pub show_prompt: bool,
+    /// The latest agent run, whichever recipe it is for.
     pub job: Option<u64>,
+    /// The recipe the latest run is for.
+    pub job_recipe: String,
+    /// Each recipe's latest run, so its tab shows its own output.
+    last_jobs: std::collections::HashMap<String, u64>,
     pub changes: Vec<Change>,
     pub reported: Vec<String>,
     /// Whether each of [`AgentBackend::ALL`] is installed; probed once (PATH scan).
@@ -47,18 +92,37 @@ pub struct AgentState {
 impl Default for AgentState {
     fn default() -> Self {
         Self {
-            kind: TaskKind::default(), notes: String::new(), target_id: String::new(),
-            evidence: String::new(), freeform: String::new(), show_prompt: false,
-            job: None, changes: Vec::new(), reported: Vec::new(), backends_found: None, auto_test: true, request: None,
+            draft: Draft::default(), drafts: Default::default(), target_id: String::new(), show_prompt: false,
+            job: None, job_recipe: String::new(), last_jobs: Default::default(),
+            changes: Vec::new(), reported: Vec::new(), backends_found: None, auto_test: true, request: None,
         }
     }
 }
 
 impl AgentState {
-    pub fn prepare_fix(&mut self, id: &str, evidence: String) {
-        self.kind = TaskKind::Fix;
+    /// Makes `id`'s draft the active one, keeping the previous recipe's aside.
+    pub fn focus(&mut self, id: &str) {
+        if self.target_id.eq_ignore_ascii_case(id) {
+            self.target_id = id.to_string();
+            return;
+        }
+        let previous = std::mem::take(&mut self.draft);
+        if !self.target_id.is_empty() && previous != Draft::default() {
+            self.drafts.insert(self.target_id.to_lowercase(), previous);
+        }
+        self.draft = self.drafts.remove(&id.to_lowercase()).unwrap_or_default();
         self.target_id = id.to_string();
-        self.evidence = evidence;
+    }
+
+    pub fn prepare_fix(&mut self, id: &str, evidence: String) {
+        self.focus(id);
+        self.draft.kind = TaskKind::Fix;
+        self.draft.evidence = evidence;
+    }
+
+    /// The latest run for `id`, if its job is still listed.
+    fn job_for(&self, id: &str) -> Option<u64> {
+        self.last_jobs.get(&id.to_lowercase()).copied()
     }
 
     pub fn start(app: &mut StudioApp, mut task: AgentTask, options: Option<crate::workflow::Options>) {
@@ -82,6 +146,12 @@ impl AgentState {
                 let mut request = tracking_request(app, &task);
                 let batch_item = request.as_ref().map(|b| (b.id.clone(), 0));
                 app.agent.job = app.start_job(spec, JobKind::Agent { before, batch_item, verification });
+                app.agent.job_recipe = app.agent.target_id.clone();
+                if let Some(job) = app.agent.job
+                    && !app.agent.target_id.is_empty()
+                {
+                    app.agent.last_jobs.insert(app.agent.target_id.to_lowercase(), job);
+                }
                 if let Some(b) = &mut request {
                     let started = app.agent.job.is_some();
                     b.items[0].status = if started { ItemStatus::Running } else { ItemStatus::Failed };
@@ -100,17 +170,83 @@ impl AgentState {
 
     fn task(&self) -> Result<AgentTask, &'static str> {
         let need_id = || if self.target_id.trim().is_empty() { Err("Choose the recipe id.") } else { Ok(self.target_id.trim().to_string()) };
-        Ok(match self.kind {
-            TaskKind::Fix => AgentTask::Fix { id: need_id()?, evidence: self.evidence.clone(), notes: self.notes.clone() },
+        let d = &self.draft;
+        Ok(match d.kind {
+            TaskKind::Fix => AgentTask::Fix { id: need_id()?, evidence: d.evidence.clone(), notes: d.notes.clone() },
             TaskKind::Review => AgentTask::Review { id: need_id()? },
-            TaskKind::Update => AgentTask::Update { id: need_id()?, notes: self.notes.clone() },
+            TaskKind::Update => AgentTask::Update { id: need_id()?, notes: d.notes.clone() },
             TaskKind::Freeform => {
-                if self.freeform.trim().is_empty() {
+                if d.freeform.trim().is_empty() {
                     return Err("Write a prompt.");
                 }
-                AgentTask::Freeform { prompt: self.freeform.clone(), recipe: Some(self.target_id.trim().to_string()).filter(|id| !id.is_empty()) }
+                AgentTask::Freeform { prompt: d.freeform.clone(), recipe: Some(self.target_id.trim().to_string()).filter(|id| !id.is_empty()) }
             }
         })
+    }
+}
+
+/// Most prompts kept in the history.
+const HISTORY_LIMIT: usize = 50;
+
+/// Records the prompt the user just started with (newest first, no repeats).
+fn remember_prompt(app: &mut StudioApp) {
+    let text = app.agent.draft.prompt_text().trim().to_string();
+    if text.is_empty() {
+        return;
+    }
+    let kind = app.agent.draft.kind.name().to_string();
+    let history = &mut app.settings.agent_prompt_history;
+    history.retain(|h| !(h.text == text && h.kind == kind && h.recipe.eq_ignore_ascii_case(&app.agent.target_id)));
+    history.insert(0, ystudio_core::settings::PromptRecord {
+        recipe: app.agent.target_id.clone(),
+        kind,
+        text,
+        at: ystudio_core::intake::timestamp(),
+    });
+    history.truncate(HISTORY_LIMIT);
+}
+
+/// The History menu: this recipe's prompts first, then other recipes'. Picking
+/// one puts it back in the form, with its task kind.
+fn history_menu(app: &mut StudioApp, ui: &mut Ui) {
+    let id = app.agent.target_id.clone();
+    let (mine, others): (Vec<_>, Vec<_>) = app.settings.agent_prompt_history.iter().cloned().partition(|h| h.recipe.eq_ignore_ascii_case(&id));
+    let mut picked = None;
+    ui.add_enabled_ui(!(mine.is_empty() && others.is_empty()), |ui| {
+        ui.menu_button(format!("\u{E81C}  History ({})", mine.len() + others.len()), |ui| {
+            ui.set_max_width(420.0);
+            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                for (heading, list) in [(id.clone(), &mine), ("Other recipes".to_string(), &others)] {
+                    if list.is_empty() {
+                        continue;
+                    }
+                    ui.label(RichText::new(heading).small().weak());
+                    for h in list {
+                        let first = h.text.lines().next().unwrap_or_default();
+                        let short: String = first.chars().take(70).collect();
+                        let more = if short.len() < h.text.trim_end().len() { "…" } else { "" };
+                        let label = format!("{}  {short}{more}", h.kind);
+                        let hover = format!("{} · {}\n\n{}", if h.recipe.is_empty() { "no recipe" } else { &h.recipe }, h.at, h.text);
+                        if ui.button(label).on_hover_text(hover).clicked() {
+                            picked = Some(h.clone());
+                            ui.close();
+                        }
+                    }
+                    ui.add_space(4.0);
+                }
+            });
+        });
+    });
+    if let Some(h) = picked {
+        let d = &mut app.agent.draft;
+        d.kind = TaskKind::from_name(&h.kind).unwrap_or(TaskKind::Freeform);
+        if d.kind == TaskKind::Review {
+            d.kind = TaskKind::Freeform;
+        }
+        match d.kind {
+            TaskKind::Freeform => d.freeform = h.text,
+            _ => d.notes = h.text,
+        }
     }
 }
 
@@ -151,31 +287,37 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
 
     egui::Panel::left("agent-form").resizable(true).default_size(430.0).frame(theme::pane_frame()).show(ui, |ui| {
         egui::ScrollArea::vertical().id_salt("agent-form-scroll").show(ui, |ui| {
+            // The tab always works on the open recipe, with that recipe's own draft.
+            app.agent.focus(&open_id);
             let st = &mut app.agent;
-            // The tab always works on the open recipe.
-            st.target_id = open_id.clone();
             ui.horizontal_wrapped(|ui| {
                 for (k, label, _) in TaskKind::ALL {
-                    ui.selectable_value(&mut st.kind, k, label);
+                    ui.selectable_value(&mut st.draft.kind, k, label);
                 }
             });
-            let blurb = TaskKind::ALL.iter().find(|(k, ..)| *k == st.kind).map(|t| t.2).unwrap_or_default();
+            let blurb = TaskKind::ALL.iter().find(|(k, ..)| *k == st.draft.kind).map(|t| t.2).unwrap_or_default();
             ui.label(RichText::new(blurb).weak());
             ui.add_space(6.0);
-            match st.kind {
+            let kind = st.draft.kind;
+            if kind != TaskKind::Review {
+                ui.horizontal(|ui| {
+                    ui.label(if kind == TaskKind::Freeform { "Prompt" } else { "Notes for the agent" });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| history_menu(app, ui));
+                });
+            }
+            let st = &mut app.agent;
+            match st.draft.kind {
                 TaskKind::Freeform => {
-                    ui.label("Prompt");
-                    ui.add(egui::TextEdit::multiline(&mut st.freeform).desired_rows(8).desired_width(ui.available_width()));
+                    ui.add(egui::TextEdit::multiline(&mut st.draft.freeform).desired_rows(8).desired_width(ui.available_width()));
                 }
                 TaskKind::Review => {}
                 _ => {
-                    ui.label("Notes for the agent");
-                    ui.add(egui::TextEdit::multiline(&mut st.notes).desired_rows(3).desired_width(ui.available_width()).hint_text("Constraints, preferred source, known quirks…"));
+                    ui.add(egui::TextEdit::multiline(&mut st.draft.notes).desired_rows(3).desired_width(ui.available_width()).hint_text("Constraints, preferred source, known quirks…"));
                 }
             }
-            if st.kind == TaskKind::Fix {
+            if st.draft.kind == TaskKind::Fix {
                 ui.label("Evidence (harness output, error text)");
-                ui.add(egui::TextEdit::multiline(&mut st.evidence).code_editor().desired_rows(6).desired_width(ui.available_width()));
+                ui.add(egui::TextEdit::multiline(&mut st.draft.evidence).code_editor().desired_rows(6).desired_width(ui.available_width()));
             }
             ui.add_space(6.0);
             ui.label("Agent and model");
@@ -214,19 +356,35 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             let can_run = task.is_ok() && app.writable() && !running;
             if theme::primary(ui, can_run, RichText::new("\u{E99A}  Start agent")).clicked() {
                 let task = task.unwrap();
+                // The prompt goes to History, then the form is ready for the next one.
+                remember_prompt(app);
+                app.agent.draft.clear_prompt();
                 if can_verify && app.agent.auto_test {
                     crate::workflow::request(app, crate::workflow::Request::Agent(task));
                 } else {
                     AgentState::start(app, task, None);
                 }
+                app.save_settings();
             }
         });
     });
 
     theme::pane(ui, |ui| {
     crate::workflow::progress(app, ui);
-    // Output, changes and next steps.
-    if !app.agent.changes.is_empty() || !app.agent.reported.is_empty() {
+    let shown_job = app.agent.job_for(&open_id).filter(|j| app.job(*j).is_some());
+    let other_running = app.agent.job.filter(|j| Some(*j) != shown_job && app.job(*j).is_some_and(|job| job.proc.is_running()));
+    if other_running.is_some() && !app.agent.job_recipe.is_empty() {
+        let other = app.agent.job_recipe.clone();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("The agent is working on").weak());
+            if ui.link(&other).on_hover_text("Open that recipe's Agent tab.").clicked() && app.open_recipe_by_id(&other) {
+                app.view = View::Agent;
+            }
+        });
+    }
+    // Output, changes and next steps of this recipe's latest run.
+    let own_result = shown_job.is_some() && shown_job == app.agent.job;
+    if own_result && (!app.agent.changes.is_empty() || !app.agent.reported.is_empty()) {
         let mut open = None;
         let mut test = None;
         theme::card(ui, |ui| {
@@ -290,7 +448,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             }
         });
     }
-    match app.agent.job.and_then(|j| app.job_mut(j)) {
+    match shown_job.and_then(|j| app.job_mut(j)) {
         Some(job) => job_log(ui, &mut job.proc, "agent"),
         None => {
             ui.add_space(30.0);
@@ -301,4 +459,45 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         }
     }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workflow::tests::fake_app;
+
+    #[test]
+    fn each_recipe_keeps_its_own_draft() {
+        let mut st = AgentState::default();
+        st.focus("one");
+        st.draft.kind = TaskKind::Freeform;
+        st.draft.freeform = "for one".into();
+        st.focus("two");
+        assert_eq!(st.draft, Draft::default(), "a new recipe starts empty");
+        st.draft.notes = "for two".into();
+        st.focus("ONE");
+        assert_eq!((st.draft.kind, st.draft.freeform.as_str()), (TaskKind::Freeform, "for one"));
+        st.prepare_fix("two", "evidence".into());
+        assert_eq!((st.draft.kind, st.draft.notes.as_str(), st.draft.evidence.as_str()), (TaskKind::Fix, "for two", "evidence"));
+    }
+
+    #[test]
+    fn started_prompts_go_to_history_newest_first_without_repeats() {
+        let (_dir, mut app) = fake_app();
+        app.agent.focus("app");
+        for text in ["first", "second", "first"] {
+            app.agent.draft.kind = TaskKind::Freeform;
+            app.agent.draft.freeform = text.into();
+            remember_prompt(&mut app);
+        }
+        let texts: Vec<_> = app.settings.agent_prompt_history.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, ["first", "second"]);
+        assert_eq!(app.settings.agent_prompt_history[0].recipe, "app");
+        // A review has no prompt to remember.
+        app.agent.draft.kind = TaskKind::Review;
+        remember_prompt(&mut app);
+        assert_eq!(app.settings.agent_prompt_history.len(), 2);
+        app.agent.draft.clear_prompt();
+        assert!(app.agent.draft.freeform.is_empty());
+    }
 }

@@ -101,6 +101,18 @@ status bar.
 
 Only one agent process runs at a time, whether it came from the Agent view, a batch, or an extraction.
 
+Claude Code runs with `--output-format stream-json --verbose`. `agent_stream::claude_lines`
+renders each event as the pump reads it: assistant text as output, thinking as `Stream::Thinking`
+(set in from an accent rule), tool calls as one-line `Stream::Tool` summaries, failed tool results,
+and a closing line with turns, time and cost. Narration can be hidden per log (*Thinking & tool
+calls*) and is left out of `RunningProcess::report_text`, which is what `STUDIO-RECIPES:`,
+approval and failure summaries are read from.
+
+The Agent tab keeps a draft per recipe (`AgentState::focus`), shows the open recipe's own latest
+run (with a link when the agent is busy on another recipe), clears the prompt once a run starts,
+and keeps the last 50 started prompts in `Settings::agent_prompt_history` (*History*: this
+recipe's first, then others').
+
 Job logs are virtualised (`show_rows`), so egui's label selection cannot span rows that have
 scrolled away. `app::job_log` therefore selects whole lines by index: click, drag (scrolling past
 the edges) or Shift+click, then Ctrl+C, *Copy N lines* or the context menu. Logs only grow, so
