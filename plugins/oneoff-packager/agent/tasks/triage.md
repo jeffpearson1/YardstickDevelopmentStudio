@@ -1,6 +1,6 @@
 Read `ticket.md`, `parsed-ticket.json`, `downloads.json` (if present) and anything in `intake/`. Then write `products.json`: one entry for each separate piece of software the ticket asks for.
 
-If `products.json` already contains `routedProducts`, preserve that array exactly and do not put those product IDs back into `products`. The user routed them to Recipe Builder in Studio.
+If `products.json` already contains `routedProducts` or `completedProducts`, preserve those arrays exactly and do not put those product IDs back into `products`. The user routed the first to Recipe Builder; the second already exist as a Yardstick recipe or Intune app. Keep `completedOverride`, `existing` and `flags` on any product that has them.
 
 First read `.studio\agent\references\workflow.md`, section 1.
 
@@ -24,7 +24,7 @@ List the files that belong to each product in its `downloads`, as the work-item-
 
 ## If the ticket came from SCCM
 
-When `intake\sccm-export.json` exists the request is one application: write exactly one product. Take the name, publisher and version from the export; there are no links (leave `links` empty) and the deployment collections are not `targets` for Intune. Put the application's name and manufacturer in `searchPatterns` so the Intune inventory finds a copy that was migrated before.
+When `intake\sccm-export.json` exists the request is one application: write exactly one product. Take the name, publisher and version from the export; there are no links (leave `links` empty) and the deployment collections are not `targets` for Intune. Put the application's name and manufacturer in `searchPatterns` so the existing-apps check finds a copy that was migrated before.
 
 ## The file
 
@@ -51,8 +51,8 @@ When `intake\sccm-export.json` exists the request is one application: write exac
 
 - `id`: the recipe id. Lowercase letters, digits, dots, dashes and underscores; start from the product name with spaces removed.
 - `version`: what the ticket asks for, or `""` if it names none. Do not guess one here.
-- `searchPatterns`: case-insensitive regular expressions that would match this product's Intune app, by its name or publisher, including likely older names and spellings. Make them specific enough not to match unrelated apps (a bare `viewer` is too broad). A Studio step searches the tenant with these, so a pattern that is too narrow can miss an existing app.
+- `searchPatterns`: case-insensitive regular expressions that would match this product's Intune app, by its name or publisher, including likely older names and spellings. Make them specific enough not to match unrelated apps (a bare `viewer` is too broad). A Studio step searches the tenant with these before routing and moves a product with a match to Already available, so a pattern that is too narrow misses an existing app and one that is too broad hides a product that needs packaging.
 - `requestedGroupId`: `null` unless the ticket names an approved Entra group by object ID.
 - Leave `status` as `needs-research` for every product at this stage.
 
-Write `products.json` and nothing else. Preserve `routedProducts` when it exists. If the ticket contains no software request, write `{ "products": [] }` and say why in your report.
+Write `products.json` and nothing else. Preserve `routedProducts` and `completedProducts` when they exist. If the ticket contains no software request, write `{ "products": [] }` and say why in your report.

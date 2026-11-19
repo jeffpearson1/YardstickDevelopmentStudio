@@ -120,6 +120,7 @@ struct PanelCache {
     request: Option<Arc<String>>,
     tables: HashMap<String, Result<Vec<Value>, String>>,
     routed: HashMap<String, Result<Vec<Value>, String>>,
+    completed: HashMap<String, Result<Vec<Value>, String>>,
     markdown: HashMap<String, Option<Arc<String>>>,
     files: HashMap<String, Vec<String>>,
 }
@@ -554,7 +555,11 @@ fn advance_automation(app: &mut StudioApp, id: &str, dir: &Path) {
                 id,
                 dir,
                 AutomationState::AwaitingAction,
-                format!("Review {count} products in {} and choose which belong in Recipe Builder.", panel.title),
+                if count == 0 {
+                    format!("Every product in {} is already available. Confirm, or choose one to package anyway.", panel.title)
+                } else {
+                    format!("Review the products in {} and choose which belong in Recipe Builder.", panel.title)
+                },
                 false,
             );
         }
@@ -564,7 +569,7 @@ fn advance_automation(app: &mut StudioApp, id: &str, dir: &Path) {
                 id,
                 dir,
                 AutomationState::Complete,
-                format!("All products in {} were routed to Recipe Builder. No One-Off stages remain.", panel.title),
+                format!("No products in {} are left to package here: each was routed to Recipe Builder or is already available.", panel.title),
                 false,
             );
         }
@@ -1128,6 +1133,7 @@ fn item_detail(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem) {
 enum RoutingAction {
     Route(usize),
     Return(usize),
+    Restore(usize),
     Confirm,
     OpenRouted(String, String),
 }
@@ -1291,11 +1297,34 @@ fn set_routing_review(app: &mut StudioApp, id: &str, dir: &Path, panel: &str, re
 }
 
 fn continue_after_routing(app: &mut StudioApp, id: &str, dir: &Path) {
-    if WorkItem::open(dir).is_ok_and(|item| item.meta.automation.state == AutomationState::AwaitingAction)
+    // Complete too: moving a product back after "nothing left to package" resumes the work.
+    if WorkItem::open(dir).is_ok_and(|item| matches!(item.meta.automation.state, AutomationState::AwaitingAction | AutomationState::Complete))
         && set_automation(app, id, dir, AutomationState::Running, "Routing reviewed. Looking for the next safe stage.", false)
     {
         advance_automation(app, id, dir);
     }
+}
+
+/// Coloured markers a plugin puts on a row: `flags: [{ label, tone, detail }]`,
+/// where tone is green, amber, red, blue or grey.
+fn row_flags(row: &Value) -> Vec<(String, egui::Color32, String)> {
+    row.get("flags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|flag| {
+            let text = |name: &str| flag.get(name).and_then(Value::as_str).unwrap_or_default().trim().to_string();
+            let label = text("label");
+            let tone = match text("tone").as_str() {
+                "green" => theme::green(),
+                "amber" => theme::amber(),
+                "red" => theme::red(),
+                "blue" => theme::blue(),
+                _ => theme::grey(),
+            };
+            (!label.is_empty()).then(|| (label, tone, text("detail")))
+        })
+        .collect()
 }
 
 fn routing_row(ui: &mut Ui, row: &Value, button: &str, enabled: bool, secondary: Option<(&str, bool)>) -> (bool, bool) {
@@ -1303,6 +1332,7 @@ fn routing_row(ui: &mut Ui, row: &Value, button: &str, enabled: bool, secondary:
     let version = row_field(row, &["version"]);
     let status = row_field(row, &["status"]);
     let notes = row_field(row, &["notes"]);
+    let flags = row_flags(row);
     let mut clicked = false;
     let mut secondary_clicked = false;
     ui.horizontal_wrapped(|ui| {
@@ -1313,6 +1343,12 @@ fn routing_row(ui: &mut Ui, row: &Value, button: &str, enabled: bool, secondary:
         if !status.is_empty() {
             theme::badge(ui, status.replace('-', " "), theme::grey());
         }
+        for (label, color, detail) in &flags {
+            let badge = theme::badge(ui, label, *color);
+            if !detail.is_empty() {
+                badge.on_hover_text(detail);
+            }
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             clicked = ui.add_enabled(enabled, egui::Button::new(button)).clicked();
             if let Some((label, secondary_enabled)) = secondary {
@@ -1320,6 +1356,9 @@ fn routing_row(ui: &mut Ui, row: &Value, button: &str, enabled: bool, secondary:
             }
         });
     });
+    for (_, _, detail) in flags.iter().filter(|(_, _, detail)| !detail.is_empty()) {
+        ui.label(RichText::new(detail).small());
+    }
     if !notes.is_empty() {
         ui.label(RichText::new(notes).small().weak());
     }
@@ -1329,20 +1368,26 @@ fn routing_row(ui: &mut Ui, row: &Value, button: &str, enabled: bool, secondary:
 fn routing_panels(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem, item_running: bool) {
     let id = c.plugin.manifest.id.clone();
     for panel in c.plugin.manifest.page.panels.iter().filter(|panel| panel.recipe_builder.is_some()) {
-        let (active, routed) = {
+        let (active, routed, completed) = {
             let Some(cache) = app.plugins.page(&id).panels.as_ref() else { continue };
-            (cache.tables.get(&panel.title).cloned(), cache.routed.get(&panel.title).cloned())
+            (
+                cache.tables.get(&panel.title).cloned(),
+                cache.routed.get(&panel.title).cloned(),
+                cache.completed.get(&panel.title).cloned(),
+            )
         };
         let Some(Ok(active)) = active else { continue };
         let routed = routed.and_then(Result::ok).unwrap_or_default();
-        if active.is_empty() && routed.is_empty() {
+        let completed = completed.and_then(Result::ok).unwrap_or_default();
+        if active.is_empty() && routed.is_empty() && completed.is_empty() {
             continue;
         }
         let routing = panel.recipe_builder.as_ref().unwrap();
         let stage_started = item.step(&routing.review_before).state != StepState::NotRun;
         let busy = item_running || crate::workflow::busy(app) || Lock::holder(&item.dir).is_some();
         let editable = !stage_started && !busy;
-        let needs_review = !active.is_empty() && (active.len() > 1 || !routed.is_empty()) && !item.meta.routing_reviews.contains(&panel.title);
+        let needs_review = !item.meta.routing_reviews.contains(&panel.title)
+            && (!completed.is_empty() || (!active.is_empty() && (active.len() > 1 || !routed.is_empty())));
         let mut action = None;
 
         theme::section_heading(ui, "Product routing");
@@ -1357,12 +1402,27 @@ fn routing_panels(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem, it
         if needs_review {
             theme::banner(ui, theme::amber(), |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(format!(
-                        "This ticket contains {} products. Route each reusable app, then confirm what remains in {}.",
-                        active.len() + routed.len(),
-                        c.plugin.manifest.name
-                    ));
-                    let keep = if active.len() == 2 { "Keep both here".to_string() } else { format!("Keep {} here", active.len()) };
+                    let total = active.len() + routed.len() + completed.len();
+                    ui.label(if active.is_empty() {
+                        format!(
+                            "{} already available. Confirm, or package one anyway.",
+                            if total == 1 { "This product is".to_string() } else { format!("All {total} products are") }
+                        )
+                    } else if !completed.is_empty() {
+                        format!(
+                            "{} of {total} product(s) already available. Route each reusable app, then confirm what remains in {}.",
+                            completed.len(),
+                            c.plugin.manifest.name
+                        )
+                    } else {
+                        format!("This ticket contains {total} products. Route each reusable app, then confirm what remains in {}.", c.plugin.manifest.name)
+                    });
+                    let keep = match active.len() {
+                        0 => "Confirm".to_string(),
+                        1 => "Keep it here".to_string(),
+                        2 => "Keep both here".to_string(),
+                        n => format!("Keep {n} here"),
+                    };
                     if theme::primary(ui, editable, keep)
                         .on_hover_text("Continue these products through the One-Off Packager pipeline.")
                         .on_disabled_hover_text("Wait for current work to finish before changing routing.")
@@ -1377,7 +1437,11 @@ fn routing_panels(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem, it
             ui.label(RichText::new(format!("Routing is locked because downstream {} work has started.", c.plugin.manifest.name)).small().weak());
         } else if active.is_empty() {
             theme::banner(ui, theme::green(), |ui| {
-                ui.label("Every product in this ticket is now handled by Recipe Builder.");
+                ui.label(if completed.is_empty() {
+                    "Every product in this ticket is now handled by Recipe Builder."
+                } else {
+                    "Nothing in this ticket needs packaging: each product is already available or handled by Recipe Builder."
+                });
             });
         }
 
@@ -1386,6 +1450,24 @@ fn routing_panels(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem, it
                 action = Some(RoutingAction::Route(index));
             }
             ui.separator();
+        }
+        if !completed.is_empty() {
+            egui::CollapsingHeader::new(format!("Already available ({})", completed.len()))
+                .id_salt(("plugin-completed-products", &id, &panel.title))
+                .default_open(true)
+                .show(ui, |ui| {
+                    for (index, row) in completed.iter().enumerate() {
+                        // Triage's "needs research" no longer describes a product that exists.
+                        let mut row = row.clone();
+                        if let Some(fields) = row.as_object_mut() {
+                            fields.remove("status");
+                        }
+                        if routing_row(ui, &row, "Package anyway", editable, None).0 {
+                            action = Some(RoutingAction::Restore(index));
+                        }
+                        ui.separator();
+                    }
+                });
         }
         if !routed.is_empty() {
             egui::CollapsingHeader::new(format!("In Recipe Builder ({})", routed.len()))
@@ -1457,6 +1539,16 @@ fn routing_panels(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem, it
                     }
                     Ok(()) => {}
                     Err(e) => app.error(e),
+                }
+            }
+            Some(RoutingAction::Restore(index)) if set_routing_review(app, &id, &item.dir, &panel.title, false) => {
+                match plugin::move_panel_row_between(&item.dir, panel, index, plugin::RowList::Completed, plugin::RowList::Active) {
+                    Ok(_) => {
+                        app.plugins.page(&id).panels = None;
+                        app.notify(format!("Moved the product back to {}. It will be packaged.", c.plugin.manifest.name));
+                        continue_after_routing(app, &id, &item.dir);
+                    }
+                    Err(e) => app.error(format!("Could not move the product back: {e:#}")),
                 }
             }
             Some(RoutingAction::Confirm) if set_routing_review(app, &id, &item.dir, &panel.title, true) => {
@@ -1918,6 +2010,7 @@ fn refresh_panels(app: &mut StudioApp, id: &str, c: &Ctx, dir: &Path, force: boo
         request: ystudio_core::read_text(&dir.join("ticket.md")).ok().map(Arc::new),
         tables: HashMap::new(),
         routed: HashMap::new(),
+        completed: HashMap::new(),
         markdown: HashMap::new(),
         files: HashMap::new(),
     };
@@ -1940,6 +2033,7 @@ fn refresh_panels(app: &mut StudioApp, id: &str, c: &Ctx, dir: &Path, force: boo
                 cache.tables.insert(p.title.clone(), rows);
                 if p.recipe_builder.is_some() {
                     cache.routed.insert(p.title.clone(), plugin::routed_panel_rows(dir, p).map_err(|e| format!("{e:#}")));
+                    cache.completed.insert(p.title.clone(), plugin::completed_panel_rows(dir, p).map_err(|e| format!("{e:#}")));
                 }
             }
             PanelKind::Markdown => {
@@ -2514,9 +2608,12 @@ pub(crate) mod tests {
             {"id":"faststoneimageviewer","name":"FastStone Image Viewer","version":"8.5","status":"locally-validated","notes":"Vendor installer, unsigned"},
             {"id":"inphotocaptureps","name":"inPhoto Capture PS","version":"4.18.42","status":"needs-research","notes":"Vendor link in the ticket"}]}"#).unwrap();
         for (id, state, summary) in [
-            ("parse-ticket", StepState::Ok, "2 link(s), 0 Dropbox, 1 asset tag(s)."),
+            ("parse-ticket", StepState::Ok, "2 link(s), 0 file-sharing, 1 asset tag(s)."),
+            ("fetch-links", StepState::Ok, "1 file(s) from 2 link(s)."),
             ("triage", StepState::Ok, "Finished: 1 file(s) changed."),
+            ("stage-dropbox", StepState::Ok, "Staged 1 file(s) in the software dropbox."),
             ("runtime", StepState::Ok, "Created the runtime and proved its DELETE guard. YardstickDev commit 2a28d70a."),
+            ("check-existing", StepState::Ok, "Checked 212 Yardstick recipe(s) and 412 Intune app(s). No product already exists."),
             ("inventory", StepState::Ok, "Scanned 412 apps in Contoso: 0 possible existing app(s)."),
             ("prepare-test", StepState::Warn, "Prepare test run 20261113-101500-001: faststoneimageviewer: WhatIf."),
         ] {
@@ -2542,7 +2639,13 @@ pub(crate) mod tests {
         // The pipeline is in the order the page lists it, and a step is ready only after what it needs.
         let m = app.plugins.get("oneoff-packager").unwrap().manifest.clone();
         let order: Vec<&str> = m.pipeline().iter().map(|s| s.id()).collect();
-        assert_eq!(order, ["parse-ticket", "triage", "runtime", "inventory", "prepare-test", "full-test-request", "full-test", "build", "prepare-live", "live-change"]);
+        assert_eq!(
+            order,
+            [
+                "parse-ticket", "fetch-links", "triage", "stage-dropbox", "runtime", "check-existing", "inventory", "prepare-test", "full-test-request",
+                "full-test", "build", "prepare-live", "live-change"
+            ]
+        );
         let item = WorkItem::open(&item.dir).unwrap();
         assert!(item.satisfied(&m.step("full-test-request").unwrap().after), "Prepare finished with warnings, so the request can be written");
         assert!(!item.satisfied(&m.step("build").unwrap().after), "nothing is built before the install test");
@@ -2556,7 +2659,7 @@ pub(crate) mod tests {
             {"id":"faststoneimageviewer","name":"FastStone Image Viewer","version":"8.5","status":"needs-research","notes":"Licensed lab request","links":[]},
             {"id":"qgis","name":"QGIS","publisher":"QGIS.org","version":"3.40","status":"needs-research","notes":"Reusable open-source application","links":["https://qgis.org"]}
         ]}"#).unwrap();
-        for stage in ["parse-ticket", "triage"] {
+        for stage in ["parse-ticket", "fetch-links", "triage", "stage-dropbox", "runtime", "check-existing"] {
             mixed.meta.steps.insert(stage.into(), plugin::StepRecord { state: StepState::Ok, ..Default::default() });
         }
         mixed.save().unwrap();
@@ -2585,9 +2688,7 @@ pub(crate) mod tests {
 
         let mut linked = WorkItem::open(&mixed.dir).unwrap();
         linked.meta.routing_reviews.insert("Products".into());
-        for stage in ["runtime", "inventory"] {
-            linked.meta.steps.insert(stage.into(), plugin::StepRecord { state: StepState::Ok, ..Default::default() });
-        }
+        linked.meta.steps.insert("inventory".into(), plugin::StepRecord { state: StepState::Ok, ..Default::default() });
         linked.save().unwrap();
         assert!(matches!(m.next_automatic(&linked), AutomationNext::RecipeWorkNeeded(_, ids) if ids == ["faststoneimageviewer"]));
         app.batch.batch.as_mut().unwrap().id = dir.path().join("linked-recipe-work").to_string_lossy().into_owned();
@@ -2604,6 +2705,29 @@ pub(crate) mod tests {
             Some("faststoneimageviewer"),
         ));
         render(&mut app, "recipe-builder-linked-plugin-work", 1400, 1000);
+
+        let mut existing = WorkItem::create(&root, "{date}-{slug}", "Existing apps", "TASK-EXISTING", Origin::default(), SystemTime::now()).unwrap();
+        std::fs::write(existing.dir.join("ticket.md"), "Please install 7-Zip, Zoom and FastStone Image Viewer.").unwrap();
+        std::fs::write(existing.dir.join("products.json"), r#"{"products":[
+            {"id":"faststoneimageviewer","name":"FastStone Image Viewer","version":"8.5","status":"needs-research","flags":[]}],
+          "completedProducts":[
+            {"id":"7zip","name":"7-Zip","status":"needs-research","flags":[
+              {"label":"Yardstick recipe: 7zip","tone":"green","detail":"Yardstick recipe: Recipes\\7zip.yaml (7-Zip)"},
+              {"label":"In Intune","tone":"green","detail":"In Intune: 7-Zip (Igor Pavlov; assigned)"}]},
+            {"id":"zoom","name":"Zoom Workplace","status":"needs-research","flags":[
+              {"label":"In Intune, no Yardstick recipe","tone":"amber","detail":"In Intune without a Yardstick recipe: Zoom Workplace (Zoom; assigned). Package it anyway to give it a recipe."}]}]}"#).unwrap();
+        for stage in ["parse-ticket", "fetch-links", "triage", "stage-dropbox", "runtime", "check-existing"] {
+            existing.meta.steps.insert(stage.into(), plugin::StepRecord { state: StepState::Ok, ..Default::default() });
+        }
+        existing.save().unwrap();
+        assert!(matches!(m.next_automatic(&existing), AutomationNext::RoutingReview(_, 1)), "already-available products get a look first");
+        app.plugins.page("oneoff-packager").selected = Some(existing.dir.clone());
+        app.plugins.page("oneoff-packager").panels = None;
+        app.view = View::Plugin(0);
+        render(&mut app, "oneoff-product-existing", 1400, 1000);
+        let zoom = plugin::move_panel_row_between(&existing.dir, panel, 1, plugin::RowList::Completed, plugin::RowList::Active).unwrap();
+        assert_eq!((zoom["id"].as_str(), zoom["completedOverride"].as_bool()), (Some("zoom"), Some(true)));
+        assert_eq!(plugin::active_panel_rows(&existing.dir, panel).unwrap().len(), 2);
     }
 
     /// Installs the repository's plugins and gives them settings under `dir`.

@@ -1,11 +1,11 @@
 schema: 1
 id: oneoff-packager
 name: One-Off Packager
-version: 1.6.0
+version: 1.7.0
 publisher: Yardstick contributors
 description: Packages one-off software requests that don't suit Yardstick. An agent triages the ticket, Recipe Builder authors and checks recipes, and packaging and Intune upload remain separate stages. Anything that installs software or changes the tenant waits for your approval of the exact file it acts on.
 icon: E7B8
-studio: { minVersion: 0.7.0, hostApi: 3 }
+studio: { minVersion: 0.7.0, hostApi: 4 }
 source: { github: jeffpearson1/YardstickDevelopmentStudio, tagPrefix: plugin-oneoff-packager-v }
 requires:
   modules:
@@ -52,6 +52,7 @@ page:
     - triage
     - stage-dropbox
     - runtime
+    - check-existing
     - inventory
     - prepare-test
     - full-test-request
@@ -65,7 +66,7 @@ page:
       file: products.json
       rows: /products
       columns: [name, version, status, notes]
-      recipeBuilder: { routedRows: /routedProducts, reviewBefore: runtime, authorBefore: prepare-test, recipeFolder: recipes, iconFolder: icons }
+      recipeBuilder: { routedRows: /routedProducts, completedRows: /completedProducts, reviewBefore: inventory, authorBefore: prepare-test, recipeFolder: recipes, iconFolder: icons }
     - { type: markdown, title: Downloads, file: downloads.md }
     - { type: markdown, title: Change set, file: intune-upload/live-change-summary.md }
     - type: files
@@ -111,13 +112,13 @@ steps:
     scope: plugin
   - id: parse-ticket
     label: Extract links and targets
-    description: Pulls links, Dropbox links and asset tags out of the request text into parsed-ticket.json.
+    description: Pulls links, file-sharing links and asset tags out of the request text into parsed-ticket.json.
     script: scripts/Step-ParseTicket.ps1
     risk: local-write
     automatic: true
   - id: fetch-links
     label: Download linked installers
-    description: Downloads the files the ticket links to (Dropbox and SharePoint links as direct downloads, zips unpacked) and records each one's size, hash, signer and version. Web pages are skipped and nothing is run.
+    description: Downloads the files the ticket links to (file-sharing links such as Dropbox, OneDrive/SharePoint, Google Drive and Box as direct downloads, zips unpacked) and records each one's size, hash, signer and version. Web pages are skipped and nothing is run.
     script: scripts/Step-FetchLinks.ps1
     params: { maxGb: 4 }
     risk: local-write
@@ -136,12 +137,19 @@ steps:
     script: scripts/Step-Runtime.ps1
     risk: local-write
     automatic: true
+  - id: check-existing
+    label: Find apps that already exist
+    description: Looks for each product among YardstickDev's recipes and, read-only, the tenant's Windows apps. Products that already exist move to Already available before routing; you can package one anyway.
+    script: scripts/Step-CheckExisting.ps1
+    risk: tenant-read
+    after: [runtime, triage]
+    automatic: true
   - id: inventory
     label: Check Intune for existing apps
     description: A read-only search of the tenant's Win32 apps and the target group. Run before anything is packaged.
     script: scripts/Step-Inventory.ps1
     risk: tenant-read
-    after: [runtime, triage]
+    after: [runtime, triage, check-existing]
     automatic: true
   - id: prepare-test
     label: Prepare test (no install)

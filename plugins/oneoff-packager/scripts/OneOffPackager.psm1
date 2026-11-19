@@ -205,6 +205,153 @@ function New-OneOffInventory {
     [pscustomobject]@{ Path = $path; Inventory = $inventory }
 }
 
+# ------------------------------------------------------------------ existing apps (before routing)
+
+# Intune app types that install on Windows; phone and Mac apps are not the same product here.
+$script:WindowsAppTypes = '(?i)win32|windows|winget|officeSuite|microsoftStore|microsoftEdge'
+
+function Get-OneOffNameKey {
+    # A name reduced to lowercase letters and digits, so "7-Zip" and "7zip" compare equal.
+    param([string]$Name)
+    ([string]$Name).ToLowerInvariant() -replace '[^a-z0-9]', ''
+}
+
+function Get-OneOffRecipeIndex {
+    # The YardstickDev clone's shipped recipes (development recipes are work in progress):
+    # id, display name and publisher, read from the top-level YAML lines.
+    param([string]$YardstickDev)
+    if (-not $YardstickDev -or -not (Test-Path -LiteralPath $YardstickDev -PathType Container)) { return @() }
+    $recipesRel = 'Recipes'; $developmentRel = 'Recipes\Development'
+    $project = Join-Path $YardstickDev 'Yardstick.Project.psd1'
+    if (Test-Path -LiteralPath $project -PathType Leaf) {
+        try {
+            $data = Import-PowerShellDataFile -LiteralPath $project
+            if ($data.RecipesPath) { $recipesRel = [string]$data.RecipesPath }
+            if ($data.DevelopmentRecipes) { $developmentRel = [string]$data.DevelopmentRecipes }
+        } catch { }
+    }
+    $recipes = [IO.Path]::GetFullPath((Join-Path $YardstickDev $recipesRel))
+    $development = [IO.Path]::GetFullPath((Join-Path $YardstickDev $developmentRel))
+    if (-not (Test-Path -LiteralPath $recipes -PathType Container)) { return @() }
+    foreach ($file in Get-ChildItem -LiteralPath $recipes -Filter '*.yaml' -File -Recurse) {
+        if (Test-PathWithin -Path $file.FullName -Root $development) { continue }
+        $text = [IO.File]::ReadAllText($file.FullName)
+        $field = {
+            param($name)
+            if ($text -match "(?m)^$name\s*:\s*(.+?)\s*$") { $Matches[1].Trim().Trim('"', "'") } else { '' }
+        }
+        [pscustomobject]@{
+            id          = $file.BaseName
+            displayName = & $field 'displayName'
+            publisher   = & $field 'publisher'
+            path        = [IO.Path]::GetRelativePath($YardstickDev, $file.FullName)
+        }
+    }
+}
+
+function Find-OneOffRecipeMatches {
+    # Recipes that are this product: the same id, or the same name once punctuation is ignored.
+    param([Parameter(Mandatory)]$Product, [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Recipes)
+    $id = Get-OneOffNameKey (Get-Prop $Product 'id' '')
+    $name = Get-OneOffNameKey (Get-Prop $Product 'name' '')
+    @($Recipes | Where-Object {
+        $recipeId = Get-OneOffNameKey $_.id
+        $recipeName = Get-OneOffNameKey $_.displayName
+        ($id -and $recipeId -eq $id) -or ($name -and ($recipeName -eq $name -or $recipeId -eq $name))
+    })
+}
+
+function Get-OneOffIntuneAppIndex {
+    # Read-only. Assumes a connected Graph session. Every Windows app in the tenant.
+    $select = '$select=id,displayName,publisher,isAssigned,publishingState&$top=999'
+    @(Invoke-YardstickGraphRequest -Method Get -Resource "deviceAppManagement/mobileApps?$select" -MaxAttempts 2) |
+        Where-Object { $type = [string](Get-Prop $_ '@odata.type' ''); -not $type -or $type -match $script:WindowsAppTypes }
+}
+
+function Get-OneOffExistingIntuneApps {
+    # The tenant's Windows apps, through the isolated runtime's guarded Graph layer.
+    param(
+        [Parameter(Mandatory)][string]$WorkItem,
+        [Parameter(Mandatory)][string]$TenantId,
+        [string]$TenantName,
+        [string]$CredentialTarget = 'Yardstick:IntuneGraph'
+    )
+    $session = Connect-OneOffTenant -Runtime (Join-Path $WorkItem 'runtime') -TenantId $TenantId -TenantName $TenantName -CredentialTarget $CredentialTarget
+    try {
+        [pscustomobject]@{ Tenant = $session.DisplayName; Apps = @(Get-OneOffIntuneAppIndex) }
+    } finally {
+        Disconnect-YardstickGraph
+    }
+}
+
+function Update-OneOffExistingProducts {
+    # Marks each product with what already exists (a Yardstick recipe, an Intune app) and
+    # moves the ones that exist to completedProducts. A product the user moved back
+    # (completedOverride) keeps its marks but stays. $IntuneApps is $null when Intune
+    # could not be checked.
+    param(
+        [Parameter(Mandatory)][string]$WorkItem,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Recipes,
+        [AllowNull()][object[]]$IntuneApps,
+        [string]$IntuneNote
+    )
+    $path = Join-Path $WorkItem 'products.json'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'products.json is missing. Run the triage task first.' }
+    $document = Read-Json -Path $path
+    $intuneChecked = $null -ne $IntuneApps
+    $keep = [System.Collections.Generic.List[object]]::new()
+    $completed = [System.Collections.Generic.List[object]]::new()
+    foreach ($row in @(Get-Prop $document 'completedProducts' @())) { $completed.Add($row) }
+    $moved = [System.Collections.Generic.List[string]]::new()
+    $intuneOnly = [System.Collections.Generic.List[string]]::new()
+    foreach ($product in @(Get-Prop $document 'products' @())) {
+        $name = [string](Get-Prop $product 'name' (Get-Prop $product 'id' '?'))
+        $recipeHits = @(Find-OneOffRecipeMatches -Product $product -Recipes $Recipes)
+        $intuneHits = @()
+        if ($intuneChecked) {
+            $patterns = @(Get-OneOffSearchPatterns -Products @($product))
+            if ($patterns.Count) { $intuneHits = @(Select-InventoryCandidates -Index $IntuneApps -Patterns $patterns | ForEach-Object { $_.App }) }
+        }
+        $appText = @($intuneHits | ForEach-Object {
+            $state = if ((Get-Prop $_ 'isAssigned') -eq $true) { 'assigned' } else { 'not assigned' }
+            "$(Get-Prop $_ 'displayName' '?') ($(Get-Prop $_ 'publisher' 'no publisher'); $state)"
+        })
+        $flags = [System.Collections.Generic.List[object]]::new()
+        if ($recipeHits.Count) {
+            $flags.Add([ordered]@{ label = "Yardstick recipe: $(@($recipeHits.id) -join ', ')"; tone = 'green'
+                detail = 'Yardstick recipe: ' + (@($recipeHits | ForEach-Object { "$($_.path) ($($_.displayName))" }) -join '; ') })
+        }
+        if ($intuneHits.Count -and $recipeHits.Count) {
+            $flags.Add([ordered]@{ label = 'In Intune'; tone = 'green'; detail = 'In Intune: ' + ($appText -join '; ') })
+        } elseif ($intuneHits.Count) {
+            $flags.Add([ordered]@{ label = 'In Intune, no Yardstick recipe'; tone = 'amber'
+                detail = 'In Intune without a Yardstick recipe: ' + ($appText -join '; ') + '. Package it anyway to give it a recipe.' })
+            $intuneOnly.Add($name)
+        } elseif (-not $intuneChecked) {
+            $flags.Add([ordered]@{ label = 'Intune not checked'; tone = 'grey'; detail = $IntuneNote })
+        }
+        $existing = [ordered]@{
+            checkedUtc    = [DateTime]::UtcNow.ToString('o')
+            recipes       = @($recipeHits | ForEach-Object { [ordered]@{ id = $_.id; displayName = $_.displayName; path = $_.path } })
+            intuneChecked = $intuneChecked
+            intuneApps    = @($intuneHits | ForEach-Object {
+                [ordered]@{ id = Get-Prop $_ 'id'; displayName = Get-Prop $_ 'displayName'; publisher = Get-Prop $_ 'publisher'; isAssigned = Get-Prop $_ 'isAssigned' }
+            })
+        }
+        $product | Add-Member -NotePropertyName existing -NotePropertyValue $existing -Force
+        $product | Add-Member -NotePropertyName flags -NotePropertyValue @($flags) -Force
+        if (($recipeHits.Count -or $intuneHits.Count) -and (Get-Prop $product 'completedOverride') -ne $true) {
+            $completed.Add($product); $moved.Add($name)
+        } else {
+            $keep.Add($product)
+        }
+    }
+    $document | Add-Member -NotePropertyName products -NotePropertyValue @($keep) -Force
+    $document | Add-Member -NotePropertyName completedProducts -NotePropertyValue @($completed) -Force
+    Write-Json -Path $path -Value $document -Depth 30
+    [pscustomobject]@{ Completed = @($moved); IntuneOnly = @($intuneOnly); Remaining = $keep.Count; IntuneChecked = $intuneChecked }
+}
+
 # ------------------------------------------------------------------ full-test evidence and packaging
 
 function Find-TestResult {
@@ -437,6 +584,12 @@ function New-OneOffLiveChange {
             $own = @(Get-Prop $product 'searchPatterns' @())
             if (-not $own -and $product) { $own = @(Get-OneOffSearchPatterns -Products @($product)) }
             $duplicates = @(@($inventory.matchingApps) | Where-Object { $hit = $_; @($hit.matchedPatterns | Where-Object { $_ -in $own }).Count -gt 0 })
+            # Apps the existing-apps check showed before the user chose "Package anyway" are accepted;
+            # anything new since then still stops the change.
+            if ((Get-Prop $product 'completedOverride') -eq $true) {
+                $seen = @(@(Get-Prop (Get-Prop $product 'existing') 'intuneApps' @()) | ForEach-Object { [string](Get-Prop $_ 'id' '') } | Where-Object { $_ })
+                $duplicates = @($duplicates | Where-Object { [string]$_.id -notin $seen })
+            }
             if ($duplicates.Count -gt 0) {
                 throw "Intune already has $($duplicates.Count) app(s) that may be '$($package.id)': $((@($duplicates | ForEach-Object { $_.displayName }) -join ', ')). Review them and set the product's status before preparing a change."
             }
@@ -777,9 +930,37 @@ $script:InstallerExtensions = @('.exe', '.msi', '.msix', '.msixbundle', '.appx',
 # Files a ticket link may deliver that are worth keeping beside the installers.
 $script:KeptExtensions = $script:InstallerExtensions + @('.mst', '.msp', '.xml', '.json', '.ini', '.cfg', '.reg', '.txt', '.lic', '.key')
 
+# File-sharing services a ticket may link installers from, by host. Their sharing links
+# usually open a preview page; Get-OneOffDownloadUri asks the ones it knows for the file.
+$script:FileShareHosts = [ordered]@{
+    'Dropbox'          = '(^|\.)(dropbox\.com|dropboxusercontent\.com)$'
+    'OneDrive'         = '(^|\.)(sharepoint\.com|1drv\.ms|onedrive\.live\.com)$'
+    'Google Drive'     = '^(drive|docs|drive\.usercontent)\.google\.com$'
+    'Box'              = '(^|\.)box\.com$'
+    'WeTransfer'       = '(^|\.)(wetransfer\.com|we\.tl)$'
+    'MEGA'             = '(^|\.)mega\.(nz|io)$'
+    'MediaFire'        = '(^|\.)mediafire\.com$'
+    'pCloud'           = '(^|\.)pcloud\.(link|com)$'
+    'Egnyte'           = '(^|\.)egnyte\.com$'
+    'ShareFile'        = '(^|\.)sharefile\.com$'
+    'GitHub'           = '^(github\.com|objects\.githubusercontent\.com|raw\.githubusercontent\.com)$'
+}
+
+function Get-OneOffFileShareHost {
+    # The file-sharing service a link belongs to, or '' for any other site.
+    param([Parameter(Mandatory)][string]$Url)
+    $uri = $null
+    if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri)) { return '' }
+    $hostName = $uri.Host.ToLowerInvariant()
+    foreach ($name in $script:FileShareHosts.Keys) {
+        if ($hostName -match $script:FileShareHosts[$name]) { return $name }
+    }
+    ''
+}
+
 function Remove-OneOffUrlQuery {
     # A link as it may be written down: scheme, host and path, never the query
-    # (Dropbox and SharePoint put access tokens there).
+    # (file-sharing services put access tokens there).
     param([Parameter(Mandatory)][string]$Url)
     $uri = $null
     if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri)) { return '(unreadable link)' }
@@ -789,11 +970,13 @@ function Remove-OneOffUrlQuery {
 }
 
 function Get-OneOffDownloadUri {
-    # The URL that returns the file itself: a Dropbox share link only downloads with dl=1,
-    # a SharePoint/OneDrive sharing link with download=1. Other links are used as they are.
+    # The URL that returns the file itself rather than a file-sharing service's preview page:
+    # Dropbox wants dl=1, OneDrive/SharePoint download=1, Google Drive its download endpoint,
+    # a Box shared link its /shared/static/ form, a GitHub file page raw=1. Other links (vendor
+    # sites, and services with no unattended download) are used as they are; a link that still
+    # opens a web page is reported, not kept.
     param([Parameter(Mandatory)][string]$Url)
     $uri = [Uri]$Url
-    $hostName = $uri.Host.ToLowerInvariant()
     $query = $uri.Query.TrimStart('?')
     $pairs = @(if ($query) { $query -split '&' | Where-Object { $_ } })
     $set = {
@@ -801,12 +984,28 @@ function Get-OneOffDownloadUri {
         $kept = @($pairs | Where-Object { $_ -notmatch "^(?i)$name=" })
         $kept + "$name=$value"
     }
-    if ($hostName -match '(^|\.)dropbox\.com$') {
-        $pairs = & $set $pairs 'dl' '1'
-    } elseif ($hostName -match '(^|\.)(sharepoint\.com|1drv\.ms|onedrive\.live\.com)$') {
-        $pairs = & $set $pairs 'download' '1'
-    } else {
-        return $uri.AbsoluteUri
+    switch (Get-OneOffFileShareHost -Url $Url) {
+        'Dropbox' {
+            if ($uri.Host -match '(?i)dropboxusercontent') { return $uri.AbsoluteUri }
+            $pairs = & $set $pairs 'dl' '1'
+        }
+        'OneDrive' { $pairs = & $set $pairs 'download' '1' }
+        'Google Drive' {
+            $id = if ($uri.AbsolutePath -match '/(?:file/)?d/([A-Za-z0-9_-]+)') { $Matches[1] }
+                elseif ($query -match '(?:^|&)id=([A-Za-z0-9_-]+)') { $Matches[1] }
+            if (-not $id -or $uri.Host -match '(?i)^docs\.') { return $uri.AbsoluteUri }
+            # confirm=t skips the "can't scan this file for viruses" page large files get.
+            return "https://drive.usercontent.google.com/download?id=$id&export=download&confirm=t"
+        }
+        'Box' {
+            if ($uri.AbsolutePath -notmatch '^/s/([A-Za-z0-9]+)/?$') { return $uri.AbsoluteUri }
+            return "$($uri.Scheme)://$($uri.Authority)/shared/static/$($Matches[1])"
+        }
+        'GitHub' {
+            if ($uri.Host -ne 'github.com' -or $uri.AbsolutePath -notmatch '^/[^/]+/[^/]+/blob/') { return $uri.AbsoluteUri }
+            $pairs = & $set $pairs 'raw' '1'
+        }
+        default { return $uri.AbsoluteUri }
     }
     $builder = [UriBuilder]::new($uri)
     $builder.Query = ($pairs -join '&')
@@ -947,7 +1146,10 @@ function Save-OneOffTicketDownloads {
             $size = (Get-Item -LiteralPath $partial).Length
             if ($isPage) {
                 Remove-Item -LiteralPath $partial -Force
-                $link.result = 'web page, not a file (nothing kept)'
+                $service = Get-OneOffFileShareHost -Url $url
+                $link.result = if ($service) {
+                    "$service page, not a file (nothing kept): the link may need signing in, or ask for a direct-download link"
+                } else { 'web page, not a file (nothing kept)' }
                 $links.Add($link); continue
             }
             if ($size -gt $MaxBytes) {
@@ -1085,4 +1287,5 @@ Export-ModuleMember -Function Get-OneOffSearchPatterns, Select-InventoryCandidat
     New-OneOffInventory, Find-TestResult, Find-FullTestResult, New-OneOffLocalPackages, Get-RecipeAppSettings, New-OneOffDetectionRule, New-OneOffChangeSummary,
     New-OneOffLiveChange, Test-DetectionRulesMatch, Test-AppMetadata, Test-AppAssignment, Invoke-OneOffLiveChangeCore, Invoke-OneOffLiveChange,
     Resolve-RecipePlaceholders, Get-WorkItemProducts, Remove-OneOffUrlQuery, Get-OneOffDownloadUri, Get-OneOffInstallerFacts,
-    Save-OneOffTicketDownloads, Get-OneOffSoftwareDropbox, Copy-OneOffTicketInstallers
+    Save-OneOffTicketDownloads, Get-OneOffSoftwareDropbox, Copy-OneOffTicketInstallers, Get-OneOffFileShareHost,
+    Get-OneOffRecipeIndex, Find-OneOffRecipeMatches, Get-OneOffIntuneAppIndex, Get-OneOffExistingIntuneApps, Update-OneOffExistingProducts

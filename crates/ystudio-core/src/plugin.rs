@@ -27,8 +27,9 @@ use crate::process::ProcessSpec;
 use crate::update::{Release, is_newer};
 
 /// The page and widget kit this Studio provides. A manifest asking for more
-/// needs a newer Studio.
-pub const HOST_API: u32 = 3;
+/// needs a newer Studio. 4: routable tables can keep `completedRows`, and rows
+/// can carry coloured `flags`.
+pub const HOST_API: u32 = 4;
 pub const MANIFEST: &str = "plugin.yaml";
 pub const WORK_ITEM_FILE: &str = "work-item.json";
 /// Every plugin declares this folder setting; work items live under it.
@@ -272,6 +273,11 @@ pub struct PanelDef {
 pub struct RecipeBuilderRouteDef {
     /// A top-level JSON array in the panel file that retains routed rows.
     pub routed_rows: String,
+    /// A top-level JSON array of rows the plugin found already done (an
+    /// existing recipe or app). Its steps move rows there; the user can move
+    /// one back, which marks it `completedOverride: true` so it stays back.
+    #[serde(default)]
+    pub completed_rows: Option<String>,
     /// Automatic execution pauses before this stage while a multi-row ticket
     /// still needs a routing decision.
     pub review_before: String,
@@ -339,25 +345,66 @@ pub fn routed_panel_rows(dir: &Path, panel: &PanelDef) -> Result<Vec<Value>> {
     rows_at(dir, panel, &routing.routed_rows)
 }
 
+/// Rows the plugin marked already done. Empty when the panel declares none.
+pub fn completed_panel_rows(dir: &Path, panel: &PanelDef) -> Result<Vec<Value>> {
+    match panel.recipe_builder.as_ref().and_then(|routing| routing.completed_rows.as_deref()) {
+        Some(pointer) => rows_at(dir, panel, pointer),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The arrays a routable table row can live in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowList {
+    Active,
+    Routed,
+    Completed,
+}
+
 /// Atomically moves one table row between a plugin's active and Recipe
 /// Builder-retained arrays. Returns the row that moved.
 pub fn move_panel_row(dir: &Path, panel: &PanelDef, index: usize, to_recipe_builder: bool) -> Result<Value> {
+    let (from, to) = if to_recipe_builder { (RowList::Active, RowList::Routed) } else { (RowList::Routed, RowList::Active) };
+    move_panel_row_between(dir, panel, index, from, to)
+}
+
+/// Atomically moves one table row between two of a routable panel's arrays.
+/// A row taken out of the completed list is marked `completedOverride: true`,
+/// so the plugin's own checks leave it where the user put it.
+pub fn move_panel_row_between(dir: &Path, panel: &PanelDef, index: usize, from: RowList, to: RowList) -> Result<Value> {
     let file = panel.file.as_deref().ok_or_else(|| anyhow!("panel '{}' has no file", panel.title))?;
-    let active = panel.rows.as_deref().and_then(top_level_pointer).ok_or_else(|| anyhow!("panel '{}' has no routable rows", panel.title))?;
     let routing = panel.recipe_builder.as_ref().ok_or_else(|| anyhow!("panel '{}' has no Recipe Builder routing", panel.title))?;
-    let routed = top_level_pointer(&routing.routed_rows).ok_or_else(|| anyhow!("panel '{}' has invalid routedRows", panel.title))?;
-    let (from, to) = if to_recipe_builder { (active, routed) } else { (routed, active) };
+    let key = |list: RowList| -> Result<&str> {
+        match list {
+            RowList::Active => panel.rows.as_deref().and_then(top_level_pointer).ok_or_else(|| anyhow!("panel '{}' has no routable rows", panel.title)),
+            RowList::Routed => top_level_pointer(&routing.routed_rows).ok_or_else(|| anyhow!("panel '{}' has invalid routedRows", panel.title)),
+            RowList::Completed => routing
+                .completed_rows
+                .as_deref()
+                .and_then(top_level_pointer)
+                .ok_or_else(|| anyhow!("panel '{}' has no completedRows", panel.title)),
+        }
+    };
+    let (from_list, to_list) = (from, to);
+    let (from, to) = (key(from)?, key(to)?);
     anyhow::ensure!(from != to, "panel '{}' routes rows back into the same array", panel.title);
 
     let path = dir.join(file);
     let text = crate::read_text(&path).with_context(|| format!("reading {}", path.display()))?;
     let mut document: Value = serde_json::from_str(&text).with_context(|| format!("reading {}", path.display()))?;
     let object = document.as_object_mut().ok_or_else(|| anyhow!("{} must contain a JSON object", path.display()))?;
-    let row = {
+    let mut row = {
         let source = object.get_mut(from).and_then(Value::as_array_mut).ok_or_else(|| anyhow!("{} /{} is not an array", path.display(), from))?;
         anyhow::ensure!(index < source.len(), "row {} no longer exists in panel '{}'", index + 1, panel.title);
         source.remove(index)
     };
+    if let Some(fields) = row.as_object_mut() {
+        if from_list == RowList::Completed {
+            fields.insert("completedOverride".into(), Value::Bool(true));
+        } else if to_list == RowList::Completed {
+            fields.remove("completedOverride");
+        }
+    }
     let destination = object.entry(to.to_string()).or_insert_with(|| Value::Array(Vec::new()));
     destination.as_array_mut().ok_or_else(|| anyhow!("{} /{} is not an array", path.display(), to))?.push(row.clone());
 
@@ -679,14 +726,17 @@ impl Manifest {
             if let Some(panel) = self.page.panels.iter().find(|panel| {
                 panel.recipe_builder.as_ref().is_some_and(|routing| routing.review_before == stage.id())
             })
-                && !item.meta.routing_reviews.contains(&panel.title)
                 && let Some(count) = panel_row_count(&item.dir, panel)
             {
-                if count == 0 {
+                // Rows the plugin found already done always get a look before
+                // the workflow moves on: the user may want one packaged anyway.
+                let reviewed = item.meta.routing_reviews.contains(&panel.title);
+                let completed = completed_panel_rows(&item.dir, panel).map(|rows| rows.len()).unwrap_or(0);
+                if count == 0 && (reviewed || completed == 0) {
                     return AutomationNext::RoutedComplete(panel);
                 }
                 let routed = routed_panel_rows(&item.dir, panel).map(|rows| rows.len()).unwrap_or(0);
-                if count > 1 || routed > 0 {
+                if !reviewed && (count > 1 || routed > 0 || completed > 0) {
                     return AutomationNext::RoutingReview(panel, count);
                 }
             }
@@ -903,6 +953,11 @@ impl Manifest {
                 }
                 if top_level_pointer(&routing.routed_rows).is_none() {
                     p(format!("panel '{}' routedRows must be a top-level JSON pointer", panel.title));
+                }
+                if let Some(completed) = routing.completed_rows.as_deref()
+                    && (top_level_pointer(completed).is_none() || completed == routing.routed_rows || Some(completed) == panel.rows.as_deref())
+                {
+                    p(format!("panel '{}' completedRows must be its own top-level JSON pointer", panel.title));
                 }
                 if self.task(&routing.review_before).is_none() && self.step(&routing.review_before).is_none() {
                     p(format!("panel '{}' reviews routing before unknown stage '{}'", panel.title, routing.review_before));
@@ -2261,8 +2316,8 @@ mod tests {
             assert!(err.contains(expect), "{to}: {err}");
         }
         assert!(invalid(&base.replace("id: echo\n", "id: triage\n")).contains("duplicate"));
-        let newer = Manifest::parse(&base.replace("hostApi: 3", "hostApi: 4")).unwrap();
-        assert!(newer.incompatibility(VERSION).unwrap().contains("plugin API 4"));
+        let newer = Manifest::parse(&base.replace("hostApi: 3", "hostApi: 5")).unwrap();
+        assert!(newer.incompatibility(VERSION).unwrap().contains("plugin API 5"));
     }
 
     #[test]
@@ -2457,6 +2512,41 @@ mod tests {
         let restored = move_panel_row(&item.dir, panel, 0, false).unwrap();
         assert_eq!(restored["id"], "one");
         assert_eq!(panel_row_count(&item.dir, panel), Some(1));
+    }
+
+    #[test]
+    fn completed_rows_need_a_look_and_can_be_moved_back() {
+        let mut manifest = Manifest::parse(&fixture_manifest()).unwrap();
+        manifest.agent.as_mut().unwrap().tasks[0].automatic = true;
+        manifest.steps[0].automatic = true;
+        manifest.page.panels.insert(0, serde_yaml::from_str(
+            "type: table\ntitle: Products\nfile: products.json\nrows: /products\ncolumns: [name]\nrecipeBuilder:\n  routedRows: /routedProducts\n  completedRows: /completedProducts\n  reviewBefore: echo\n",
+        ).unwrap());
+        let panel = &manifest.page.panels[0];
+        let d = tempfile::tempdir().unwrap();
+        let mut item = WorkItem::create(d.path(), "{date}-{slug}", "Existing", "", Origin::default(), SystemTime::now()).unwrap();
+        item.meta.steps.insert("triage".into(), StepRecord { state: StepState::Ok, ..Default::default() });
+
+        // One product, already available: the user still sees it before the ticket completes.
+        std::fs::write(item.dir.join("products.json"), r#"{"products":[],"completedProducts":[{"id":"one","name":"One"}]}"#).unwrap();
+        assert_eq!(completed_panel_rows(&item.dir, panel).unwrap().len(), 1);
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::RoutingReview(_, 0)));
+        item.meta.routing_reviews.insert("Products".into());
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::RoutedComplete(_)));
+
+        // "Package anyway" moves it back with an override the plugin's checks respect.
+        item.meta.routing_reviews.clear();
+        let back = move_panel_row_between(&item.dir, panel, 0, RowList::Completed, RowList::Active).unwrap();
+        assert_eq!(back["completedOverride"], true);
+        let active = active_panel_rows(&item.dir, panel).unwrap();
+        assert_eq!((active.len(), active[0]["completedOverride"].as_bool()), (1, Some(true)));
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::Run(Stage::Step(step)) if step.id == "echo"));
+
+        // A single remaining product beside a completed one still needs confirmation.
+        std::fs::write(item.dir.join("products.json"), r#"{"products":[{"id":"two"}],"completedProducts":[{"id":"one"}]}"#).unwrap();
+        assert!(matches!(manifest.next_automatic(&item), AutomationNext::RoutingReview(_, 1)));
+        let again = move_panel_row_between(&item.dir, panel, 0, RowList::Active, RowList::Completed).unwrap();
+        assert!(again.get("completedOverride").is_none());
     }
 
     #[test]

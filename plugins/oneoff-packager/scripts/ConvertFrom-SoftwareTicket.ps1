@@ -8,7 +8,10 @@ param(
     [switch]$AsJson
 )
 
-begin { $parts = [System.Collections.Generic.List[string]]::new() }
+begin {
+    if (-not (Get-Command Get-OneOffFileShareHost -ErrorAction SilentlyContinue)) { Import-Module (Join-Path $PSScriptRoot 'OneOffPackager.psm1') }
+    $parts = [System.Collections.Generic.List[string]]::new()
+}
 process { $parts.Add($TicketText) }
 end {
     $raw = $parts -join [Environment]::NewLine
@@ -44,7 +47,8 @@ end {
         ProductsHeuristic = $products
         TargetStrings     = $targets
         Urls              = @($urls)
-        DropboxUrls       = @($urls | Where-Object { $_ -match '(?i)^https://(?:www\.)?dropbox\.com/' })
+        # Links to file-sharing services (Dropbox, OneDrive, Google Drive, Box...), by host.
+        FileShareUrls     = @($urls | Where-Object { Get-OneOffFileShareHost -Url $_ })
         HasDownloadLinks  = ($urls.Count -gt 0)
         NormalizedText    = $normalized
     }

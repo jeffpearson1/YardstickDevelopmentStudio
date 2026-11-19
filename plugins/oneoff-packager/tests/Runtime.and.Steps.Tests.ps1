@@ -73,11 +73,11 @@ Describe 'the step protocol' {
     }
 
     It 'extracts links and targets from the ticket' {
-        Set-Content -LiteralPath (Join-Path $t.WorkItem 'ticket.md') -Value 'Hi, software is Zoom and Mplus. See [x](https://www.dropbox.com/s/a/Zoom.msi?dl=0) for NC-4214805.'
+        Set-Content -LiteralPath (Join-Path $t.WorkItem 'ticket.md') -Value 'Hi, software is Zoom and Mplus. See [x](https://www.dropbox.com/s/a/Zoom.msi?dl=0) and https://drive.google.com/file/d/abc/view for NC-4214805. Vendor: https://vendor.example/mplus'
         $r = Invoke-TestStep -Item $t -Script 'Step-ParseTicket.ps1'
         $r.ExitCode | Should -Be 0
         $r.Result.status | Should -Be 'ok'
-        $r.Result.summary | Should -Be '1 link(s), 1 Dropbox, 1 asset tag(s).'
+        $r.Result.summary | Should -Be '3 link(s), 2 file-sharing, 1 asset tag(s).'
         $parsed = Get-Content (Join-Path $t.WorkItem 'parsed-ticket.json') -Raw | ConvertFrom-Json
         $parsed.TargetStrings | Should -Be @('NC-4214805')
         $r.Result.artifacts[0].path | Should -Be 'parsed-ticket.json'
