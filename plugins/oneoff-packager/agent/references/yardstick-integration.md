@@ -2,7 +2,7 @@
 
 ## Isolation
 
-YardstickDev is the one upstream source. Its working tree stays clean and is read-only for every ticket. The **Create the isolated runtime** step copies what a ticket needs into `runtime\` (the Yardstick scripts and modules, templates, existing recipes, icons, docs and the recipe harness), rewrites source-root paths in the copied preferences, inserts a fail-closed guard in `Invoke-YardstickGraphRequest` that throws on any HTTP `DELETE`, and writes `runtime\.oneoff-runtime.json`. It refuses a dirty or non-git source.
+YardstickDev is the one upstream source, and it is read-only for every ticket. The **Create the isolated runtime** step makes `runtime\` a fresh `git clone` of YardstickDev's checked-out commit (uncommitted changes there are left out), copies in the git-ignored files a ticket needs (preferences, the icon library, `*.common.yaml` recipe data), rewrites source-root paths in the copied preferences, inserts a fail-closed guard in `Invoke-YardstickGraphRequest` that throws on any HTTP `DELETE`, and writes `runtime\.oneoff-runtime.json`. It refuses a non-git source. The last stage, **Clean up the runtime**, deletes the clone once the Intune change is done.
 
 A second script proves the guard: a synthetic `DELETE` must be blocked before authentication. Every step that talks to Intune runs that proof first and refuses to go on if it fails. If the copied Graph layer ever stops routing every request through `Invoke-YardstickGraphRequest`, the guard must be updated; never assume safety.
 
@@ -10,7 +10,7 @@ You work **in** `runtime\` only to read. Do not edit it.
 
 ## Checking a recipe
 
-Use the copied runtime's own schema validator on a recipe you wrote:
+Use the runtime's own schema validator on a recipe you wrote:
 
 ```powershell
 pwsh -NoProfile -File runtime\Tests\RecipeHarness\Test-RecipeSchema.ps1 -RecipePath recipes\<id>.yaml

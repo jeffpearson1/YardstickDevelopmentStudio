@@ -13,8 +13,9 @@ Invoke-StudioStep -StudioInput $StudioInput -StudioResult $StudioResult -Body {
     if ((Test-Path -LiteralPath $manifest) -and @(Get-ChildItem -LiteralPath $runtime -Force).Count -gt 0) {
         $note = 'The runtime already exists; its DELETE guard was proven again.'
     } else {
-        & (Join-Path $PSScriptRoot 'New-OneOffYardstickRuntime.ps1') -YardstickDevPath $yardstickDev -DestinationPath $runtime | Out-Null
-        $note = 'Created the runtime and proved its DELETE guard.'
+        $made = & (Join-Path $PSScriptRoot 'New-OneOffYardstickRuntime.ps1') -YardstickDevPath $yardstickDev -DestinationPath $runtime
+        $note = 'Cloned YardstickDev into the runtime and proved its DELETE guard.'
+        if ($made.UncommittedChangesLeftOut) { $note += " $($made.UncommittedChangesLeftOut) uncommitted change(s) in YardstickDev were left out." }
     }
     $safety = & (Join-Path $PSScriptRoot 'Test-OneOffRuntimeSafety.ps1') -RuntimePath $runtime
     if (-not $safety.Safe) { throw 'The runtime DELETE guard did not pass.' }

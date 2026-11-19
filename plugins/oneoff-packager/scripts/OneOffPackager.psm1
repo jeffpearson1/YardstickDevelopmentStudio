@@ -268,19 +268,40 @@ function Get-OneOffIntuneAppIndex {
         Where-Object { $type = [string](Get-Prop $_ '@odata.type' ''); -not $type -or $type -match $script:WindowsAppTypes }
 }
 
+function Remove-OneOffRuntime {
+    # Deletes a runtime clone this plugin made (it must carry .oneoff-runtime.json) and returns
+    # its manifest, or $null when there is nothing to remove.
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $null }
+    $manifestPath = Join-Path $Path '.oneoff-runtime.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw "$Path is not a One-Off runtime (no .oneoff-runtime.json); it was left alone." }
+    $manifest = Read-Json -Path $manifestPath
+    # Git marks its object files read-only; -Force removes them too.
+    Remove-Item -LiteralPath $Path -Recurse -Force
+    if (Test-Path -LiteralPath $Path) { throw "Could not remove $Path completely. Close anything using it and run the stage again." }
+    $manifest
+}
+
 function Get-OneOffExistingIntuneApps {
-    # The tenant's Windows apps, through the isolated runtime's guarded Graph layer.
+    # The tenant's Windows apps, through the guarded Graph layer of a temporary YardstickDev
+    # clone that is removed again before this returns.
     param(
-        [Parameter(Mandatory)][string]$WorkItem,
+        [Parameter(Mandatory)][string]$YardstickDev,
         [Parameter(Mandatory)][string]$TenantId,
         [string]$TenantName,
         [string]$CredentialTarget = 'Yardstick:IntuneGraph'
     )
-    $session = Connect-OneOffTenant -Runtime (Join-Path $WorkItem 'runtime') -TenantId $TenantId -TenantName $TenantName -CredentialTarget $CredentialTarget
+    $runtime = Join-Path ([IO.Path]::GetTempPath()) ("oneoff-check-" + [guid]::NewGuid().ToString('N'))
     try {
-        [pscustomobject]@{ Tenant = $session.DisplayName; Apps = @(Get-OneOffIntuneAppIndex) }
+        & (Join-Path $script:Here 'New-OneOffYardstickRuntime.ps1') -YardstickDevPath $YardstickDev -DestinationPath $runtime -ModulesOnly | Out-Null
+        $session = Connect-OneOffTenant -Runtime $runtime -TenantId $TenantId -TenantName $TenantName -CredentialTarget $CredentialTarget
+        try {
+            [pscustomobject]@{ Tenant = $session.DisplayName; Apps = @(Get-OneOffIntuneAppIndex) }
+        } finally {
+            Disconnect-YardstickGraph
+        }
     } finally {
-        Disconnect-YardstickGraph
+        if (Test-Path -LiteralPath $runtime) { Remove-Item -LiteralPath $runtime -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -1288,4 +1309,4 @@ Export-ModuleMember -Function Get-OneOffSearchPatterns, Select-InventoryCandidat
     New-OneOffLiveChange, Test-DetectionRulesMatch, Test-AppMetadata, Test-AppAssignment, Invoke-OneOffLiveChangeCore, Invoke-OneOffLiveChange,
     Resolve-RecipePlaceholders, Get-WorkItemProducts, Remove-OneOffUrlQuery, Get-OneOffDownloadUri, Get-OneOffInstallerFacts,
     Save-OneOffTicketDownloads, Get-OneOffSoftwareDropbox, Copy-OneOffTicketInstallers, Get-OneOffFileShareHost,
-    Get-OneOffRecipeIndex, Find-OneOffRecipeMatches, Get-OneOffIntuneAppIndex, Get-OneOffExistingIntuneApps, Update-OneOffExistingProducts
+    Get-OneOffRecipeIndex, Find-OneOffRecipeMatches, Get-OneOffIntuneAppIndex, Get-OneOffExistingIntuneApps, Update-OneOffExistingProducts, Remove-OneOffRuntime

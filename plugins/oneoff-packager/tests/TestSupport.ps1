@@ -234,6 +234,8 @@ function New-FakeYardstickDev {
     foreach ($dir in 'Modules', 'Config', 'Templates', 'Recipes', 'Icons', 'Tests\RecipeHarness') { New-Item -ItemType Directory -Path (Join-Path $Path $dir) -Force | Out-Null }
     foreach ($file in 'Yardstick.ps1', 'Yardstick.psd1', 'Yardstick.Project.psd1', 'ProjectLayout.ps1', 'RecipeGroups.yaml') { Set-Content -LiteralPath (Join-Path $Path $file) -Value "# $file" }
     Set-Content -LiteralPath (Join-Path $Path 'Config\settings.yaml') -Value 'a: 1'
+    # Git keeps no empty folders, and the runtime is a clone, so each folder holds a file.
+    foreach ($dir in 'Templates', 'Recipes', 'Icons', 'Tests\RecipeHarness') { Set-Content -LiteralPath (Join-Path $Path "$dir\.gitkeep") -Value '' }
     Set-Content -LiteralPath (Join-Path $Path 'Modules\YardstickGraph.psm1') -Encoding utf8NoBOM -Value @'
 function Get-YardstickGraphTokenExpiry { Get-Date }
 function Invoke-YardstickGraphRequest {
