@@ -1635,7 +1635,11 @@ fn log_lines(ui: &mut Ui, proc: &RunningProcess, salt: &str, view: &[usize]) {
                 // `show_rows` requires every child to have exactly `row_h` height.
                 // Keep process output on one line so long commands scroll sideways
                 // instead of changing the virtual row geometry between repaints.
-                let galley = ui.painter().layout_no_wrap(line.text.clone(), font.clone(), color);
+                // `layout_no_wrap` still breaks at '\n', so embedded line breaks are
+                // flattened too, or the extra lines paint over the rows below. Copy
+                // still uses the original text.
+                let text = ystudio_core::process::one_line(&line.text).into_owned();
+                let galley = ui.painter().layout_no_wrap(text, font.clone(), color);
                 let width = galley.size().x.max(ui.available_width());
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, row_h), egui::Sense::click_and_drag());
                 if selected.as_ref().is_some_and(|r| r.contains(&i)) {
