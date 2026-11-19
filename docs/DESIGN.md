@@ -470,6 +470,13 @@ new page type needs one (`studio.hostApi` in the manifest says which kit it expe
   original ticket context. Rows can be returned until the downstream plugin stage starts.
   The confirmed review is stored on the work item. An empty active array completes the
   plugin run without invoking steps that no longer have products to process.
+- **Already-done rows** (host API 4). A panel may also declare `recipeBuilder.completedRows`,
+  a third array its own steps fill with rows that need no work (One-Off Packager: an existing
+  Yardstick recipe or Intune app). The host lists them under *Already available* and always
+  pauses for review when any exist, even for one product. *Package anyway* moves a row back
+  and marks it `completedOverride: true`, which the plugin's checks respect. Any row may carry
+  `flags: [{label, tone, detail}]`, shown as coloured badges (tone green, amber, red, blue
+  or grey) with the detail beneath.
 - **Linked Recipe Builder authoring** reuses the same panel declaration with `authorBefore`,
   `recipeFolder` and `iconFolder`. At that boundary the host creates or reuses one Recipe
   Builder item per active row and records the origin in both the batch item and plugin work

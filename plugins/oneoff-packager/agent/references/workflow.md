@@ -7,6 +7,7 @@ Who does what, in order. The steps in the **Studio** column are buttons the user
 | 1 | Extract links and targets | Studio | `parsed-ticket.json` |
 | 2 | Triage the ticket | **Agent** | `products.json` |
 | 3 | Create the isolated runtime | Studio | `runtime\` |
+| 3b | Find apps that already exist (recipes and Intune), then product routing | Studio and the user | `completedProducts` in `products.json` |
 | 4 | Check Intune for existing apps | Studio | `inventory\intune-inventory.json` |
 | 5 | Research, author and run safe checks | Recipe Builder | Yardstick development recipe and evidence |
 | 6 | Prepare test (installs nothing) | Studio | `artifacts\package-tests\<run>\` |
@@ -20,7 +21,7 @@ Who does what, in order. The steps in the **Studio** column are buttons the user
 
 Preserve the request as received; never edit `ticket.md`. For every product record its canonical name, publisher, edition, architecture and requested version or channel; the links that belong to it; update or admin-intervention requirements; target strings such as asset tags, device names or groups; licensing, authentication, restart, dependency and data-handling constraints; and any ambiguity that would change the package or the target.
 
-Do not infer that links match product names by position unless the ticket or the link's contents establish it. Never include signed query strings or private Dropbox URLs in any file; redact the query when you quote a link.
+Do not infer that links match product names by position unless the ticket or the link's contents establish it. Never include signed query strings or private file-sharing URLs (Dropbox, OneDrive, Google Drive, Box or any other service) in any file; redact the query when you quote a link.
 
 ## 2. Inventory comes before packaging
 
@@ -33,7 +34,7 @@ The Studio searches Intune read-only for each product, using your `searchPattern
 
 ## 3. Acquire or request the installer
 
-Prefer an official vendor source with a stable unattended enterprise installer and a verifiable version. Use a supplied Dropbox folder only if the ticket authorises it, and inspect its contents before choosing a payload.
+Prefer an official vendor source with a stable unattended enterprise installer and a verifiable version. Use a supplied file-sharing folder only if the ticket authorises it, and inspect its contents before choosing a payload.
 
 Files the ticket links to are already downloaded into `downloads/` with their facts in `downloads.json`, and after triage the Studio copies each product's files (its `downloads`) to `<SoftwareDropbox>\<recipe-id>\` and lists them on the product as `ticketInstallers`. Recipe authoring can then use that installer through `manualDownload` when the vendor offers no unattended download of the same file.
 

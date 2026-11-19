@@ -18,7 +18,7 @@ Invoke-StudioStep -StudioInput $StudioInput -StudioResult $StudioResult -Body {
     $path = Join-Path $workItem 'parsed-ticket.json'
     $parsed | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $path -Encoding utf8NoBOM
     @{
-        Summary   = "$(@($parsed.Urls).Count) link(s), $(@($parsed.DropboxUrls).Count) Dropbox, $(@($parsed.TargetStrings).Count) asset tag(s)."
+        Summary   = "$(@($parsed.Urls).Count) link(s), $(@($parsed.FileShareUrls).Count) file-sharing, $(@($parsed.TargetStrings).Count) asset tag(s)."
         Outputs   = @{ parsed = 'parsed-ticket.json' }
         Artifacts = @(New-StudioArtifact -WorkItem $workItem -Path $path -Label 'Parsed ticket')
     }

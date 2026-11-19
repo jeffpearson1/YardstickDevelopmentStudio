@@ -67,6 +67,21 @@ Describe 'ticket links' {
         Get-OneOffDownloadUri 'https://contoso.sharepoint.com/:u:/s/IT/abc?e=x1' | Should -Be 'https://contoso.sharepoint.com/:u:/s/IT/abc?e=x1&download=1'
         Get-OneOffDownloadUri 'https://vendor.example/files/setup.exe?v=2' | Should -Be 'https://vendor.example/files/setup.exe?v=2'
     }
+
+    It 'knows other file-sharing services, not only Dropbox' {
+        Get-OneOffDownloadUri 'https://drive.google.com/file/d/1AbC_d-9/view?usp=sharing' | Should -Be 'https://drive.usercontent.google.com/download?id=1AbC_d-9&export=download&confirm=t'
+        Get-OneOffDownloadUri 'https://drive.google.com/open?id=1AbC' | Should -Be 'https://drive.usercontent.google.com/download?id=1AbC&export=download&confirm=t'
+        Get-OneOffDownloadUri 'https://asu.app.box.com/s/k3y9' | Should -Be 'https://asu.app.box.com/shared/static/k3y9'
+        Get-OneOffDownloadUri 'https://github.com/o/r/blob/main/setup.msi' | Should -Be 'https://github.com/o/r/blob/main/setup.msi?raw=1'
+        Get-OneOffDownloadUri 'https://onedrive.live.com/redir?resid=1' | Should -Be 'https://onedrive.live.com/redir?resid=1&download=1'
+        Get-OneOffDownloadUri 'https://wetransfer.com/downloads/abc' | Should -Be 'https://wetransfer.com/downloads/abc'
+        foreach ($pair in @(
+            @('https://www.dropbox.com/s/a', 'Dropbox'), @('https://contoso-my.sharepoint.com/x', 'OneDrive'), @('https://1drv.ms/u/s!x', 'OneDrive'),
+            @('https://drive.google.com/x', 'Google Drive'), @('https://app.box.com/s/x', 'Box'), @('https://we.tl/t-x', 'WeTransfer'),
+            @('https://mega.nz/file/x', 'MEGA'), @('https://www.mediafire.com/file/x', 'MediaFire'), @('https://vendor.example/x', ''))) {
+            Get-OneOffFileShareHost $pair[0] | Should -Be $pair[1] -Because $pair[0]
+        }
+    }
 }
 
 Describe 'downloading the installers a ticket links to' {
