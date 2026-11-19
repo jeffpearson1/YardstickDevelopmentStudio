@@ -411,7 +411,7 @@ fn pump<R: Read + Send + 'static>(
 
 /// Strips colours and the line ending. Progress meters (git --progress) redraw
 /// with '\r', so only the final state of such a line is kept.
-fn clean_line(raw: &str) -> String {
+pub fn clean_line(raw: &str) -> String {
     let text = strip_ansi(raw);
     let text = text.trim_end_matches(['\r', '\n']);
     text.rsplit('\r').next().unwrap_or(text).to_string()
