@@ -45,6 +45,16 @@ pub struct LogLine {
     pub text: String,
 }
 
+/// `text` on a single line, with each line break shown as ` ⏎ `. Log views lay
+/// every entry out in one fixed-height row, so an embedded newline would draw
+/// over the rows below it. Borrows when there is nothing to replace.
+pub fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(['\n', '\r']) {
+        return text.into();
+    }
+    text.trim_end_matches(['\n', '\r']).replace("\r\n", "\n").replace(['\n', '\r'], " \u{23CE} ").into()
+}
+
 #[derive(Debug)]
 enum Event {
     Line(LogLine),
@@ -114,13 +124,14 @@ impl ProcessSpec {
         self
     }
 
-    /// A readable command line for the log (not used for execution).
+    /// A readable command line for the log (not used for execution). Always one
+    /// line: line breaks inside an argument (an agent prompt) show as `⏎`.
     pub fn display(&self) -> String {
         let quote = |s: &str| if s.contains(' ') || s.is_empty() { format!("\"{s}\"") } else { s.to_string() };
         let mut parts = vec![quote(&self.program.to_string_lossy())];
         for a in &self.args {
             let shown = if a.len() > 400 { format!("{}… ({} chars)", &a[..a.char_indices().nth(400).map(|(i, _)| i).unwrap_or(a.len())], a.len()) } else { a.clone() };
-            parts.push(quote(&shown));
+            parts.push(quote(&one_line(&shown)));
         }
         parts.join(" ")
     }
@@ -400,7 +411,7 @@ fn pump<R: Read + Send + 'static>(
 
 /// Strips colours and the line ending. Progress meters (git --progress) redraw
 /// with '\r', so only the final state of such a line is kept.
-fn clean_line(raw: &str) -> String {
+pub fn clean_line(raw: &str) -> String {
     let text = strip_ansi(raw);
     let text = text.trim_end_matches(['\r', '\n']);
     text.rsplit('\r').next().unwrap_or(text).to_string()
@@ -604,6 +615,16 @@ mod tests {
     fn strips_ansi() {
         assert_eq!(strip_ansi("\u{1b}[32;1mPass\u{1b}[0m done"), "Pass done");
         assert_eq!(strip_ansi("\u{1b}]0;title\u{7}text"), "text");
+    }
+
+    #[test]
+    fn log_lines_and_command_echo_stay_on_one_line() {
+        assert!(matches!(one_line("plain"), std::borrow::Cow::Borrowed("plain")));
+        assert_eq!(one_line("a\r\nb\nc\rd\n"), "a \u{23CE} b \u{23CE} c \u{23CE} d");
+        let spec = ProcessSpec::new("agent", "claude.exe", &std::env::temp_dir()).args(["-p", "Read the skill.\n\nHard rules:\n1. Only"]);
+        let shown = spec.display();
+        assert!(!shown.contains(['\n', '\r']), "{shown}");
+        assert!(shown.contains("Read the skill. \u{23CE}  \u{23CE} Hard rules:"), "{shown}");
     }
 
     #[test]

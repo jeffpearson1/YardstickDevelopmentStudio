@@ -19,7 +19,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::process::{Output, ProcessSpec, run_bytes, run_output};
+use crate::process::{Output, ProcessSpec, clean_line, one_line, run_bytes, run_output};
 use crate::results::RecipeResult;
 use crate::validation::{Completion, hash_bytes};
 use crate::workspace::{RecipeLocation, Workspace};
@@ -241,15 +241,22 @@ fn git(git: &Path, cwd: &Path, args: &[&str]) -> ProcessSpec {
 
 /// Runs git, logging the command; fails with git's own message.
 fn run(git_exe: &Path, cwd: &Path, args: &[&str], log: &mut dyn FnMut(&str)) -> Result<String> {
-    log(&format!("> git {}", args.join(" ")));
+    // One log row per command, even for a multi-line commit message.
+    log(&format!("> git {}", one_line(&args.join(" "))));
     let out = run_output(&git(git_exe, cwd, args))?;
-    for line in out.stderr.lines().filter(|l| !l.trim().is_empty()) {
-        log(line);
+    // Progress meters ("Updating files: 7%\r…") keep only their final frame.
+    for line in stderr_lines(&out.stderr) {
+        log(&line);
     }
     if !out.success {
         bail!("git {} failed: {}", args.first().copied().unwrap_or_default(), last_line(&out));
     }
     Ok(out.stdout)
+}
+
+/// git's stderr as log lines: colours and '\r' progress frames removed, blanks skipped.
+fn stderr_lines(stderr: &str) -> impl Iterator<Item = String> + '_ {
+    stderr.lines().map(clean_line).filter(|l| !l.trim().is_empty())
 }
 
 /// The most telling line: the last one on stderr (git reports errors there), else on stdout.
@@ -800,6 +807,12 @@ fn pull_url(text: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::workspace::fake_workspace;
+
+    #[test]
+    fn git_progress_logs_only_its_final_frame() {
+        let stderr = "Preparing worktree\nUpdating files:   6% (24/376)\rUpdating files: 100% (376/376), done.\n\n";
+        assert_eq!(stderr_lines(stderr).collect::<Vec<_>>(), ["Preparing worktree", "Updating files: 100% (376/376), done."]);
+    }
 
     #[test]
     fn web_urls_from_remotes() {
