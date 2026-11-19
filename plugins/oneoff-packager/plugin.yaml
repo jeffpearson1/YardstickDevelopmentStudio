@@ -1,7 +1,7 @@
 schema: 1
 id: oneoff-packager
 name: One-Off Packager
-version: 1.5.0
+version: 1.6.0
 publisher: Yardstick contributors
 description: Packages one-off software requests that don't suit Yardstick. An agent triages the ticket, Recipe Builder authors and checks recipes, and packaging and Intune upload remain separate stages. Anything that installs software or changes the tenant waits for your approval of the exact file it acts on.
 icon: E7B8
@@ -48,7 +48,9 @@ page:
   importer: import-servicenow
   pipeline:
     - parse-ticket
+    - fetch-links
     - triage
+    - stage-dropbox
     - runtime
     - inventory
     - prepare-test
@@ -64,6 +66,7 @@ page:
       rows: /products
       columns: [name, version, status, notes]
       recipeBuilder: { routedRows: /routedProducts, reviewBefore: runtime, authorBefore: prepare-test, recipeFolder: recipes, iconFolder: icons }
+    - { type: markdown, title: Downloads, file: downloads.md }
     - { type: markdown, title: Change set, file: intune-upload/live-change-summary.md }
     - type: files
       title: Evidence
@@ -94,9 +97,9 @@ agent:
   tasks:
     - id: triage
       label: Triage the ticket
-      description: Reads the request and lists each product with its links, targets and open questions.
+      description: Reads the request and the installers its links delivered, and lists each product with its links, downloads, targets and open questions.
       prompt: agent/tasks/triage.md
-      after: [parse-ticket]
+      after: [fetch-links]
       outputs: [products.json]
       automatic: true
 steps:
@@ -112,6 +115,21 @@ steps:
     script: scripts/Step-ParseTicket.ps1
     risk: local-write
     automatic: true
+  - id: fetch-links
+    label: Download linked installers
+    description: Downloads the files the ticket links to (Dropbox and SharePoint links as direct downloads, zips unpacked) and records each one's size, hash, signer and version. Web pages are skipped and nothing is run.
+    script: scripts/Step-FetchLinks.ps1
+    params: { maxGb: 4 }
+    risk: local-write
+    after: [parse-ticket]
+    automatic: true
+  - id: stage-dropbox
+    label: Put installers in the software dropbox
+    description: Copies each product's downloaded installers to <SoftwareDropbox>\<product id>\ (from the YardstickDev preferences) for manualDownload recipes, without replacing a different file. Notes them on the product for recipe authoring.
+    script: scripts/Step-StageDropbox.ps1
+    risk: local-write
+    after: [fetch-links, triage]
+    automatic: true
   - id: runtime
     label: Create the isolated runtime
     description: Copies YardstickDev into this ticket with a guard that blocks every Graph DELETE, then proves the guard works.
@@ -120,7 +138,7 @@ steps:
     automatic: true
   - id: inventory
     label: Check Intune for existing apps
-    description: A read-only search of the tenant's Win32 apps and the target group. Run before anything is downloaded.
+    description: A read-only search of the tenant's Win32 apps and the target group. Run before anything is packaged.
     script: scripts/Step-Inventory.ps1
     risk: tenant-read
     after: [runtime, triage]
