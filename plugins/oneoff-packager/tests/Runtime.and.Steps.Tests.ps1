@@ -13,24 +13,49 @@ Describe 'the isolated runtime' {
     }
     AfterEach { Remove-TestWorkItem $t }
 
-    It 'is copied from a clean checkout with a guard that blocks DELETE before authentication' {
+    It 'is a clone of the checked-out commit with a guard that blocks DELETE before authentication' {
         $made = & (Join-Path $scripts 'New-OneOffYardstickRuntime.ps1') -YardstickDevPath $source -DestinationPath $runtime
         $made.DeleteGuardInstalled | Should -BeTrue
+        (& git -C $runtime rev-parse HEAD) | Should -Be (& git -C $source rev-parse HEAD)
         (Get-Content (Join-Path $runtime 'Modules\YardstickGraph.psm1') -Raw) | Should -Match 'ONEOFF_DELETE_BLOCKED'
         $proof = & (Join-Path $scripts 'Test-OneOffRuntimeSafety.ps1') -RuntimePath $runtime
         $proof.Safe | Should -BeTrue
         $proof.Proof | Should -Match 'DELETE blocked before authentication'
         $manifest = Get-Content (Join-Path $runtime '.oneoff-runtime.json') -Raw | ConvertFrom-Json
-        $manifest.sourceWasClean | Should -BeTrue
+        $manifest.sourceKind | Should -Be 'YardstickDev clone'
+        $manifest.sourceUncommittedChanges | Should -Be 0
         $manifest.sourceCommit | Should -Be (& git -C $source rev-parse HEAD)
         # The source was never touched.
         @(& git -C $source status --porcelain).Count | Should -Be 0
     }
 
-    It 'refuses a dirty checkout' {
+    It 'leaves uncommitted changes in YardstickDev out instead of refusing them' {
         Add-Content -LiteralPath (Join-Path $source 'Yardstick.ps1') -Value '# local edit'
-        { & (Join-Path $scripts 'New-OneOffYardstickRuntime.ps1') -YardstickDevPath $source -DestinationPath $runtime } | Should -Throw '*clean working tree*'
-        Test-Path $runtime | Should -BeFalse
+        Set-Content -LiteralPath (Join-Path $source 'Modules\Scratch.psm1') -Value '# untracked'
+        $made = & (Join-Path $scripts 'New-OneOffYardstickRuntime.ps1') -YardstickDevPath $source -DestinationPath $runtime
+        $made.UncommittedChangesLeftOut | Should -Be 2
+        (Get-Content (Join-Path $runtime 'Yardstick.ps1') -Raw) | Should -Not -Match 'local edit'
+        Test-Path (Join-Path $runtime 'Modules\Scratch.psm1') | Should -BeFalse
+        (Get-Content (Join-Path $runtime '.oneoff-runtime.json') -Raw | ConvertFrom-Json).sourceUncommittedChanges | Should -Be 2
+        @(& git -C $source status --porcelain).Count | Should -Be 2 -Because 'the source is only read'
+    }
+
+    It 'copies the git-ignored files a ticket needs and points preferences at the runtime' {
+        Set-Content -LiteralPath (Join-Path $source '.gitignore') -Value "/Local/`n/Icons/*`n!/Icons/.gitkeep`n/Recipes/*.common.yaml"
+        Set-Content -LiteralPath (Join-Path $source 'Icons\.gitkeep') -Value ''
+        & git -C $source add -A 2>&1 | Out-Null
+        & git -C $source -c user.name=t -c user.email=t@t commit -qm ignore 2>&1 | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $source 'Local') | Out-Null
+        Set-Content -LiteralPath (Join-Path $source 'Local\preferences.yaml') -Value "BuildSpace: $source\Artifacts"
+        Set-Content -LiteralPath (Join-Path $source 'Icons\app.png') -Value 'png'
+        Set-Content -LiteralPath (Join-Path $source 'Recipes\site.common.yaml') -Value 'a: 1'
+        $made = & (Join-Path $scripts 'New-OneOffYardstickRuntime.ps1') -YardstickDevPath $source -DestinationPath $runtime
+        $made.UncommittedChangesLeftOut | Should -Be 0 -Because 'ignored files are not changes'
+        Get-Content (Join-Path $runtime 'Icons\app.png') -Raw | Should -Match 'png'
+        Test-Path (Join-Path $runtime 'Recipes\site.common.yaml') | Should -BeTrue
+        Get-Content (Join-Path $runtime 'Local\preferences.yaml') -Raw | Should -Match ([regex]::Escape("$runtime\Artifacts"))
+        $manifest = Get-Content (Join-Path $runtime '.oneoff-runtime.json') -Raw | ConvertFrom-Json
+        @($manifest.localFilesCopied | Sort-Object) | Should -Be @('Icons\app.png', 'Local\preferences.yaml', 'Recipes\site.common.yaml')
     }
 
     It 'refuses a destination inside the source, and one that is not empty' {
@@ -44,6 +69,36 @@ Describe 'the isolated runtime' {
         Set-Content -LiteralPath (Join-Path $source 'Modules\YardstickGraph.psm1') -Value 'function Invoke-YardstickGraphRequest { }'
         & git -C $source -c user.name=t -c user.email=t@t commit -qam 'no marker' 2>&1 | Out-Null
         { & (Join-Path $scripts 'New-OneOffYardstickRuntime.ps1') -YardstickDevPath $source -DestinationPath $runtime } | Should -Throw '*refusing to create an unguarded runtime*'
+        Test-Path $runtime | Should -BeFalse -Because 'a half-made clone is removed'
+    }
+
+    It 'can clone only the modules, for a quick guarded Graph session' {
+        & (Join-Path $scripts 'New-OneOffYardstickRuntime.ps1') -YardstickDevPath $source -DestinationPath $runtime -ModulesOnly | Out-Null
+        Test-Path (Join-Path $runtime 'Recipes') | Should -BeFalse
+        (Get-Content (Join-Path $runtime '.oneoff-runtime.json') -Raw | ConvertFrom-Json).modulesOnly | Should -BeTrue
+        (& (Join-Path $scripts 'Test-OneOffRuntimeSafety.ps1') -RuntimePath $runtime).Safe | Should -BeTrue
+    }
+
+    It 'is removed by the cleanup stage, which keeps its record' {
+        $item = $t.WorkItem
+        Remove-Item -LiteralPath (Join-Path $item 'runtime') -Recurse -Force
+        & (Join-Path $scripts 'New-OneOffYardstickRuntime.ps1') -YardstickDevPath $source -DestinationPath (Join-Path $item 'runtime') | Out-Null
+        $commit = & git -C $source rev-parse HEAD
+        $r = Invoke-TestStep -Item $t -Script 'Step-Cleanup.ps1'
+        $r.ExitCode | Should -Be 0 -Because $r.Output
+        $r.Result.summary | Should -Be "Removed the ticket's YardstickDev clone (commit $($commit.Substring(0, 8)))."
+        Test-Path (Join-Path $item 'runtime') | Should -BeFalse
+        (Get-Content (Join-Path $item 'artifacts\runtime-manifest.json') -Raw | ConvertFrom-Json).sourceCommit | Should -Be $commit
+        $r.Result.artifacts[0].path | Should -Be 'artifacts\runtime-manifest.json'
+        (Invoke-TestStep -Item $t -Script 'Step-Cleanup.ps1').Result.summary | Should -Be 'There was no YardstickDev clone to remove.'
+    }
+
+    It 'never removes a folder that is not a runtime' {
+        Import-Module (Join-Path (Get-PluginRoot) 'scripts\OneOffPackager.psm1') -Force
+        New-Item -ItemType Directory -Path $runtime | Out-Null
+        Set-Content -LiteralPath (Join-Path $runtime 'keep.txt') -Value 'x'
+        { Remove-OneOffRuntime -Path $runtime } | Should -Throw '*not a One-Off runtime*'
+        Test-Path (Join-Path $runtime 'keep.txt') | Should -BeTrue
     }
 
     It 'fails the safety proof when the guard was removed or a DELETE path was added' {

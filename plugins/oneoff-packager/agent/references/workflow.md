@@ -6,8 +6,8 @@ Who does what, in order. The steps in the **Studio** column are buttons the user
 |---|-------|-----|--------|
 | 1 | Extract links and targets | Studio | `parsed-ticket.json` |
 | 2 | Triage the ticket | **Agent** | `products.json` |
-| 3 | Create the isolated runtime | Studio | `runtime\` |
-| 3b | Find apps that already exist (recipes and Intune), then product routing | Studio and the user | `completedProducts` in `products.json` |
+| 3 | Find apps that already exist (recipes and Intune), then product routing | Studio and the user | `completedProducts` in `products.json` |
+| 3b | Create the isolated runtime (a clone of YardstickDev) | Studio | `runtime\` |
 | 4 | Check Intune for existing apps | Studio | `inventory\intune-inventory.json` |
 | 5 | Research, author and run safe checks | Recipe Builder | Yardstick development recipe and evidence |
 | 6 | Prepare test (installs nothing) | Studio | `artifacts\package-tests\<run>\` |
@@ -16,6 +16,7 @@ Who does what, in order. The steps in the **Studio** column are buttons the user
 | 9 | Build the `.intunewin` packages | Studio | `local-packages\` |
 | 10 | Prepare the Intune change | Studio | `intune-upload\live-change-set.json` |
 | 11 | Upload and assign, after the user approves it | Studio | `intune-upload\live-change-result.json` |
+| 12 | Clean up the runtime | Studio | `artifacts\runtime-manifest.json` (the clone is deleted) |
 
 ## 1. Establish the request (your triage)
 

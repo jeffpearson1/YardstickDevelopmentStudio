@@ -1,7 +1,7 @@
 schema: 1
 id: oneoff-packager
 name: One-Off Packager
-version: 1.7.0
+version: 1.8.0
 publisher: Yardstick contributors
 description: Packages one-off software requests that don't suit Yardstick. An agent triages the ticket, Recipe Builder authors and checks recipes, and packaging and Intune upload remain separate stages. Anything that installs software or changes the tenant waits for your approval of the exact file it acts on.
 icon: E7B8
@@ -21,7 +21,7 @@ settings:
     type: folder
     default: "{workspace}"
     cloneRepository: true
-    help: A clean git checkout of YardstickDev. Clone a private copy here so One-Off Packager work can continue independently of Recipe Builder runs.
+    help: A git checkout of YardstickDev. Each ticket clones its committed state into a private runtime (removed when the ticket finishes), so uncommitted changes here neither block a ticket nor reach it. The package test runs this checkout's recipe harness; clone a private copy here so One-Off work does not wait for Recipe Builder.
   - key: tenantId
     label: Tenant ID
     type: guid
@@ -51,8 +51,8 @@ page:
     - fetch-links
     - triage
     - stage-dropbox
-    - runtime
     - check-existing
+    - runtime
     - inventory
     - prepare-test
     - full-test-request
@@ -60,13 +60,14 @@ page:
     - build
     - prepare-live
     - live-change
+    - cleanup
   panels:
     - type: table
       title: Products
       file: products.json
       rows: /products
       columns: [name, version, status, notes]
-      recipeBuilder: { routedRows: /routedProducts, completedRows: /completedProducts, reviewBefore: inventory, authorBefore: prepare-test, recipeFolder: recipes, iconFolder: icons }
+      recipeBuilder: { routedRows: /routedProducts, completedRows: /completedProducts, reviewBefore: runtime, authorBefore: prepare-test, recipeFolder: recipes, iconFolder: icons }
     - { type: markdown, title: Downloads, file: downloads.md }
     - { type: markdown, title: Change set, file: intune-upload/live-change-summary.md }
     - type: files
@@ -133,16 +134,16 @@ steps:
     automatic: true
   - id: runtime
     label: Create the isolated runtime
-    description: Copies YardstickDev into this ticket with a guard that blocks every Graph DELETE, then proves the guard works.
+    description: Clones YardstickDev's committed state into this ticket (uncommitted changes are left out) with a guard that blocks every Graph DELETE, then proves the guard works. The Clean up stage removes it.
     script: scripts/Step-Runtime.ps1
     risk: local-write
     automatic: true
   - id: check-existing
     label: Find apps that already exist
-    description: Looks for each product among YardstickDev's recipes and, read-only, the tenant's Windows apps. Products that already exist move to Already available before routing; you can package one anyway.
+    description: Looks for each product among YardstickDev's recipes and, read-only through a temporary guarded clone of YardstickDev (removed afterwards), the tenant's Windows apps. Products that already exist move to Already available before routing; you can package one anyway.
     script: scripts/Step-CheckExisting.ps1
     risk: tenant-read
-    after: [runtime, triage]
+    after: [triage]
     automatic: true
   - id: inventory
     label: Check Intune for existing apps
@@ -196,4 +197,11 @@ steps:
     risk: tenant-write
     gate: { kind: hash, file: intune-upload/live-change-set.json, summary: intune-upload/live-change-summary.md }
     after: [prepare-live]
+    automatic: true
+  - id: cleanup
+    label: Clean up the runtime
+    description: Removes this ticket's YardstickDev clone now that the Intune change is done, keeping its record (source commit, guard hash) in artifacts\runtime-manifest.json.
+    script: scripts/Step-Cleanup.ps1
+    risk: local-write
+    after: [live-change]
     automatic: true

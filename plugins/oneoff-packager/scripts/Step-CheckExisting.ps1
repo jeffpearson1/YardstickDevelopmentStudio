@@ -9,16 +9,19 @@ Import-Module (Join-Path $PSScriptRoot 'OneOffPackager.psm1') -Force
 Invoke-StudioStep -StudioInput $StudioInput -StudioResult $StudioResult -Body {
     param($in)
     $workItem = $in.workItem
-    $recipes = @(Get-OneOffRecipeIndex -YardstickDev (Get-StudioSetting $in 'yardstickDevPath'))
+    $yardstickDev = Get-StudioSetting $in 'yardstickDevPath'
+    $recipes = @(Get-OneOffRecipeIndex -YardstickDev $yardstickDev)
 
     $apps = $null
     $note = ''
     $tenantId = Get-StudioSetting $in 'tenantId'
     if (-not $tenantId) {
         $note = 'Intune was not checked: set the Tenant ID in the plugin settings.'
+    } elseif (-not $yardstickDev) {
+        $note = 'Intune was not checked: set the YardstickDev folder in the plugin settings.'
     } else {
         try {
-            $found = Get-OneOffExistingIntuneApps -WorkItem $workItem -TenantId $tenantId -TenantName (Get-StudioSetting $in 'tenantName') `
+            $found = Get-OneOffExistingIntuneApps -YardstickDev $yardstickDev -TenantId $tenantId -TenantName (Get-StudioSetting $in 'tenantName') `
                 -CredentialTarget (Get-StudioSetting $in 'credentialTarget')
             $apps = @($found.Apps)
         } catch {

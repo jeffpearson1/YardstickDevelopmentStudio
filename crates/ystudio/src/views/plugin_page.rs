@@ -2642,8 +2642,8 @@ pub(crate) mod tests {
         assert_eq!(
             order,
             [
-                "parse-ticket", "fetch-links", "triage", "stage-dropbox", "runtime", "check-existing", "inventory", "prepare-test", "full-test-request",
-                "full-test", "build", "prepare-live", "live-change"
+                "parse-ticket", "fetch-links", "triage", "stage-dropbox", "check-existing", "runtime", "inventory", "prepare-test", "full-test-request",
+                "full-test", "build", "prepare-live", "live-change", "cleanup"
             ]
         );
         let item = WorkItem::open(&item.dir).unwrap();
@@ -2659,7 +2659,7 @@ pub(crate) mod tests {
             {"id":"faststoneimageviewer","name":"FastStone Image Viewer","version":"8.5","status":"needs-research","notes":"Licensed lab request","links":[]},
             {"id":"qgis","name":"QGIS","publisher":"QGIS.org","version":"3.40","status":"needs-research","notes":"Reusable open-source application","links":["https://qgis.org"]}
         ]}"#).unwrap();
-        for stage in ["parse-ticket", "fetch-links", "triage", "stage-dropbox", "runtime", "check-existing"] {
+        for stage in ["parse-ticket", "fetch-links", "triage", "stage-dropbox", "check-existing"] {
             mixed.meta.steps.insert(stage.into(), plugin::StepRecord { state: StepState::Ok, ..Default::default() });
         }
         mixed.save().unwrap();
@@ -2688,7 +2688,9 @@ pub(crate) mod tests {
 
         let mut linked = WorkItem::open(&mixed.dir).unwrap();
         linked.meta.routing_reviews.insert("Products".into());
-        linked.meta.steps.insert("inventory".into(), plugin::StepRecord { state: StepState::Ok, ..Default::default() });
+        for stage in ["runtime", "inventory"] {
+            linked.meta.steps.insert(stage.into(), plugin::StepRecord { state: StepState::Ok, ..Default::default() });
+        }
         linked.save().unwrap();
         assert!(matches!(m.next_automatic(&linked), AutomationNext::RecipeWorkNeeded(_, ids) if ids == ["faststoneimageviewer"]));
         app.batch.batch.as_mut().unwrap().id = dir.path().join("linked-recipe-work").to_string_lossy().into_owned();
@@ -2716,7 +2718,7 @@ pub(crate) mod tests {
               {"label":"In Intune","tone":"green","detail":"In Intune: 7-Zip (Igor Pavlov; assigned)"}]},
             {"id":"zoom","name":"Zoom Workplace","status":"needs-research","flags":[
               {"label":"In Intune, no Yardstick recipe","tone":"amber","detail":"In Intune without a Yardstick recipe: Zoom Workplace (Zoom; assigned). Package it anyway to give it a recipe."}]}]}"#).unwrap();
-        for stage in ["parse-ticket", "fetch-links", "triage", "stage-dropbox", "runtime", "check-existing"] {
+        for stage in ["parse-ticket", "fetch-links", "triage", "stage-dropbox", "check-existing"] {
             existing.meta.steps.insert(stage.into(), plugin::StepRecord { state: StepState::Ok, ..Default::default() });
         }
         existing.save().unwrap();
