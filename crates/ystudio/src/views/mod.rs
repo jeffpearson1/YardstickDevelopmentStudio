@@ -13,6 +13,7 @@ pub mod recipes;
 pub mod runs;
 pub mod settings;
 pub mod setup;
+pub mod tenant;
 pub mod testbench;
 pub mod tools;
 pub mod update;
@@ -329,6 +330,9 @@ pub fn git_bar(app: &mut StudioApp, ui: &mut Ui) {
     let (mut fetch, mut pull, mut sync) = (false, false, false);
     ui.horizontal_wrapped(|ui| {
         match &app.git_status {
+            None if app.git_checking() => {
+                ui.label(RichText::new("Checking git…").small().weak());
+            }
             None => {
                 ui.label(RichText::new("Not a git clone").small().weak());
             }

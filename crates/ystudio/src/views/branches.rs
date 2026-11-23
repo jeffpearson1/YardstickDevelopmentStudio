@@ -260,9 +260,10 @@ pub fn switched(app: &mut StudioApp, branch: &str, ok: bool, job: u64) {
 }
 
 pub fn pushed(app: &mut StudioApp, ok: bool, job: u64) {
+    // A push does not change the branch, so the status from before it names it.
+    let branch = app.git_status.as_ref().and_then(|s| s.as_ref().ok()).map(|s| s.branch.clone()).unwrap_or_default();
     app.refresh_git_status();
     if ok {
-        let branch = app.git_status.as_ref().and_then(|s| s.as_ref().ok()).map(|s| s.branch.clone()).unwrap_or_default();
         app.notify(format!("Pushed {branch}."));
     } else {
         app.console_job = Some(job);
@@ -295,6 +296,7 @@ mod tests {
             app.poll_for_tests();
         }
         app.poll_for_tests();
+        app.await_git_status();
     }
 
     #[test]
@@ -310,6 +312,7 @@ mod tests {
         git(&root, &["commit", "-q", "-m", "init"]);
         git(&root, &["branch", "recipe/brave"]);
         app.refresh_git_status();
+        app.await_git_status();
         assert_eq!(app.git_status.as_ref().unwrap().as_ref().unwrap().branch, "main");
 
         app.branch_menu.open = true;

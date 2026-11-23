@@ -338,7 +338,8 @@ fn edit_body(app: &mut StudioApp, ui: &mut Ui) {
         });
     }
     if matches.is_empty() {
-        ui.label(RichText::new("No recipe matches.").weak());
+        let text = if app.scanning() { "Loading recipes…" } else { "No recipe matches." };
+        ui.label(RichText::new(text).weak());
     }
     if let Some(p) = open {
         app.request_open_recipe(p);

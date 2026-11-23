@@ -178,24 +178,42 @@ pub struct Status {
 }
 
 /// Local branch and ahead/behind counts against the last fetched upstream. Does not touch the network.
+///
+/// One `git status` call: starting git can take half a second where
+/// antivirus scans each launch, so this does not run one command per field.
 pub fn status(root: &Path) -> Result<Status> {
     let git = git_exe()?;
-    let run = |args: &[&str]| run_capture(&spec("git", git.clone(), root, args)).map(|s| s.trim().to_string());
-    let branch = run(&["rev-parse", "--abbrev-ref", "HEAD"])?;
-    let Ok(upstream) = run(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]) else {
-        return Ok(Status { branch, upstream: None, ahead: 0, behind: 0 });
-    };
-    let (ahead, behind) = parse_left_right(&run(&["rev-list", "--left-right", "--count", "HEAD...@{u}"])?)?;
-    Ok(Status { branch, upstream: Some(upstream), ahead, behind })
+    // Optional locks off: a status running beside a fetch or pull must not
+    // take the index lock they need.
+    let args = ["--no-optional-locks", "status", "--porcelain=v2", "--branch", "--untracked-files=no", "--ignore-submodules=all"];
+    parse_status(&run_capture(&spec("git", git, root, &args))?)
 }
 
-/// Parses `git rev-list --left-right --count HEAD...@{u}`: "<ahead>\t<behind>".
-fn parse_left_right(s: &str) -> Result<(u32, u32)> {
-    let mut it = s.split_whitespace().map(str::parse::<u32>);
-    match (it.next(), it.next()) {
-        (Some(Ok(a)), Some(Ok(b))) => Ok((a, b)),
-        _ => bail!("unexpected rev-list output '{s}'"),
+/// Reads the `# branch.*` headers of `git status --porcelain=v2 --branch`.
+fn parse_status(out: &str) -> Result<Status> {
+    let mut status = Status { branch: String::new(), upstream: None, ahead: 0, behind: 0 };
+    for line in out.lines() {
+        let Some(header) = line.strip_prefix("# branch.") else { continue };
+        let (key, value) = header.split_once(' ').unwrap_or((header, ""));
+        match key {
+            // `git rev-parse --abbrev-ref HEAD` spells a detached HEAD "HEAD".
+            "head" => status.branch = if value == "(detached)" { "HEAD".into() } else { value.to_string() },
+            "upstream" => status.upstream = Some(value.to_string()),
+            "ab" => {
+                let mut it = value.split_whitespace();
+                let parse = |v: Option<&str>, sign: char| v.and_then(|v| v.strip_prefix(sign)).and_then(|n| n.parse::<u32>().ok());
+                match (parse(it.next(), '+'), parse(it.next(), '-')) {
+                    (Some(a), Some(b)) => (status.ahead, status.behind) = (a, b),
+                    _ => bail!("unexpected git status branch line '{line}'"),
+                }
+            }
+            _ => {}
+        }
     }
+    if status.branch.is_empty() {
+        bail!("git status did not name the current branch");
+    }
+    Ok(status)
 }
 
 #[cfg(test)]
@@ -244,9 +262,17 @@ mod tests {
     }
 
     #[test]
-    fn parses_ahead_behind() {
-        assert_eq!(parse_left_right("2\t5\n").unwrap(), (2, 5));
-        assert!(parse_left_right("x").is_err());
+    fn parses_branch_headers() {
+        let tracked = "# branch.oid f141877\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +2 -5\n1 .M N... 100644 100644 100644 a b x.md\n";
+        assert_eq!(parse_status(tracked).unwrap(), Status { branch: "main".into(), upstream: Some("origin/main".into()), ahead: 2, behind: 5 });
+        // No upstream, or one that was deleted on the remote: nothing to compare.
+        let local = "# branch.oid f141877\n# branch.head recipe/brave\n";
+        assert_eq!(parse_status(local).unwrap(), Status { branch: "recipe/brave".into(), upstream: None, ahead: 0, behind: 0 });
+        let gone = "# branch.oid f141877\n# branch.head main\n# branch.upstream origin/gone\n";
+        assert_eq!(parse_status(gone).unwrap(), Status { branch: "main".into(), upstream: Some("origin/gone".into()), ahead: 0, behind: 0 });
+        assert_eq!(parse_status("# branch.oid f141877\n# branch.head (detached)\n").unwrap().branch, "HEAD");
+        assert!(parse_status("# branch.head main\n# branch.ab x y\n").is_err());
+        assert!(parse_status("").is_err());
     }
 
     #[test]

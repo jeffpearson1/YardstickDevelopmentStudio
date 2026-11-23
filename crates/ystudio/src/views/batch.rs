@@ -451,6 +451,8 @@ pub fn open_file(app: &mut StudioApp, path: &Path) {
         Ok(doc) => {
             let n = doc.records.len();
             let format = doc.format.clone();
+            // Matching needs every recipe; at launch they may still be loading.
+            app.await_scan();
             let batch = Batch::new(doc, &app.recipes);
             let items = batch.items.len();
             offer_batch(app, batch);

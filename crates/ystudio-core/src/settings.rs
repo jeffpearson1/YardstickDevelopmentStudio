@@ -56,6 +56,68 @@ pub struct Settings {
     pub plugins: BTreeMap<String, PluginPrefs>,
     /// Prompts started from the Agent tab, newest first.
     pub agent_prompt_history: Vec<PromptRecord>,
+    /// The optional "run on my tenant" validation (see `tenant`). Off by default.
+    pub tenant: TenantSettings,
+}
+
+/// What happens to the app a tenant validation run creates.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum TenantAfterRun {
+    /// Assign it to the test group(s) and leave it there.
+    #[default]
+    LeaveInTestGroup,
+    /// Upload it with no assignments and leave it.
+    LeaveUnassigned,
+    /// Upload it with no assignments, then remove it.
+    Remove,
+}
+
+impl TenantAfterRun {
+    pub const ALL: [TenantAfterRun; 3] = [Self::LeaveInTestGroup, Self::LeaveUnassigned, Self::Remove];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::LeaveInTestGroup => "Deploy to the test group and leave it",
+            Self::LeaveUnassigned => "Upload without assignments and leave it",
+            Self::Remove => "Remove it after the run",
+        }
+    }
+
+    /// Whether the app is assigned to the test group(s) during the run.
+    pub fn assigns(self) -> bool {
+        matches!(self, Self::LeaveInTestGroup)
+    }
+}
+
+/// Settings for validating a recipe on the user's own Intune tenant before it
+/// is published. Everything here is inert until `enabled` is set.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TenantSettings {
+    /// Shows the Tenant step on a recipe's Test tab. Off by default.
+    pub enabled: bool,
+    /// The tenant the clone's Intune credential must belong to (an Entra tenant id).
+    pub tenant_id: String,
+    /// Optional: the organization's display name must match too.
+    pub tenant_name: String,
+    /// Entra groups (display name or object id) the test app is assigned to.
+    pub test_groups: Vec<String>,
+    pub after_run: TenantAfterRun,
+    /// With `Remove`, ask before deleting instead of removing straight away.
+    pub ask_before_remove: bool,
+}
+
+impl Default for TenantSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tenant_id: String::new(),
+            tenant_name: String::new(),
+            test_groups: Vec::new(),
+            after_run: TenantAfterRun::default(),
+            ask_before_remove: true,
+        }
+    }
 }
 
 /// One prompt started from the Agent tab.
@@ -115,6 +177,7 @@ impl Default for Settings {
             diagnostic_logging: false,
             plugins: BTreeMap::new(),
             agent_prompt_history: Vec::new(),
+            tenant: TenantSettings::default(),
         }
     }
 }
@@ -184,6 +247,25 @@ mod tests {
         assert_eq!(s.repo_url, crate::DEFAULT_REPO_URL);
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(Settings::load_from(&path), Settings::default());
+    }
+
+    #[test]
+    fn tenant_validation_is_off_unless_asked_for() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("s.json");
+        // Settings saved before the feature existed carry no tenant block.
+        std::fs::write(&path, r#"{"dark_mode": true}"#).unwrap();
+        let t = Settings::load_from(&path).tenant;
+        assert!(!t.enabled);
+        assert_eq!(t.after_run, TenantAfterRun::LeaveInTestGroup);
+        assert!(t.ask_before_remove && t.test_groups.is_empty());
+        // A partial block keeps the safe defaults for what it leaves out.
+        std::fs::write(&path, r#"{"tenant": {"tenant_id": "abc"}}"#).unwrap();
+        let t = Settings::load_from(&path).tenant;
+        assert_eq!(t.tenant_id, "abc");
+        assert!(!t.enabled && t.ask_before_remove);
+        assert!(TenantAfterRun::LeaveInTestGroup.assigns());
+        assert!(!TenantAfterRun::LeaveUnassigned.assigns() && !TenantAfterRun::Remove.assigns());
     }
 
     #[test]

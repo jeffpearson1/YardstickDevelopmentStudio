@@ -387,7 +387,7 @@ pub fn settings_form(app: &mut StudioApp, ui: &mut Ui, id: &str) {
         if ystudio_core::git::is_repo(&dest) {
             app.settings.plugins.entry(id.to_string()).or_default().values.insert(setting, dest.display().to_string());
             app.save_settings();
-            app.notify(format!("{} is using its private Yardstick clone.", p.manifest.name));
+            app.seed_clone_preferences(&dest, &format!("{} is using its private Yardstick clone", p.manifest.name));
         } else {
             match ystudio_core::git::clone(&app.settings.repo_url, &dest) {
                 Ok(spec) => {

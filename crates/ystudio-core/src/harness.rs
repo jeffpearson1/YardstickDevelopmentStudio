@@ -221,6 +221,7 @@ pub fn build(ws: &Workspace, action: &HarnessAction, consent: Consent, pwsh: &Pa
 /// Opens `Install-Yardstick.ps1 -DevelopmentOnly` in its own console; it is interactive.
 pub fn install_development_only(ws: &Workspace, pwsh: &Path) -> Result<ProcessSpec> {
     ws.ensure_writable("configure")?;
+    crate::setup::ensure_not_connected(ws)?;
     let mut spec = ProcessSpec::new("Install-Yardstick -DevelopmentOnly", pwsh, &ws.root).args([
         "-NoProfile",
         "-NoExit",

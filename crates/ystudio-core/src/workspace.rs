@@ -219,6 +219,14 @@ impl Workspace {
         self.kind.is_writable()
     }
 
+    /// A development clone that has been made a full Yardstick instance: the
+    /// user listed it as trusted and `developmentOnly` is off, so
+    /// `Yardstick.ps1` is allowed to run and sign in to the tenant. A
+    /// development-only clone, an unconfigured one and production never are.
+    pub fn tenant_connected(&self) -> bool {
+        self.kind == WorkspaceKind::Development && !self.development_only
+    }
+
     /// Errors with a user-facing explanation unless the workspace is writable.
     pub fn ensure_writable(&self, action: &str) -> Result<()> {
         if let WorkspaceKind::Production { reason } = &self.kind {
@@ -494,6 +502,25 @@ pub fn discover_default(production: &Path) -> Option<PathBuf> {
     candidates.into_iter().next().or_else(|| is_yardstick_root(production).then(|| production.to_path_buf()))
 }
 
+/// Gives the Yardstick clone at `dest` a copy of `source`'s preferences, so
+/// packaging there uses the same SoftwareDropbox, archive, credential target and
+/// app defaults. Paths that point inside `source` are rewritten to point inside
+/// `dest`. Returns `false`, changing nothing, when `dest` already has
+/// preferences or `source` has none.
+pub fn copy_preferences(source: &Workspace, dest: &Path) -> Result<bool> {
+    let target = Workspace::open(dest, &[], &[])?.layout.preferences;
+    if target.exists() || !source.layout.preferences.is_file() {
+        return Ok(false);
+    }
+    let text = read_text(&source.layout.preferences).with_context(|| format!("reading {}", source.layout.preferences.display()))?;
+    let text = text.replace(&*source.root.to_string_lossy(), &dest.to_string_lossy());
+    if let Some(dir) = target.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    std::fs::write(&target, text).with_context(|| format!("writing {}", target.display()))?;
+    Ok(true)
+}
+
 /// The result of [`Workspace::rename_development_recipe`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Renamed {
@@ -542,6 +569,34 @@ mod tests {
             std::fs::write(root.join(r"Local\preferences.yaml"), p).unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn a_new_clone_gets_the_source_preferences_with_its_own_paths() {
+        let src = fake_workspace(Some(""));
+        let root = src.path().display().to_string();
+        let prefs = format!("SoftwareDropbox: '\\\\server\\Dropbox'\ncredentialTarget: \"Yardstick:IntuneGraph\"\nBuildspace: '{root}\\Artifacts\\BuildSpace'\n");
+        std::fs::write(src.path().join(r"Local\preferences.yaml"), &prefs).unwrap();
+        let source = Workspace::open(src.path(), &[], &[]).unwrap();
+        let dest = fake_workspace(None);
+
+        assert!(copy_preferences(&source, dest.path()).unwrap());
+        let copied = std::fs::read_to_string(dest.path().join(r"Local\preferences.yaml")).unwrap();
+        assert_eq!(copied, prefs.replace(&root, &dest.path().display().to_string()));
+        let ws = Workspace::open(dest.path(), &[], &[]).unwrap();
+        assert_eq!(ws.software_dropbox, Some(PathBuf::from(r"\\server\Dropbox")));
+
+        // Preferences already there are never replaced.
+        std::fs::write(dest.path().join(r"Local\preferences.yaml"), "developmentOnly: true\n").unwrap();
+        assert!(!copy_preferences(&source, dest.path()).unwrap());
+        assert_eq!(std::fs::read_to_string(dest.path().join(r"Local\preferences.yaml")).unwrap(), "developmentOnly: true\n");
+
+        // A source without preferences has nothing to give.
+        let bare_dir = fake_workspace(None);
+        let bare = Workspace::open(bare_dir.path(), &[], &[]).unwrap();
+        let fresh = fake_workspace(None);
+        assert!(!copy_preferences(&bare, fresh.path()).unwrap());
+        assert!(!fresh.path().join(r"Local\preferences.yaml").exists());
     }
 
     #[test]
@@ -626,6 +681,24 @@ mod tests {
         assert!(ws.ensure_writable("save").is_err());
         let ws = Workspace::open(d.path(), &[], &[d.path().to_path_buf()]).unwrap();
         assert!(ws.is_writable());
+    }
+
+    #[test]
+    fn only_a_trusted_full_install_is_tenant_connected() {
+        let full = fake_workspace(Some("defaultScopeTags: []\n"));
+        let root = full.path().to_path_buf();
+        // Untrusted, a full install is production.
+        assert!(!Workspace::open(&root, &[], &[]).unwrap().tenant_connected());
+        // Trusted, it is a development clone that may talk to the tenant.
+        let trusted = std::slice::from_ref(&root);
+        assert!(Workspace::open(&root, &[], trusted).unwrap().tenant_connected());
+        // Production wins over trust.
+        assert!(!Workspace::open(&root, trusted, trusted).unwrap().tenant_connected());
+        // Development-only and unconfigured clones are never connected.
+        let dev = fake_workspace(Some("developmentOnly: true\n"));
+        assert!(!Workspace::open(dev.path(), &[], &[dev.path().to_path_buf()]).unwrap().tenant_connected());
+        let fresh = fake_workspace(None);
+        assert!(!Workspace::open(fresh.path(), &[], &[]).unwrap().tenant_connected());
     }
 
     #[test]

@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Instant, SystemTime};
 
 use eframe::egui::{self, RichText, Ui};
@@ -151,6 +152,8 @@ pub enum JobKind {
     Setup { result: PathBuf },
     /// `winget install` of a missing tool, or `gh auth setup-git`.
     InstallTool,
+    /// The read-only tenant connection check; `result` is the report it writes.
+    TenantCheck { result: PathBuf },
     /// A plugin step; `dir` is its work item, or the plugin's work root.
     PluginStep { plugin: String, dir: PathBuf, step: String, result: PathBuf, risk: ystudio_core::plugin::Risk, purpose: views::plugin_page::Purpose },
     /// An agent task of a plugin, working in a work item's folder.
@@ -290,6 +293,49 @@ pub struct WsCache {
     pub production_dropbox: Option<PathBuf>,
 }
 
+/// A workspace rescan running off the UI thread; see [`StudioApp::rescan_in_background`].
+struct WsScan {
+    root: PathBuf,
+    rx: Receiver<ScanResult>,
+    /// A synchronous refresh has run since the scan started, so the scan's
+    /// copy of that part is the older one.
+    skip_recipes: bool,
+    skip_runs: bool,
+}
+
+struct ScanResult {
+    recipes: Vec<RecipeEntry>,
+    cache: WsCache,
+    runs: Vec<InstallRun>,
+    ledger: Ledger,
+}
+
+/// A `git status` running off the UI thread; see [`StudioApp::refresh_git_status`].
+struct GitCheck {
+    root: PathBuf,
+    rx: Receiver<Result<git::Status, String>>,
+    /// Say so when the branch is behind its upstream (after a fetch).
+    report_behind: bool,
+}
+
+/// Recipes and the workspace listings derived from them. Runs on any thread.
+fn scan_listings(ws: &Workspace, production: Option<&Path>, production_paths: &[PathBuf]) -> (Vec<RecipeEntry>, WsCache) {
+    let recipes = ws.list_recipes();
+    let production_dropbox = if ws.software_dropbox.is_none() {
+        production.and_then(|p| Workspace::open(p, production_paths, &[]).ok()).and_then(|prod| prod.software_dropbox)
+    } else {
+        None
+    };
+    let cache = WsCache {
+        icons: ws.list_icons(),
+        groups: ws.recipe_groups().into_keys().collect(),
+        has_skill: ws.has_skill(),
+        documents: ws.documents(),
+        production_dropbox,
+    };
+    (recipes, cache)
+}
+
 pub enum Pending {
     /// Switching recipes would discard unsaved edits.
     OpenRecipe(PathBuf),
@@ -325,8 +371,12 @@ pub struct StudioApp {
     completion: BTreeMap<String, Completion>,
     pub runs: Vec<InstallRun>,
     pub perf: Perf,
-    /// Branch and ahead/behind of the open workspace; `None` if it is not a git clone.
+    /// Branch and ahead/behind of the open workspace; `None` if it is not a git
+    /// clone, or while the first check runs (see [`Self::git_checking`]).
     pub git_status: Option<Result<git::Status, String>>,
+    git_check: Option<GitCheck>,
+    /// Workspace listings being read in the background.
+    ws_scan: Option<WsScan>,
     /// The footer's branch menu.
     pub branch_menu: views::branches::BranchMenu,
     pub home: views::home::HomeState,
@@ -341,6 +391,7 @@ pub struct StudioApp {
     pub update: views::update::UpdateState,
     pub settings_ui: views::settings::SettingsState,
     pub setup: views::setup::SetupState,
+    pub tenant_ui: views::tenant::TenantState,
     pub tools: views::tools::ToolsState,
     /// The UAC prompt was just answered: bring the window back to the front,
     /// which the prompt and the hidden worker took the foreground from.
@@ -395,14 +446,14 @@ impl StudioApp {
         ystudio_core::intake::Batch::override_root(std::env::temp_dir().join(format!("ystudio-test-batches-{}", std::process::id())));
         let settings = Settings::default();
         let mut app = Self {
-            home: views::home::HomeState::new(&settings), settings_ui: views::settings::SettingsState::new(&settings), setup: Default::default(), settings,
+            home: views::home::HomeState::new(&settings), settings_ui: views::settings::SettingsState::new(&settings), setup: Default::default(), tenant_ui: Default::default(), settings,
             ws: Some(ws), ws_error: None, view: View::Batch, recipes: Vec::new(),
             ws_cache: WsCache::default(), recipe: None, jobs: Vec::new(), next_job: 1,
             console_job: None, console_open: false, waker: Arc::new(|| {}),
             status: Status::default(), pending: None, md_cache: CommonMarkCache::default(),
             verdicts: BTreeMap::new(), ledger: Ledger::default(), completion: BTreeMap::new(),
             usage: Vec::new(), usage_by_job: HashMap::new(), usage_log: std::env::temp_dir().join(format!("ystudio-test-usage-{}.jsonl", std::process::id())),
-            runs: Vec::new(), perf: Perf::default(), git_status: None, branch_menu: Default::default(),
+            runs: Vec::new(), perf: Perf::default(), git_status: None, git_check: None, ws_scan: None, branch_menu: Default::default(),
             library: Default::default(), bench: Default::default(), agent: Default::default(),
             batch: Default::default(), icons: Default::default(), runs_ui: Default::default(),
             docs: Default::default(), promote: Default::default(), update: Default::default(), workflow: Default::default(),
@@ -438,6 +489,7 @@ impl StudioApp {
             home: views::home::HomeState::new(&settings),
             settings_ui: views::settings::SettingsState::new(&settings),
             setup: Default::default(),
+            tenant_ui: Default::default(),
             settings,
             ws: None,
             ws_error: None,
@@ -462,6 +514,8 @@ impl StudioApp {
             runs: Vec::new(),
             perf: Perf::new(),
             git_status: None,
+            git_check: None,
+            ws_scan: None,
             branch_menu: Default::default(),
             library: Default::default(),
             bench: Default::default(),
@@ -591,8 +645,15 @@ impl StudioApp {
                 self.recipe = None;
                 self.bench = BenchState::default();
                 self.docs = Default::default();
-                self.refresh_recipes();
-                self.refresh_runs();
+                // Nothing from the previous workspace may show while this one loads.
+                self.recipes.clear();
+                self.ws_cache = WsCache::default();
+                self.apply_runs(Vec::new(), Ledger::default());
+                self.refresh_completion();
+                self.git_status = None;
+                // Reading hundreds of recipes and run summaries, and starting
+                // git, takes seconds on a cold or antivirus-scanned disk.
+                self.rescan_in_background();
                 self.notify(format!("Opened {} - {label}", path.display()));
                 self.refresh_git_status();
                 self.refresh_remote(false);
@@ -622,28 +683,83 @@ impl StudioApp {
     /// Rescans recipes and the other workspace listings the views display, so
     /// that no view has to touch the file system while drawing a frame.
     pub fn refresh_recipes(&mut self) {
+        if let Some(scan) = &mut self.ws_scan {
+            scan.skip_recipes = true;
+        }
         let Some(ws) = &self.ws else {
             self.recipes.clear();
             self.ws_cache = WsCache::default();
             return;
         };
-        self.recipes = ws.list_recipes();
-        let production_dropbox = if ws.software_dropbox.is_none() {
-            self.settings
-                .primary_production()
-                .and_then(|p| Workspace::open(p, &self.settings.production_paths, &[]).ok())
-                .and_then(|prod| prod.software_dropbox)
-        } else {
-            None
-        };
-        self.ws_cache = WsCache {
-            icons: ws.list_icons(),
-            groups: ws.recipe_groups().into_keys().collect(),
-            has_skill: ws.has_skill(),
-            documents: ws.documents(),
-            production_dropbox,
-        };
+        (self.recipes, self.ws_cache) = scan_listings(ws, self.settings.primary_production().map(|p| p.as_ref()), &self.settings.production_paths);
         self.refresh_completion();
+    }
+
+    /// [`Self::refresh_recipes`] and [`Self::refresh_runs`] on a worker thread;
+    /// the frame that receives the result applies it. A synchronous refresh
+    /// made meanwhile wins over the scan's older copy.
+    pub fn rescan_in_background(&mut self) {
+        let Some(ws) = self.ws.clone() else { return };
+        let production = self.settings.primary_production().map(|p| AsRef::<Path>::as_ref(p).to_path_buf());
+        let production_paths = self.settings.production_paths.clone();
+        let (tx, rx) = channel();
+        let waker = self.waker.clone();
+        let root = ws.root.clone();
+        std::thread::spawn(move || {
+            let (recipes, cache) = scan_listings(&ws, production.as_deref(), &production_paths);
+            let runs = results::list_install_runs(&ws.layout.harness_artifacts);
+            let ledger = Ledger::load(&ws.layout.harness_artifacts);
+            let _ = tx.send(ScanResult { recipes, cache, runs, ledger });
+            waker();
+        });
+        self.ws_scan = Some(WsScan { root, rx, skip_recipes: false, skip_runs: false });
+    }
+
+    /// Whether the workspace's recipes are still being read.
+    pub fn scanning(&self) -> bool {
+        self.ws_scan.is_some()
+    }
+
+    fn poll_scan(&mut self) {
+        let Some(scan) = &self.ws_scan else { return };
+        match scan.rx.try_recv() {
+            Ok(result) => {
+                let scan = self.ws_scan.take().expect("checked above");
+                self.apply_scan(&scan, result);
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.ws_scan = None;
+                self.error("Could not read the workspace's recipes - use Refresh in Recipes to try again.");
+            }
+        }
+    }
+
+    /// Blocks until a background scan finishes, for work that needs the recipe
+    /// list straight away (matching an opened request list against it).
+    pub fn await_scan(&mut self) {
+        let Some(scan) = self.ws_scan.take() else { return };
+        if let Ok(result) = scan.rx.recv() {
+            self.apply_scan(&scan, result);
+        }
+    }
+
+    fn apply_scan(&mut self, scan: &WsScan, result: ScanResult) {
+        if !self.ws.as_ref().is_some_and(|w| w.root == scan.root) {
+            return;
+        }
+        if !scan.skip_recipes {
+            self.recipes = result.recipes;
+            self.ws_cache = result.cache;
+        }
+        if !scan.skip_runs {
+            self.apply_runs(result.runs, result.ledger);
+        }
+        self.refresh_completion();
+        // The lint resolves `base:` against the recipe list.
+        if let Some(r) = &mut self.recipe {
+            r.lint_rev = 0;
+        }
     }
 
     /// Re-hashes the recipes in the validation ledger.
@@ -682,12 +798,80 @@ impl StudioApp {
     }
 
     /// Reads the branch and ahead/behind counts (local only, no network).
+    /// Re-reads the branch and ahead/behind on a worker thread: starting git
+    /// can take a second or more. `git_status` keeps its last value meanwhile.
     pub fn refresh_git_status(&mut self) {
-        self.git_status = self
-            .ws
-            .as_ref()
-            .filter(|w| git::is_repo(&w.root))
-            .map(|w| git::status(&w.root).map_err(|e| format!("{e:#}")));
+        self.check_git_status(false);
+    }
+
+    fn check_git_status(&mut self, report_behind: bool) {
+        let Some(root) = self.ws.as_ref().filter(|w| git::is_repo(&w.root)).map(|w| w.root.clone()) else {
+            self.git_status = None;
+            self.git_check = None;
+            return;
+        };
+        // A newer check replaces one in flight; keep its promise to report.
+        let report_behind = report_behind || self.git_check.as_ref().is_some_and(|c| c.report_behind && c.root == root);
+        let (tx, rx) = channel();
+        let waker = self.waker.clone();
+        let dir = root.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(git::status(&dir).map_err(|e| format!("{e:#}")));
+            waker();
+        });
+        self.git_check = Some(GitCheck { root, rx, report_behind });
+    }
+
+    /// Gives a plugin's private Yardstick clone the open development
+    /// workspace's preferences (SoftwareDropbox, credential target, app
+    /// defaults) unless it has its own, then reports `done` and what was copied.
+    pub fn seed_clone_preferences(&mut self, dest: &Path, done: &str) {
+        let Some(source) = self.ws.as_ref().filter(|w| w.is_writable() && !ystudio_core::same_path(&w.root, dest)) else {
+            return self.notify(format!("{done}."));
+        };
+        let from = source.root.display().to_string();
+        match ystudio_core::workspace::copy_preferences(source, dest) {
+            Ok(true) => self.notify(format!("{done}, with the preferences of {from} (software dropbox, credentials, app defaults).")),
+            Ok(false) => self.notify(format!("{done}.")),
+            Err(e) => self.error(format!("{done}, but the preferences of {from} could not be copied: {e:#}")),
+        }
+    }
+
+    /// Whether a git status check is still running.
+    pub fn git_checking(&self) -> bool {
+        self.git_check.is_some()
+    }
+
+    fn poll_git_status(&mut self) {
+        let Some(check) = &self.git_check else { return };
+        let status = match check.rx.try_recv() {
+            Ok(status) => status,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("the git status check stopped unexpectedly".to_string()),
+        };
+        let check = self.git_check.take().expect("checked above");
+        self.apply_git_status(&check, status);
+    }
+
+    fn apply_git_status(&mut self, check: &GitCheck, status: Result<git::Status, String>) {
+        if !self.ws.as_ref().is_some_and(|w| w.root == check.root) {
+            return;
+        }
+        if check.report_behind
+            && let Ok(s) = &status
+            && s.behind > 0
+        {
+            self.notify(format!("{} new commit(s) on {} - Pull to update.", s.behind, s.upstream.as_deref().unwrap_or("upstream")));
+        }
+        self.git_status = Some(status);
+    }
+
+    /// Blocks until a running git status check finishes.
+    #[cfg(test)]
+    pub(crate) fn await_git_status(&mut self) {
+        let Some(check) = self.git_check.take() else { return };
+        let status = check.rx.recv().unwrap_or_else(|_| Err("the git status check stopped unexpectedly".to_string()));
+        self.apply_git_status(&check, status);
     }
 
     pub(crate) fn job_running(&self, pred: impl Fn(&JobKind) -> bool) -> bool {
@@ -757,16 +941,27 @@ impl StudioApp {
     }
 
     pub fn refresh_runs(&mut self) {
+        if let Some(scan) = &mut self.ws_scan {
+            scan.skip_runs = true;
+        }
         let Some(ws) = &self.ws else { return };
-        self.runs = results::list_install_runs(&ws.layout.harness_artifacts);
-        self.ledger = Ledger::load(&ws.layout.harness_artifacts);
+        let runs = results::list_install_runs(&ws.layout.harness_artifacts);
+        let ledger = Ledger::load(&ws.layout.harness_artifacts);
+        self.apply_runs(runs, ledger);
+        self.refresh_completion();
+    }
+
+    /// Keeps `runs` and `ledger` and derives each recipe's latest verdict.
+    /// The caller refreshes [`Self::completion`].
+    fn apply_runs(&mut self, runs: Vec<InstallRun>, ledger: Ledger) {
+        self.runs = runs;
+        self.ledger = ledger;
         self.verdicts.clear();
         for run in &self.runs {
             for r in run.summary.iter().flat_map(|s| &s.results) {
                 self.verdicts.entry(r.id.clone()).or_insert((r.verdict(), run.timestamp.clone()));
             }
         }
-        self.refresh_completion();
     }
 
     // ---- recipes ---------------------------------------------------------
@@ -941,6 +1136,8 @@ impl StudioApp {
         for id in finished {
             self.on_job_finished(id);
         }
+        self.poll_scan();
+        self.poll_git_status();
         crate::elevation::poll(self);
         crate::workflow::poll(self);
     }
@@ -1111,7 +1308,8 @@ impl StudioApp {
                 if ok {
                     self.settings.plugins.entry(plugin.clone()).or_default().values.insert(setting, dest.display().to_string());
                     self.save_settings();
-                    self.notify(format!("Private Yardstick clone ready for {}.", self.plugins.get(&plugin).map(|p| p.manifest.name.as_str()).unwrap_or(&plugin)));
+                    let name = self.plugins.get(&plugin).map(|p| p.manifest.name.clone()).unwrap_or(plugin);
+                    self.seed_clone_preferences(&dest, &format!("Private Yardstick clone ready for {name}"));
                 } else {
                     self.console_job = Some(id);
                     self.console_open = true;
@@ -1121,14 +1319,10 @@ impl StudioApp {
             // Outcomes arrive through the Publish view, which offers to open them.
             JobKind::PullRequests => {}
             JobKind::GitFetch => {
-                self.refresh_git_status();
-                match (&self.git_status, ok) {
-                    (_, false) => self.error("git fetch failed - see the console."),
-                    (Some(Ok(s)), true) if s.behind > 0 => {
-                        let msg = format!("{} new commit(s) on {} - Pull to update.", s.behind, s.upstream.as_deref().unwrap_or("upstream"));
-                        self.notify(msg);
-                    }
-                    _ => {}
+                // Reports new upstream commits when the check comes back.
+                self.check_git_status(ok);
+                if !ok {
+                    self.error("git fetch failed - see the console.");
                 }
             }
             JobKind::GitSwitch { branch } => views::branches::switched(self, &branch, ok, id),
@@ -1146,7 +1340,8 @@ impl StudioApp {
                 }
             }
             JobKind::SyncShared => {
-                self.refresh_recipes();
+                // Usually finishes just after launch, while the user is busy.
+                self.rescan_in_background();
                 if let Some(r) = &mut self.recipe {
                     // Icon existence may have changed.
                     r.lint_rev = 0;
@@ -1167,6 +1362,7 @@ impl StudioApp {
                 }
             }
             JobKind::InstallTool => views::tools::install_finished(self, ok),
+            JobKind::TenantCheck { result } => views::tenant::check_finished(self, ok, &result),
             JobKind::PluginStep { plugin, dir, step, result, purpose, .. } => {
                 views::plugin_page::step_finished(self, id, &plugin, &dir, &step, &result, purpose);
             }
