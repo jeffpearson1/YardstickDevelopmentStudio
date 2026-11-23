@@ -88,6 +88,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                 });
                 ui.add_space(2.0);
             }
+            super::tenant::bench_card(app, ui, &id);
             ui.add_space(6.0);
             ui.label(RichText::new(
                 "A recipe is Validated only when every phase passes in one live run. A dry run proves the scripts, \
@@ -98,6 +99,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
 
     theme::pane(ui, |ui| {
     // Results and log.
+    super::tenant::result_card(app, ui, &id);
     let result = app
         .bench
         .last_run
@@ -139,7 +141,8 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         });
     }
 
-    let last = app.bench.last_job;
+    // The newest job: a check, or a tenant run.
+    let last = super::tenant::latest_job(app, app.bench.last_job);
     match last.and_then(|j| app.job_mut(j)) {
         Some(job) => {
             ui.label(RichText::new(&job.proc.spec.label).semibold());

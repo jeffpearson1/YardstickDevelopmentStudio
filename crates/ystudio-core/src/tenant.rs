@@ -8,9 +8,11 @@
 //! development-only, and the user must have switched the feature on and named
 //! the tenant it may talk to.
 //!
-//! This module currently holds the read-only half: the connection preflight and
-//! the command that makes a clone a full instance. Nothing in it writes to the
-//! tenant.
+//! This file holds the read-only half: the gate, the connection preflight and
+//! the command that makes a clone a full instance. [`run`] holds the half that
+//! uploads an app, behind that gate and a per-run consent.
+
+pub mod run;
 
 use std::path::{Path, PathBuf};
 
@@ -27,9 +29,20 @@ pub const PREFLIGHT_SCRIPT: &str = include_str!("tenant/preflight.ps1");
 
 const PREFLIGHT_FILE: &str = "Studio-TenantPreflight.ps1";
 
+static WORK_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 /// Where the Studio keeps the scripts and results of tenant runs.
 pub fn work_dir() -> PathBuf {
+    if let Some(dir) = WORK_DIR_OVERRIDE.get() {
+        return dir.clone();
+    }
     dirs::config_dir().unwrap_or_else(std::env::temp_dir).join("YardstickStudio").join("tenant")
+}
+
+/// Points [`work_dir`] somewhere else for the rest of the process, so tests
+/// never write into the user's `%APPDATA%`. The first call wins.
+pub fn override_work_dir(dir: PathBuf) {
+    let _ = WORK_DIR_OVERRIDE.set(dir);
 }
 
 /// An Entra tenant id: a GUID.
@@ -168,6 +181,7 @@ pub struct TenantInfo {
 /// A configured test group and what it resolved to.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GroupInfo {
+    #[serde(default)]
     pub input: String,
     pub id: String,
     #[serde(default)]

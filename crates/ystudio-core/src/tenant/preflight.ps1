@@ -62,6 +62,11 @@ try {
         } else {
             Add-Check 'shared-sync' 'Pass' 'Shared content sync is off, so a temporary override cannot leave this PC.'
         }
+
+        $backup = [string](Get-Pref $prefs 'Backup')
+        if ($backup.Trim()) {
+            Add-Check 'backup' 'Warn' ("A Backup folder is set ({0}). A tenant run copies the test package there like any other upload." -f $backup.Trim())
+        }
     }
 
     # ---- scheduled task ----------------------------------------------------

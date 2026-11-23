@@ -154,6 +154,9 @@ pub enum JobKind {
     InstallTool,
     /// The read-only tenant connection check; `result` is the report it writes.
     TenantCheck { result: PathBuf },
+    /// A real Yardstick run of one recipe on the tenant. `dir` holds the staged
+    /// overrides to put back when it ends; `result` is the report it writes.
+    TenantRun { recipe_id: String, dir: PathBuf, result: PathBuf },
     /// A plugin step; `dir` is its work item, or the plugin's work root.
     PluginStep { plugin: String, dir: PathBuf, step: String, result: PathBuf, risk: ystudio_core::plugin::Risk, purpose: views::plugin_page::Purpose },
     /// An agent task of a plugin, working in a work item's folder.
@@ -444,6 +447,7 @@ impl StudioApp {
     pub(crate) fn isolated_for_tests(ws: Workspace) -> Self {
         // Working lists the tests save go to a per-process temp folder, never %APPDATA%.
         ystudio_core::intake::Batch::override_root(std::env::temp_dir().join(format!("ystudio-test-batches-{}", std::process::id())));
+        ystudio_core::tenant::override_work_dir(std::env::temp_dir().join(format!("ystudio-test-tenant-{}", std::process::id())));
         let settings = Settings::default();
         let mut app = Self {
             home: views::home::HomeState::new(&settings), settings_ui: views::settings::SettingsState::new(&settings), setup: Default::default(), tenant_ui: Default::default(), settings,
@@ -537,7 +541,12 @@ impl StudioApp {
         app.apply_theme(egui_ctx);
         app.perf.note(&format!("renderer {renderer}"));
         app.perf.renderer = renderer;
-        let start = app.settings.workspace.clone().or_else(|| {
+        // A tenant run the last session did not finish leaves a temporary override behind.
+        for note in ystudio_core::tenant::run::recover_interrupted(&ystudio_core::tenant::work_dir()) {
+            ystudio_core::diagnostics::note(&note);
+            app.notify(note);
+        }
+        let start =app.settings.workspace.clone().or_else(|| {
             app.settings
                 .primary_production()
                 .and_then(|p| ystudio_core::workspace::discover_default(p))
@@ -769,6 +778,7 @@ impl StudioApp {
             .ids()
             .filter_map(|id| self.recipes.iter().find(|r| r.id.eq_ignore_ascii_case(id)).map(|r| (id.to_string(), ledger.completion(id, &r.path))))
             .collect();
+        views::tenant::refresh_status(self);
     }
 
     /// Whether `id` is exactly what passed a live install test, or changed since.
@@ -1363,6 +1373,7 @@ impl StudioApp {
             }
             JobKind::InstallTool => views::tools::install_finished(self, ok),
             JobKind::TenantCheck { result } => views::tenant::check_finished(self, ok, &result),
+            JobKind::TenantRun { recipe_id, dir, result } => views::tenant::run_finished(self, &recipe_id, &dir, &result, ok, started),
             JobKind::PluginStep { plugin, dir, step, result, purpose, .. } => {
                 views::plugin_page::step_finished(self, id, &plugin, &dir, &step, &result, purpose);
             }
@@ -2012,6 +2023,7 @@ impl StudioApp {
         views::batch::paste_window(self, &ctx);
         views::batch::modals(self, &ctx);
         views::testbench::live_modal(self, &ctx);
+        views::tenant::run_modal(self, &ctx);
         views::promote::modals(self, &ctx);
         crate::workflow::modal(self, &ctx);
         views::plugin_page::modals(self, &ctx);

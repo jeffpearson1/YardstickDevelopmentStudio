@@ -145,6 +145,7 @@ pub fn recipe_header(app: &mut StudioApp, ui: &mut Ui) {
             theme::badge(ui, "read-only", theme::red());
         }
         recipe_status_badge(app, ui, &id);
+        tenant::status_badge(app, ui, &id);
         let r = app.recipe.as_ref().unwrap();
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if theme::primary(ui, r.dirty() && !r.read_only, "\u{E74E}  Save  (Ctrl+S)").clicked() {
