@@ -219,6 +219,15 @@ fn yardstick_step(app: &mut StudioApp, ui: &mut Ui) {
         app.setup.step = Step::Workspace;
         return;
     };
+    // The development-only setup would switch a connected clone's Intune access off.
+    if ws.tenant_connected() {
+        theme::banner(ui, theme::blue(), |ui| {
+            ui.label(RichText::new("This clone is connected to Intune").semibold().color(theme::blue()));
+            ui.label("It is a full Yardstick instance set up for tenant validation, so the development-only setup is skipped. Manage the connection under Settings \u{2192} Tenant validation.");
+        });
+        nav_buttons(app, ui, Some(Step::Workspace), Some((Step::Done, true, "")));
+        return;
+    }
     if !setup::supported(&ws) {
         theme::banner(ui, theme::amber(), |ui| {
             ui.label(RichText::new("This clone's Install-Yardstick.ps1 is too old for the wizard").semibold().color(theme::amber()));

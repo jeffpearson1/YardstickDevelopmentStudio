@@ -104,7 +104,14 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         })
         .filter(|r| app.library.group.as_ref().is_none_or(|g| r.groups.contains(g)))
         .collect();
-    ui.label(RichText::new(format!("{} of {} recipes", rows.len(), app.recipes.len())).weak());
+    if app.scanning() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(RichText::new("Loading recipes…").weak());
+        });
+    } else {
+        ui.label(RichText::new(format!("{} of {} recipes", rows.len(), app.recipes.len())).weak());
+    }
     let make_request = app.library.selecting && selection_bar(&mut app.library, ui, &rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>());
 
     let selecting = app.library.selecting;

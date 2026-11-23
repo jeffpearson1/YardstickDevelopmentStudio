@@ -162,9 +162,22 @@ pub fn status_spec(ws: &Workspace, pwsh: &Path, result: &Path) -> Result<Process
     Ok(spec("Setup status", ws, pwsh, &["-Status", "-ResultPath", &result.to_string_lossy()]))
 }
 
+/// `-DevelopmentOnly` would switch a tenant-connected clone's Intune access off
+/// again, so the development-only setup is refused there.
+pub fn ensure_not_connected(ws: &Workspace) -> Result<()> {
+    if ws.tenant_connected() {
+        bail!(
+            "This clone is connected to Intune for tenant validation, and the development-only setup would turn that off. \
+             Change its Yardstick setup from a console, or disconnect it first."
+        );
+    }
+    Ok(())
+}
+
 /// A development-only, non-interactive setup run with the wizard's answers.
 pub fn setup_spec(ws: &Workspace, pwsh: &Path, answers: &Answers, result: &Path) -> Result<ProcessSpec> {
     ws.ensure_writable("set up")?;
+    ensure_not_connected(ws)?;
     if let Some(bad) = answers.modules.iter().find(|m| m.is_empty() || !m.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')) {
         bail!("Invalid module name '{bad}'.");
     }
@@ -326,6 +339,23 @@ mod tests {
 
         let prod = Workspace::open(d.path(), &[d.path().to_path_buf()], &[]).unwrap();
         assert!(status_spec(&prod, Path::new("pwsh"), Path::new("s.json")).is_err());
+    }
+
+    #[test]
+    fn the_development_only_setup_never_runs_on_a_tenant_connected_clone() {
+        // A trusted full install is what "connected" means.
+        let d = fake_workspace(Some("defaultScopeTags: []\n"));
+        let ws = Workspace::open(d.path(), &[], &[d.path().to_path_buf()]).unwrap();
+        assert!(ws.tenant_connected());
+        let err = format!("{:#}", setup_spec(&ws, Path::new("pwsh"), &Answers::default(), Path::new("r.json")).unwrap_err());
+        assert!(err.contains("connected to Intune"), "{err}");
+        assert!(crate::harness::install_development_only(&ws, Path::new("pwsh")).is_err());
+        // The read-only status check is still fine.
+        assert!(status_spec(&ws, Path::new("pwsh"), Path::new("s.json")).is_ok());
+        // A development-only clone is unaffected.
+        let dev = fake_workspace(Some("developmentOnly: true\n"));
+        let dev_ws = Workspace::open(dev.path(), &[], &[]).unwrap();
+        assert!(setup_spec(&dev_ws, Path::new("pwsh"), &Answers::default(), Path::new("r.json")).is_ok());
     }
 
     #[test]

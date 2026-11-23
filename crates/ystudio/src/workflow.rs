@@ -188,6 +188,7 @@ pub fn busy(app: &StudioApp) -> bool {
                     | JobKind::Harness { .. }
                     | JobKind::WorkflowHarness { .. }
                     | JobKind::WorkflowRepair { .. }
+                    | JobKind::TenantCheck { .. }
                     | JobKind::PluginStep { risk: ystudio_core::plugin::Risk::LocalInstall, .. } => true,
                     JobKind::PluginAgent { plugin, .. } => !crate::views::plugin_page::has_private_workspace(app, plugin),
                     _ => false,

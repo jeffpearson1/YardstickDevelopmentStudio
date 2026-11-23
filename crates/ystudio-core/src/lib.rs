@@ -21,6 +21,7 @@ pub mod recipe;
 pub mod results;
 pub mod settings;
 pub mod setup;
+pub mod tenant;
 pub mod update;
 pub mod usage;
 pub mod validation;

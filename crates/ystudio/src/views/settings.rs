@@ -86,12 +86,12 @@ fn parse_lines(text: &str) -> Vec<PathBuf> {
 }
 
 /// Vertical rhythm inside a card: heading to content, and content to actions.
-const GROUP_GAP: f32 = 12.0;
+pub(super) const GROUP_GAP: f32 = 12.0;
 /// Width of the label column.
 const LABEL_WIDTH: f32 = 200.0;
 
 /// A form row: a fixed-width label aligned with the first line of its field.
-fn form_row<R>(ui: &mut Ui, label: &str, hover: Option<&str>, field: impl FnOnce(&mut Ui) -> R) -> R {
+pub(super) fn form_row<R>(ui: &mut Ui, label: &str, hover: Option<&str>, field: impl FnOnce(&mut Ui) -> R) -> R {
     ui.horizontal_top(|ui| {
         ui.allocate_ui_with_layout(egui::vec2(LABEL_WIDTH, 28.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
             ui.set_width(LABEL_WIDTH);
@@ -118,6 +118,8 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         theme::card(ui, |ui| super::update::card(app, ui));
         ui.add_space(theme::CARD_GAP);
         folders_card(app, ui);
+        ui.add_space(theme::CARD_GAP);
+        super::tenant::card(app, ui);
         ui.add_space(theme::CARD_GAP);
         tools_card(app, ui);
         ui.add_space(theme::CARD_GAP);

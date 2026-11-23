@@ -35,6 +35,9 @@ yardstick-studio.exe
     ├─ promote.rs        publishing by pull request: branch in a temporary worktree, push, gh pr create or compare URL
     ├─ validation.rs     ledger of recipe hashes that passed a live install test ("complete")
     ├─ setup.rs          Install-Yardstick -Status / -DevelopmentOnly -NonInteractive commands and their JSON results
+    ├─ tenant.rs         optional tenant validation: the gate every tenant action passes (`ensure_ready`), the
+    │                    read-only connection preflight (embedded PowerShell, GET-only, run with `-File` and a JSON
+    │                    input), and the command that connects a clone to Intune. Runs and removal are still to come
     ├─ git.rs            git clone/fetch/pull (ff-only) and ahead/behind status; finds git after a PATH refresh
     ├─ update.rs         self-update: latest GitHub release, SHA-256-verified MSI download, install-and-relaunch helper
     ├─ plugin.rs         plugins: plugin.yaml manifest + validation, zip install/update/uninstall with integrity
