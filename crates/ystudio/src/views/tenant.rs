@@ -3,10 +3,13 @@
 //! read-only connection check. Nothing here writes to the tenant; running a
 //! recipe through Yardstick is a separate, per-run-confirmed step.
 
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::SystemTime;
 
 use eframe::egui::{self, RichText, Ui};
 use ystudio_core::settings::TenantAfterRun;
+use ystudio_core::tenant::run::{self, Restored, RunOptions, RunResult, TenantConsent, TenantLedger, TenantStatus};
 use ystudio_core::tenant::{self, CheckLevel, PreflightReport};
 
 use super::settings::{GROUP_GAP, form_row};
@@ -20,6 +23,25 @@ pub struct TenantState {
     check: CheckState,
     /// The installer was opened in a console and has not been reloaded since.
     connect_started: bool,
+    /// What each recipe's last tenant run found, from `_studio\tenant-validated.json`.
+    ledger: TenantLedger,
+    /// The ledger's verdicts against the recipes' current contents, by lower-case id.
+    status: BTreeMap<String, TenantStatus>,
+    /// The most recent tenant run job, for its log.
+    pub job: Option<u64>,
+    /// The per-run consent dialog, while it is open.
+    modal: Option<RunModal>,
+    /// The last run's result for each recipe, this session.
+    last: BTreeMap<String, RunResult>,
+}
+
+/// The consent dialog for one tenant run.
+struct RunModal {
+    id: String,
+    /// The recipe's display name.
+    name: String,
+    ack: bool,
+    force: bool,
 }
 
 #[derive(Default)]
@@ -290,6 +312,327 @@ fn connect_clone(app: &mut StudioApp) {
     }
 }
 
+// ---- running a recipe on the tenant -------------------------------------------------
+
+/// Re-reads the tenant ledger and judges each recipe against what it says now.
+pub fn refresh_status(app: &mut StudioApp) {
+    let Some(ws) = &app.ws else {
+        app.tenant_ui.status.clear();
+        return;
+    };
+    let ledger = TenantLedger::load(&ws.layout.harness_artifacts);
+    let status = app.recipes.iter().filter(|r| ledger.get(&r.id).is_some()).map(|r| (r.id.to_lowercase(), ledger.status(&r.id, &r.path))).collect();
+    app.tenant_ui.ledger = ledger;
+    app.tenant_ui.status = status;
+}
+
+/// What the last tenant run of `id` found, against the recipe as it is now.
+pub fn status<'a>(app: &'a StudioApp, id: &str) -> Option<&'a TenantStatus> {
+    app.tenant_ui.status.get(&id.to_lowercase())
+}
+
+/// A badge for the recipe header: nothing when the feature is off or the recipe
+/// has never run on the tenant. Informational; nothing depends on it.
+pub fn status_badge(app: &StudioApp, ui: &mut Ui, id: &str) {
+    if !app.settings.tenant.enabled {
+        return;
+    }
+    match status(app, id) {
+        None | Some(TenantStatus::NotRun) => {}
+        Some(TenantStatus::Passed(r)) => {
+            theme::badge(ui, "Tenant: passed", theme::green())
+                .on_hover_text(format!("Ran on the tenant as {} {} on {}, and is unchanged since.", r.app_name, r.version, r.tested));
+        }
+        Some(TenantStatus::Failed(r)) => {
+            theme::badge(ui, "Tenant: failed", theme::red()).on_hover_text(format!("The last tenant run found a problem: {}", r.problem));
+        }
+        Some(TenantStatus::Changed(r)) => {
+            theme::badge(ui, "Changed since tenant run", theme::amber()).on_hover_text(format!("Ran on the tenant on {}, but has been edited since.", r.tested));
+        }
+        Some(TenantStatus::Removed(r)) => {
+            theme::badge(ui, "Tenant: removed", theme::grey()).on_hover_text(format!("Passed on the tenant on {}; the test app was removed afterwards.", r.tested));
+        }
+    }
+}
+
+fn running(app: &StudioApp) -> bool {
+    app.tenant_ui.job.and_then(|j| app.job(j)).is_some_and(|j| j.proc.is_running())
+}
+
+/// Whether a tenant run of the open recipe could start now, and if not, why.
+fn run_readiness(app: &StudioApp) -> Result<(), String> {
+    let Some(ws) = &app.ws else { return Err("Open a development clone first.".into()) };
+    tenant::ensure_ready(ws, &app.settings.tenant, "run a recipe on the tenant").map_err(|e| format!("{e:#}"))?;
+    let Some(r) = &app.recipe else { return Err("Open a recipe first.".into()) };
+    if r.location != ystudio_core::workspace::RecipeLocation::Development {
+        return Err("Only a development recipe can be run on the tenant. Copy it to Development first.".into());
+    }
+    if r.dirty() {
+        return Err("Save the recipe first (Ctrl+S): a tenant run uses the saved file.".into());
+    }
+    if crate::workflow::busy(app) || !app.batch.queue.is_empty() {
+        return Err("Finish the active run first.".into());
+    }
+    Ok(())
+}
+
+/// The Tenant card on a recipe's Test tab. Outside the chained checks on purpose.
+pub fn bench_card(app: &mut StudioApp, ui: &mut Ui, id: &str) {
+    if !app.settings.tenant.enabled {
+        return;
+    }
+    let readiness = run_readiness(app);
+    let active = running(app);
+    let mut open = false;
+    let mut stop = false;
+    theme::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("\u{E753}").size(18.0).color(theme::blue()));
+            ui.label(RichText::new("Tenant (optional)").semibold());
+            status_badge(app, ui, id);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if active {
+                    stop = ui.button("\u{E71A}  Stop").on_hover_text("Cancelling mid-upload can leave a partly uploaded app in Intune.").clicked();
+                } else {
+                    open = ui.add_enabled(readiness.is_ok(), egui::Button::new("Run on tenant…")).clicked();
+                }
+            });
+        });
+        ui.label(
+            RichText::new(
+                "Uploads this recipe to your Intune tenant as a test app through a real Yardstick run. \
+                 It is never part of Run all checks, and Publish does not need it.",
+            )
+            .small()
+            .weak(),
+        );
+        if let Err(why) = &readiness
+            && !active
+        {
+            ui.label(RichText::new(why).small().color(theme::amber()));
+        }
+    });
+    if stop && let Some(job) = app.tenant_ui.job.and_then(|j| app.job_mut(j)) {
+        job.proc.cancel();
+    }
+    if open {
+        open_run_modal(app);
+    }
+}
+
+fn open_run_modal(app: &mut StudioApp) {
+    let Some(r) = &app.recipe else { return };
+    let name = ystudio_core::recipe::RecipeDoc::parse(&r.text)
+        .ok()
+        .and_then(|d| d.get_str("displayName"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| r.id.clone());
+    app.tenant_ui.modal = Some(RunModal { id: r.id.clone(), name, ack: false, force: false });
+}
+
+/// The consent dialog in front of a tenant run. Selecting the option is not consent:
+/// this exact run has to be confirmed.
+pub fn run_modal(app: &mut StudioApp, ctx: &egui::Context) {
+    if app.tenant_ui.modal.is_none() {
+        return;
+    }
+    let readiness = run_readiness(app);
+    let t = app.settings.tenant.clone();
+    let mut start = false;
+    let mut cancel = false;
+    let Some(m) = app.tenant_ui.modal.as_mut() else { return };
+    egui::Modal::new(egui::Id::unique("tenant-run-modal")).show(ctx, |ui| {
+        ui.set_max_width(580.0);
+        ui.label(RichText::new("\u{E7BA}  Run on your tenant").heading().color(theme::amber()));
+        ui.label(format!(
+            "This runs Yardstick for {} and UPLOADS it to your Intune tenant as a test app. Nothing is emailed and nothing is deleted.",
+            m.name
+        ));
+        ui.add_space(6.0);
+        let tenant_label = if t.tenant_name.trim().is_empty() { t.tenant_id.trim().to_string() } else { format!("{} ({})", t.tenant_name.trim(), t.tenant_id.trim()) };
+        let assigned = match t.after_run {
+            TenantAfterRun::LeaveInTestGroup => t.test_groups.iter().map(|g| g.trim()).filter(|g| !g.is_empty()).collect::<Vec<_>>().join(", "),
+            _ => "nobody (no assignments)".into(),
+        };
+        egui::Grid::new("tenant-run-grid").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
+            for (label, value) in [
+                ("Tenant", tenant_label),
+                ("App in Intune", run::test_display_name(&m.name)),
+                ("Assigned to", assigned),
+                ("Afterwards", "The app stays in Intune until you remove it.".to_string()),
+            ] {
+                ui.label(label);
+                ui.add(egui::Label::new(RichText::new(value).semibold()).wrap());
+                ui.end_row();
+            }
+        });
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(
+                "The test app has its own name, so it cannot change a real app's versions or assignments. \
+                 Studio temporarily adds an entry for this recipe to Local\\recipeOverrides.yaml, and puts the file back when the run ends.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.separator();
+        ui.checkbox(&mut m.force, "Upload even if Intune already has this version of the test app (-Force)");
+        let who = if t.tenant_name.trim().is_empty() { t.tenant_id.trim() } else { t.tenant_name.trim() };
+        ui.checkbox(&mut m.ack, format!("I consent to uploading {} to {who} for testing.", m.name));
+        if let Err(why) = &readiness {
+            ui.label(RichText::new(why).small().color(theme::red()));
+        }
+        ui.horizontal(|ui| {
+            if theme::primary(ui, m.ack && readiness.is_ok(), RichText::new("Run on tenant")).clicked() {
+                start = true;
+            }
+            if ui.button("Cancel").clicked() {
+                cancel = true;
+            }
+        });
+    });
+    if cancel {
+        app.tenant_ui.modal = None;
+    }
+    if start && let Some(m) = app.tenant_ui.modal.take() {
+        start_run(app, &m.id, m.force);
+    }
+}
+
+fn start_run(app: &mut StudioApp, id: &str, force: bool) {
+    let Some(ws) = app.ws.clone() else { return };
+    let prepared = match run::run_spec(&ws, &app.settings.tenant, id, RunOptions { force_reupload: force }, TenantConsent::Confirmed, &app.pwsh(), &tenant::work_dir()) {
+        Ok(p) => p,
+        Err(e) => return app.error(format!("{e:#}")),
+    };
+    let dir = prepared.dir.clone();
+    let kind = JobKind::TenantRun { recipe_id: id.to_string(), dir: dir.clone(), result: prepared.result.clone() };
+    match app.start_job(prepared.spec, kind) {
+        Some(job) => {
+            app.tenant_ui.job = Some(job);
+            app.tenant_ui.last.remove(&id.to_lowercase());
+            app.console_open = true;
+            app.notify(format!("Running {id} on the tenant as {}…", prepared.app_name));
+        }
+        None => {
+            // The process never started: put the overrides back straight away.
+            if let Err(e) = run::restore_overrides(&dir) {
+                app.error(format!("Could not restore Local\\recipeOverrides.yaml: {e:#}"));
+            }
+        }
+    }
+}
+
+/// A tenant run ended (or was cancelled): put the overrides back, read what it
+/// found and remember it.
+pub fn run_finished(app: &mut StudioApp, recipe_id: &str, dir: &Path, result_path: &Path, ok: bool, started: SystemTime) {
+    match run::restore_overrides(dir) {
+        Ok(Restored::LeftAlone(why)) => app.error(why),
+        Ok(_) => {}
+        Err(e) => app.error(format!("Could not restore Local\\recipeOverrides.yaml: {e:#}")),
+    }
+    let key = recipe_id.to_lowercase();
+    let result = match RunResult::read(result_path) {
+        Ok(result) => {
+            let recipe = app.ws.as_ref().and_then(|w| w.find_recipe(recipe_id));
+            if let Some(recipe) = recipe {
+                let tenant_id = app.settings.tenant.tenant_id.trim().to_string();
+                let saved = app
+                    .tenant_ui
+                    .ledger
+                    .record_run(recipe_id, &recipe, started, &tenant_id, &result, &result.started_utc)
+                    .and_then(|recorded| if recorded { app.tenant_ui.ledger.save() } else { Ok(()) });
+                if let Err(e) = saved {
+                    app.error(format!("Could not record the tenant run of {recipe_id}: {e:#}"));
+                }
+            }
+            result
+        }
+        Err(e) => RunResult {
+            status: "Failed".into(),
+            recipe_id: recipe_id.to_string(),
+            problems: vec![if ok {
+                format!("{e:#}")
+            } else {
+                format!("The run stopped before it could report. If it was cancelled, check Intune for a partly uploaded app named '{}…'.", run::TEST_PREFIX)
+            }],
+            ..Default::default()
+        },
+    };
+    let _ = std::fs::remove_file(result_path);
+    if result.refused() {
+        app.error(format!("Nothing was uploaded: {}", result.summary()));
+    } else if result.passed() {
+        app.notify(format!("{recipe_id} ran on the tenant: {}", result.summary()));
+    } else {
+        app.error(format!("The tenant run of {recipe_id} found a problem: {}", result.summary()));
+    }
+    app.tenant_ui.last.insert(key, result);
+    refresh_status(app);
+}
+
+/// The latest tenant run of `id`: what it found, and the app it left behind.
+pub fn result_card(app: &StudioApp, ui: &mut Ui, id: &str) {
+    if !app.settings.tenant.enabled {
+        return;
+    }
+    let key = id.to_lowercase();
+    let last = app.tenant_ui.last.get(&key);
+    let record = app.tenant_ui.ledger.get(id);
+    if last.is_none() && record.is_none() {
+        return;
+    }
+    theme::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Latest tenant run").semibold());
+            match (last, record) {
+                (Some(r), _) if r.refused() => theme::badge(ui, "Not run", theme::grey()),
+                (Some(r), _) if r.passed() => theme::badge(ui, "Passed", theme::green()),
+                (Some(_), _) => theme::badge(ui, "Failed", theme::red()),
+                (None, Some(r)) if r.passed => theme::badge(ui, "Passed", theme::green()),
+                (None, _) => theme::badge(ui, "Failed", theme::red()),
+            };
+        });
+        let (name, version, app_id, groups, problems): (String, String, String, Vec<String>, Vec<String>) = match (last, record) {
+            (Some(r), _) => {
+                let a = r.app.clone().unwrap_or_default();
+                let groups = a.assignments.iter().map(|g| g.group_name.clone().or_else(|| g.group_id.clone()).unwrap_or_else(|| g.target_type.clone())).collect();
+                (a.display_name, a.display_version, a.id, groups, r.problems.clone())
+            }
+            (None, Some(r)) => (r.app_name.clone(), r.version.clone(), r.app_id.clone(), r.groups.clone(), (!r.problem.is_empty()).then(|| r.problem.clone()).into_iter().collect()),
+            (None, None) => return,
+        };
+        if !name.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&name).semibold());
+                if !version.is_empty() {
+                    ui.label(format!("version {version}"));
+                }
+            });
+            if !app_id.is_empty() {
+                ui.label(RichText::new(format!("Intune app id {app_id}")).small().monospace().weak());
+            }
+            let assigned = if groups.is_empty() { "Assigned to nobody.".to_string() } else { format!("Assigned to {}.", groups.join(", ")) };
+            ui.label(assigned);
+        }
+        for p in &problems {
+            ui.horizontal_top(|ui| {
+                ui.label(RichText::new("\u{E711}").color(theme::red()));
+                ui.add(egui::Label::new(p).wrap());
+            });
+        }
+    });
+}
+
+/// The most recent job for the Test tab's log: a check or a tenant run.
+pub fn latest_job(app: &StudioApp, harness_job: Option<u64>) -> Option<u64> {
+    match (harness_job, app.tenant_ui.job) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 #[cfg(test)]
 impl TenantState {
     pub(crate) fn show_report_for_tests(&mut self, report: PreflightReport) {
@@ -352,6 +695,107 @@ mod tests {
         super::start_check(&mut app);
         assert!(app.tenant_ui.failure_for_tests().is_some_and(|e| e.contains("not a trusted development clone")));
         assert!(app.jobs.is_empty(), "no job may start when the gate refuses");
+    }
+
+    const PASSED: &str = r##"{"status": "Passed", "recipeId": "app", "exitCode": 0, "startedUtc": "2026-11-23T10:00:00Z",
+        "tenant": {"id": "t", "name": "Contoso"}, "groups": [{"id": "g1", "name": "Testers"}],
+        "app": {"id": "0f9c1c4e-1111-4222-8333-444455556666", "displayName": "YDS TEST - App", "displayVersion": "1.0", "publishingState": "published",
+                "createdDateTime": "2026-11-23T10:05:00Z",
+                "assignments": [{"intent": "available", "targetType": "#microsoft.graph.groupAssignmentTarget", "groupId": "g1", "groupName": "Testers"}]},
+        "problems": []}"##;
+
+    /// Makes `fake_app`'s clone a trusted full instance with the feature switched on.
+    fn connect(dir: &tempfile::TempDir, app: &mut crate::app::StudioApp) {
+        std::fs::create_dir_all(dir.path().join("Local")).unwrap();
+        std::fs::write(dir.path().join("Local").join("preferences.yaml"), "defaultScopeTags: []\n").unwrap();
+        app.ws = Some(Workspace::open(dir.path(), &[], &[dir.path().to_path_buf()]).unwrap());
+        app.settings.tenant.enabled = true;
+        app.settings.tenant.tenant_id = "11111111-2222-3333-4444-555555555555".into();
+        app.settings.tenant.test_groups = vec!["Testers".into()];
+        app.refresh_recipes();
+    }
+
+    fn finish(app: &mut crate::app::StudioApp, job: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while app.job(job).unwrap().proc.is_running() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            app.poll_for_tests();
+        }
+        app.poll_for_tests();
+        assert!(!app.job(job).unwrap().proc.is_running(), "the job did not finish");
+    }
+
+    /// The real run script, in a clone with no Yardstick modules: a guard refuses
+    /// before anything reaches the tenant, which is exactly what must be safe.
+    #[test]
+    fn a_run_that_a_guard_stops_uploads_nothing_and_restores_the_overrides() {
+        let (dir, mut app) = fake_app();
+        connect(&dir, &mut app);
+        let overrides = dir.path().join("Local").join("recipeOverrides.yaml");
+        let original = "# mine\r\nother:\r\n  scopeTags: [Labs]\r\n";
+        std::fs::write(&overrides, original).unwrap();
+        // A Yardstick.ps1 that would leave a trace if the run ever reached it.
+        std::fs::write(dir.path().join("Yardstick.ps1"), "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'ran.txt') -Value ran").unwrap();
+
+        super::start_run(&mut app, "app", false);
+        let job = app.tenant_ui.job.expect("the run should have started");
+        assert!(crate::workflow::busy(&app), "a tenant run blocks other runs");
+        // While it runs, the overrides hold the temporary test entry.
+        finish(&mut app, job);
+
+        assert!(!dir.path().join("ran.txt").exists(), "Yardstick must not run when a guard fails");
+        assert_eq!(std::fs::read(&overrides).unwrap(), original.as_bytes(), "the overrides are put back byte for byte");
+        let last = &app.tenant_ui.last["app"];
+        assert!(!last.passed() && last.app.is_none());
+        // It reports why it stopped, rather than "stopped before it could report".
+        assert!(!last.problems.is_empty() && !last.problems[0].contains("could report"), "{:?}", last.problems);
+        assert!(last.refused() || last.status == "Failed", "{}", last.status);
+        assert!(app.tenant_ui.ledger.get("app").is_none() || !app.tenant_ui.ledger.get("app").unwrap().passed);
+        assert!(!crate::workflow::busy(&app), "the lock is released when it ends");
+        assert!(ystudio_core::tenant::run::recover_interrupted(&ystudio_core::tenant::work_dir()).is_empty(), "nothing is left to recover");
+    }
+
+    #[test]
+    fn a_run_is_refused_without_consent_before_anything_changes() {
+        let (dir, mut app) = fake_app();
+        connect(&dir, &mut app);
+        let overrides = dir.path().join("Local").join("recipeOverrides.yaml");
+        // Feature off: start_run goes through the same gate and starts nothing.
+        app.settings.tenant.enabled = false;
+        super::start_run(&mut app, "app", false);
+        assert!(app.jobs.is_empty() && !overrides.exists());
+        // Production: the same.
+        app.settings.tenant.enabled = true;
+        app.ws = Some(Workspace::open(dir.path(), &[dir.path().to_path_buf()], &[]).unwrap());
+        super::start_run(&mut app, "app", false);
+        assert!(app.jobs.is_empty() && !overrides.exists());
+    }
+
+    #[test]
+    fn the_dialog_the_card_and_the_result_render() {
+        use ystudio_core::tenant::run::RunResult;
+        let (dir, mut app) = fake_app();
+        connect(&dir, &mut app);
+        let recipe = dir.path().join(r"Recipes\Development\app.yaml");
+        app.open_recipe(&recipe);
+        app.view = View::TestBench;
+        render(&mut app, "tenant-bench-card", 1400, 900);
+        // The consent dialog.
+        super::open_run_modal(&mut app);
+        render(&mut app, "tenant-run-dialog", 1400, 900);
+        render(&mut app, "tenant-run-dialog-narrow", 900, 600);
+        app.tenant_ui.modal = None;
+        // A passed run, then a failed one.
+        let passed: RunResult = serde_json::from_str(PASSED).unwrap();
+        app.tenant_ui.last.insert("app".into(), passed);
+        render(&mut app, "tenant-result-passed", 1400, 900);
+        let failed: RunResult = serde_json::from_str(r#"{"status": "Failed", "problems": ["The app has an assignment outside the test groups. Check it in Intune before leaving it.", "Yardstick exited with code 40."]}"#).unwrap();
+        app.tenant_ui.last.insert("app".into(), failed);
+        render(&mut app, "tenant-result-failed", 1400, 900);
+        // An unsaved recipe cannot be run: the card says why.
+        app.recipe.as_mut().unwrap().text.push_str("# edit\n");
+        assert!(super::run_readiness(&app).unwrap_err().contains("Save the recipe"));
+        render(&mut app, "tenant-bench-card-dirty", 1400, 900);
     }
 
     #[test]
