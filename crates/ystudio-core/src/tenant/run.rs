@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use super::{GroupInfo, TenantInfo, ensure_ready};
 use crate::process::ProcessSpec;
 use crate::recipe::{RecipeDoc, is_valid_id};
-use crate::settings::{TenantAfterRun, TenantSettings};
+use crate::settings::TenantSettings;
 use crate::workspace::Workspace;
 
 /// The run script, compiled in so the file Studio runs is the file it shipped.
@@ -99,9 +99,6 @@ pub fn run_spec(
     ensure_ready(ws, tenant, "run a recipe on the tenant")?;
     if consent != TenantConsent::Confirmed {
         bail!("A tenant run uploads an app to Intune and needs explicit confirmation of this exact run.");
-    }
-    if tenant.after_run == TenantAfterRun::Remove {
-        bail!("Removing the app after a run is not available yet. Choose to leave it (in the test group or unassigned) under Settings → Tenant validation.");
     }
     if !is_valid_id(recipe_id) {
         bail!("'{recipe_id}' is not a valid recipe id.");
@@ -370,6 +367,97 @@ impl RunResult {
     }
 }
 
+// ---- removing a test app -------------------------------------------------------------
+
+/// The removal script, compiled in like the run script.
+pub const REMOVE_SCRIPT: &str = include_str!("remove.ps1");
+
+const REMOVE_FILE: &str = "Studio-TenantRemove.ps1";
+
+/// A prepared removal: the process to start and where it writes its result.
+pub struct PreparedRemove {
+    pub spec: ProcessSpec,
+    pub result: PathBuf,
+}
+
+/// Builds the removal of the test app a run recorded. It can delete exactly one
+/// app, named by an id that Studio's own result put in the ledger, and only a
+/// test app (the name still carries [`TEST_PREFIX`]) in the tenant the settings
+/// name. The script re-reads the app and refuses unless it is still that app.
+pub fn remove_spec(ws: &Workspace, tenant: &TenantSettings, record: &TenantRecord, consent: TenantConsent, pwsh: &Path, base: &Path) -> Result<PreparedRemove> {
+    ensure_ready(ws, tenant, "remove a test app from the tenant")?;
+    if consent != TenantConsent::Confirmed {
+        bail!("Removing an app from Intune needs explicit confirmation.");
+    }
+    if record.removed {
+        bail!("That test app has already been removed.");
+    }
+    if !super::is_tenant_id(&record.app_id) {
+        bail!("The run did not record an Intune app id, so there is nothing to remove.");
+    }
+    if !record.app_name.starts_with(TEST_PREFIX) {
+        bail!("'{}' is not a test app (its name does not start with '{TEST_PREFIX}'), so the Studio will not remove it.", record.app_name);
+    }
+    if !record.tenant_id.eq_ignore_ascii_case(tenant.tenant_id.trim()) {
+        bail!("That test app was created in a different tenant than the one set under Settings → Tenant validation.");
+    }
+    let stamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let dir = base.join("removals").join(format!("remove-{stamp}"));
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let script = dir.join(REMOVE_FILE);
+    let input = dir.join("input.json");
+    let result = dir.join("result.json");
+    std::fs::write(&script, REMOVE_SCRIPT).with_context(|| format!("writing {}", script.display()))?;
+    let payload = serde_json::json!({
+        "root": ws.root.to_string_lossy(),
+        "tenantId": tenant.tenant_id.trim(),
+        "tenantName": tenant.tenant_name.trim(),
+        "appId": record.app_id,
+        "appName": record.app_name,
+        "createdUtc": record.created,
+        "testPrefix": TEST_PREFIX,
+    });
+    std::fs::write(&input, serde_json::to_string_pretty(&payload)?).with_context(|| format!("writing {}", input.display()))?;
+    let spec = ProcessSpec::new(format!("Remove test app: {}", record.app_name), pwsh, &ws.root)
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(script.to_string_lossy())
+        .args(["-InputPath"])
+        .arg(input.to_string_lossy())
+        .args(["-ResultPath"])
+        .arg(result.to_string_lossy())
+        .env("NO_COLOR", "1");
+    Ok(PreparedRemove { spec, result })
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RemoveResult {
+    /// `Removed`, `Failed` or `Refused` (a check stopped it before anything was deleted).
+    #[serde(deserialize_with = "null_default")]
+    pub status: String,
+    #[serde(deserialize_with = "null_default")]
+    pub app_id: String,
+    #[serde(deserialize_with = "null_default")]
+    pub app_name: String,
+    #[serde(deserialize_with = "null_default")]
+    pub problems: Vec<String>,
+}
+
+impl RemoveResult {
+    pub fn read(path: &Path) -> Result<Self> {
+        let text = crate::read_text(path).with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&text).context("the removal wrote an unreadable result")
+    }
+
+    pub fn removed(&self) -> bool {
+        self.status == "Removed" && self.problems.is_empty()
+    }
+
+    pub fn summary(&self) -> String {
+        self.problems.first().cloned().unwrap_or_else(|| if self.removed() { format!("{} was removed from Intune.", self.app_name) } else { "The removal did not report a result.".into() })
+    }
+}
+
 // ---- the ledger --------------------------------------------------------------------
 
 /// What the last tenant run of a recipe found.
@@ -383,6 +471,9 @@ pub struct TenantRecord {
     pub app_id: String,
     pub app_name: String,
     pub version: String,
+    /// When Intune created the app, as the run read it back. Removal checks it.
+    #[serde(default)]
+    pub created: String,
     /// Display names of the groups the app was assigned to.
     pub groups: Vec<String>,
     pub tested: String,
@@ -454,6 +545,7 @@ impl TenantLedger {
             app_id: app.id,
             app_name: app.display_name,
             version: app.display_version,
+            created: app.created_date_time,
             groups: app.assignments.iter().filter_map(|a| a.group_name.clone().or_else(|| a.group_id.clone())).collect(),
             tested: tested.to_string(),
             removed: false,
@@ -463,9 +555,20 @@ impl TenantLedger {
         Ok(true)
     }
 
+    /// Notes that the test app of `id` is gone from Intune. Returns whether a record changed.
+    pub fn mark_removed(&mut self, id: &str) -> bool {
+        match self.records.get_mut(&id.to_lowercase()) {
+            Some(r) if !r.removed => {
+                r.removed = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn status(&self, id: &str, recipe: &Path) -> TenantStatus {
         let Some(record) = self.get(id) else { return TenantStatus::NotRun };
-        if record.passed && record.removed {
+        if record.removed {
             return TenantStatus::Removed(record.clone());
         }
         match crate::validation::recipe_hash(recipe) {
@@ -486,6 +589,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::settings::TenantAfterRun;
     use crate::workspace::Workspace;
 
     const TENANT: &str = "11111111-2222-3333-4444-555555555555";
@@ -527,7 +631,6 @@ mod tests {
         assert!(err(run_spec(&ws, &enabled(), "Bad Id", RunOptions::default(), TenantConsent::Confirmed, Path::new("pwsh"), base.path())).contains("not a valid recipe id"));
         assert!(err(run_spec(&ws, &enabled(), "nope", RunOptions::default(), TenantConsent::Confirmed, Path::new("pwsh"), base.path())).contains("Recipes\\Development"));
         assert!(err(run(&ws, &TenantSettings { test_groups: vec![], ..enabled() }, base.path(), TenantConsent::Confirmed)).contains("test group"));
-        assert!(err(run(&ws, &TenantSettings { after_run: TenantAfterRun::Remove, ..enabled() }, base.path(), TenantConsent::Confirmed)).contains("not available yet"));
         // Refusals touch nothing.
         assert!(!overrides_path(&ws).exists());
         assert!(!base.path().join("runs").exists() || std::fs::read_dir(base.path().join("runs")).unwrap().all(|e| !e.unwrap().path().join(MARKER).exists()));
@@ -779,6 +882,125 @@ mod tests {
         std::fs::create_dir_all(d.path().join("_studio")).unwrap();
         std::fs::write(TenantLedger::path(d.path()), "not json").unwrap();
         assert!(TenantLedger::load(d.path()).get("app").is_none());
+    }
+
+    fn record() -> TenantRecord {
+        TenantRecord {
+            sha256: "x".into(),
+            tenant_id: TENANT.into(),
+            passed: true,
+            app_id: "0f9c1c4e-1111-4222-8333-444455556666".into(),
+            app_name: "YDS TEST - 7-Zip".into(),
+            version: "1.0".into(),
+            created: "2026-11-23T10:05:00Z".into(),
+            groups: vec![],
+            tested: "t".into(),
+            removed: false,
+            problem: String::new(),
+        }
+    }
+
+    #[test]
+    fn removal_deletes_only_a_recorded_test_app_in_the_configured_tenant() {
+        let (_d, ws) = connected();
+        let base = tempfile::tempdir().unwrap();
+        let remove = |r: &TenantRecord, t: &TenantSettings, c: TenantConsent| remove_spec(&ws, t, r, c, Path::new("pwsh.exe"), base.path());
+        let err = |r: Result<PreparedRemove>| format!("{:#}", r.err().expect("should refuse"));
+        assert!(err(remove(&record(), &enabled(), TenantConsent::None)).contains("explicit confirmation"));
+        assert!(err(remove(&record(), &TenantSettings { enabled: false, ..enabled() }, TenantConsent::Confirmed)).contains("switched off"));
+        // A real app's name, an empty or malformed id, a removed record, another tenant: all refused.
+        assert!(err(remove(&TenantRecord { app_name: "7-Zip".into(), ..record() }, &enabled(), TenantConsent::Confirmed)).contains("not a test app"));
+        assert!(err(remove(&TenantRecord { app_name: "Something YDS TEST - ".into(), ..record() }, &enabled(), TenantConsent::Confirmed)).contains("not a test app"));
+        assert!(err(remove(&TenantRecord { app_id: String::new(), ..record() }, &enabled(), TenantConsent::Confirmed)).contains("did not record an Intune app id"));
+        assert!(err(remove(&TenantRecord { app_id: "7-Zip".into(), ..record() }, &enabled(), TenantConsent::Confirmed)).contains("app id"));
+        assert!(err(remove(&TenantRecord { removed: true, ..record() }, &enabled(), TenantConsent::Confirmed)).contains("already been removed"));
+        assert!(err(remove(&TenantRecord { tenant_id: "aaaaaaaa-2222-3333-4444-555555555555".into(), ..record() }, &enabled(), TenantConsent::Confirmed)).contains("different tenant"));
+        assert!(!base.path().join("removals").exists(), "a refusal writes nothing");
+
+        let ok = remove(&record(), &enabled(), TenantConsent::Confirmed).unwrap();
+        let args = ok.spec.args.join(" ");
+        assert!(args.contains("-File") && !args.contains("-Command"));
+        assert!(!args.contains("0f9c1c4e") && !args.contains("7-Zip"), "ids and names travel in the JSON input, not on the command line");
+        let dir = ok.result.parent().unwrap();
+        let input: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("input.json")).unwrap()).unwrap();
+        assert_eq!(input["appId"], "0f9c1c4e-1111-4222-8333-444455556666");
+        assert_eq!(input["createdUtc"], "2026-11-23T10:05:00Z");
+        assert_eq!(input["testPrefix"], TEST_PREFIX);
+        assert_eq!(std::fs::read_to_string(dir.join(REMOVE_FILE)).unwrap(), REMOVE_SCRIPT);
+        // Production and development-only clones are refused by the gate.
+        let prod = Workspace::open(ws.root.as_path(), std::slice::from_ref(&ws.root), &[]).unwrap();
+        assert!(remove_spec(&prod, &enabled(), &record(), TenantConsent::Confirmed, Path::new("pwsh"), base.path()).is_err());
+    }
+
+    #[test]
+    fn remove_script_sends_one_delete_after_it_has_proved_what_it_is_deleting() {
+        let script = REMOVE_SCRIPT.to_ascii_lowercase();
+        assert_eq!(script.matches("-method delete").count(), 1, "exactly one delete");
+        for method in ["post", "put", "patch"] {
+            assert!(!script.contains(&format!("-method {method}")), "removal must not use {method}");
+        }
+        // The delete targets the recorded id only: no search, no wildcard, no name.
+        let delete_line = script.lines().find(|l| l.contains("-method delete")).unwrap();
+        assert!(delete_line.contains("$appid") && !delete_line.contains('?') && !delete_line.contains("filter"), "{delete_line}");
+        // From the moment it re-reads the app, nothing may search or loop.
+        let tail = &script[script.find("re-read the app").expect("the proof section is marked")..];
+        assert!(!tail.contains("$filter") && !tail.contains("-like") && !tail.contains("foreach") && !tail.contains("where-object"), "no searching or looping near a delete");
+        for verb in ["remove-", "set-content", "new-item", "out-file", "yardstick.ps1", "invoke-yardstick "] {
+            assert!(!script.contains(verb), "removal must not contain {verb}");
+        }
+        // Every proof comes before the delete.
+        let delete_at = script.find("-method delete").unwrap();
+        for proof in ["is not a guid", "developmentonly", "get-yardstickintunecredential", "organization", "win32lobapp", "startswith($prefix)", "createdutc"] {
+            let at = script.find(proof).unwrap_or_else(|| panic!("missing check: {proof}"));
+            assert!(at < delete_at, "{proof} must be checked before the delete");
+        }
+    }
+
+    #[test]
+    fn remove_script_parses_in_powershell() {
+        let Some(pwsh) = crate::process::which("pwsh") else { return };
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join(REMOVE_FILE);
+        std::fs::write(&path, REMOVE_SCRIPT).unwrap();
+        let probe = format!(
+            "$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile({}, [ref]$null, [ref]$e); \
+             if ($e.Count) {{ $e | ForEach-Object {{ $_.Message }}; exit 1 }}",
+            crate::harness::ps_quote(&path.to_string_lossy())
+        );
+        let out = std::process::Command::new(pwsh).args(["-NoProfile", "-NonInteractive", "-Command", &probe]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    }
+
+    #[test]
+    fn reads_removal_results_and_marks_the_ledger() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("r.json");
+        std::fs::write(&p, r#"{"status": "Removed", "appId": "a", "appName": "YDS TEST - 7-Zip", "problems": []}"#).unwrap();
+        let r = RemoveResult::read(&p).unwrap();
+        assert!(r.removed());
+        assert_eq!(r.summary(), "YDS TEST - 7-Zip was removed from Intune.");
+        std::fs::write(&p, r#"{"status": "Refused", "appId": "a", "appName": null, "problems": ["The app is now called 'x', which is not a test app, so it was not removed."]}"#).unwrap();
+        let r = RemoveResult::read(&p).unwrap();
+        assert!(!r.removed() && r.summary().contains("not a test app"));
+        // "Removed" with a problem is not a removal.
+        std::fs::write(&p, r#"{"status": "Removed", "problems": ["x"]}"#).unwrap();
+        assert!(!RemoveResult::read(&p).unwrap().removed());
+
+        let recipe = d.path().join("app.yaml");
+        std::fs::write(&recipe, "id: app\n").unwrap();
+        let passed: RunResult = serde_json::from_str(PASSED).unwrap();
+        let mut ledger = TenantLedger::load(d.path());
+        ledger.record_run("app", &recipe, SystemTime::now() + Duration::from_secs(5), TENANT, &passed, "t").unwrap();
+        assert_eq!(ledger.get("app").unwrap().created, "2026-11-23T10:05:00Z");
+        assert!(ledger.mark_removed("App"));
+        assert!(!ledger.mark_removed("app"), "already marked");
+        assert!(!ledger.mark_removed("other"));
+        assert!(matches!(ledger.status("app", &recipe), TenantStatus::Removed(_)));
+        // A record written before `created` existed still loads.
+        ledger.save().unwrap();
+        let text = std::fs::read_to_string(TenantLedger::path(d.path())).unwrap().replace("\"created\"", "\"createdX\"");
+        std::fs::write(TenantLedger::path(d.path()), text).unwrap();
+        assert_eq!(TenantLedger::load(d.path()).get("app").unwrap().created, "");
     }
 
     #[test]

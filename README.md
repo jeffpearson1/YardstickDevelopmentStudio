@@ -25,7 +25,7 @@ production pulls them once they are merged.
 | **Recipe Library** | Library of all shipped and `Recipes\Development` recipes, with filters, location and status badges, *New recipe*, *Copy to Development*, *Missing icons*, and *Update several…*. Clicking a recipe or *Open in Builder* adds it to the unified Recipe Builder working list and opens its Design/YAML/Test/Icon/Agent workspace there. |
 | **Recipe Library → Design** | Form-based editor whose field catalogue mirrors Yardstick's schema (`Test-RecipeSchema`) and the skill's guidance. Fields are grouped into steps, script fields get a highlighted PowerShell editor with optional line numbers, and it lints as you type. A field whose variable a download script assigns is not marked required; if the YAML leaves it blank it is shown read-only as *set by preDownloadScript* (or whichever script sets it). Saving keeps key order and writes scripts as literal blocks. It warns before dropping YAML comments; use the YAML tab to keep them. |
 | **Recipe Library → YAML** | Raw YAML with syntax highlighting and optional line numbers, kept in sync with Design. |
-| **Recipe Library → Test** | Runs the harness steps: Lint, Schema, Lab (download/package) and Install test (dry run or live). **Run all checks** runs all six steps in order, stops on failure, and pauses for explicit consent before the live install test. **Run safe checks** chains Lint, Schema and DryRun without installing anything. |
+| **Recipe Library → Test** | Runs the harness steps: Lint, Schema, Lab (download/package) and Install test (dry run or live). **Run all checks** runs all six steps in order, stops on failure, and pauses for explicit consent before the live install test. **Run safe checks** chains Lint, Schema and DryRun without installing anything. With *Tenant validation* switched on in Settings, a separate **Tenant** card can run the recipe through Yardstick on your own Intune tenant as a test app named `YDS TEST - <name>` (see [Tenant validation](#tenant-validation-optional)). |
 | **Recipe Library → Icon** | The icon finder, which replaces Yardstick's `Get-YardstickIcon.ps1`, filled in for the open recipe. It shows the recipe's current icon, and searches the web by itself only when there is no usable one. It searches installer resources (EXE/MSI), Wikidata/Commons, Chocolatey, the vendor site (manifest, touch icon, favicon) and image search in parallel, scores each result for relevance and merges duplicates. Preview on checker/dark/light backgrounds, clean it up (background removal, trim, square, margin), save it to `Icons\` and set `iconFile`. Also opens for a request item, from the library's *Missing icons*, or with `--icons "<app>"`. |
 | **Recipe Builder → Agent** | Runs the `yardstick-recipes` skill on the open recipe through GitHub Copilot CLI, Claude Code or OpenAI Codex: Fix, Review, Update or Freeform. Fix and Update can **Test and repair automatically**: Studio runs every harness stage and returns recipe failures to the agent, up to five test attempts by default. Live install/uninstall checks require explicit run consent. Review is read-only. Every run is also kept in **Recipe Builder** as a one-item request (*fix app*, *review app*, …) with its status and test results, and *Run agent on this* there repeats the same task; the request you have open in Recipe Builder is not replaced. |
 | **Recipe Builder** | A persistent working list unifies individual recipes, existing Library recipes and imported batches. Its left pane adds existing recipes, opens the inline new-recipe form, imports a file or pastes text; entries can be selected, removed, or cleared after confirmation. Removing the recipe open in the editor also closes its editor; unsaved work offers **Save and remove**, **Discard edits and remove**, **Keep in editor**, or cancel. The batch overview can **Complete all remaining**, **Complete selected**, or **Complete this recipe**. A running batch can pause after its active recipe. Requests sent to a plugin remain **in plugin** rather than appearing done; running, attention, approval and completion states roll back into the list, and **Open in…** / **Back to Recipe Builder** return to the exact linked work. Opening an existing recipe keeps the list and progress visible while exposing **Design**, **YAML**, **Test**, **Icon**, and **Agent**; *Batch overview* returns to the remaining work. **Save**, **Save as…** and **Load…** preserve lists under `%APPDATA%\YardstickStudio\batches`. Opening another list offers to append it, save and replace, replace without saving, or cancel. Imported formats include ServiceNow/JSON, CSV/TSV, Excel `xlsx/xls/ods`, YAML, text/Markdown/email, HTML and Word `docx`; quick scan and optional agent extraction find the software, version, vendor URL and ticket. One consent dialog covers a run's live tests, and system-context tests share one UAC prompt per run. |
@@ -60,6 +60,27 @@ See [docs/DESIGN.md](docs/DESIGN.md) for the architecture and the safety model.
   desktop app unpacks its CLI to) and re-reads `PATH`, so one installed while it is open is found.
   Setup can install a missing one with winget and check that it is signed in.
 - Optional: the GitHub CLI (`gh`), to open pull requests directly from Publish.
+
+## Tenant validation (optional)
+
+Off by default. The live install test proves a recipe on this PC, but only a run against a tenant shows how
+Intune treats the upload, detection rules and assignments. When you want that before publishing:
+
+1. **Settings → Tenant validation:** switch it on, enter the tenant id (and optionally its name), and name the test
+   group(s). Choose what happens afterwards: deploy to the test group and leave the app, upload it unassigned and
+   leave it, or remove it (with an option to be asked first).
+2. **Connect this clone to Intune…** runs Yardstick's installer in a console and lists the clone under Trusted
+   development folders. Answer **No** when it asks about a scheduled task. *Check connection* then signs in
+   read-only and reports anything that would stop a run.
+3. On a development recipe's **Test** tab, **Run on tenant…** shows exactly what will happen and needs your
+   confirmation each time.
+
+The app is created as `YDS TEST - <name>`, so it cannot change a real app's versions or assignments. Studio
+temporarily adds an entry for the recipe to `Local\recipeOverrides.yaml`, forces the test groups, and puts the file
+back afterwards (even after a crash). A test app can be removed from the result card; only the app a run created
+can be removed. The result is shown on the Test tab, in the recipe's header and in the Publish dialog, for your
+information. Publishing never requires it. A clone that is connected must have `syncSharedContent` off and no
+scheduled task running Yardstick from it.
 
 ## Plugins
 

@@ -9,7 +9,9 @@
    test bench.
 3. Make it impossible to damage production by accident. Yardstick deploys to a real Intune
    tenant, so the Studio is structurally unable to write to, test in, or run agents in a
-   production folder.
+   production folder. The one way the Studio ever reaches a tenant is the optional, off-by-default
+   *tenant validation* (see *Safety model*), which runs only from a development clone the user has
+   connected and trusted.
 4. Be a single self-contained native executable, written in Rust.
 
 ## Architecture
@@ -37,7 +39,9 @@ yardstick-studio.exe
     ├─ setup.rs          Install-Yardstick -Status / -DevelopmentOnly -NonInteractive commands and their JSON results
     ├─ tenant.rs         optional tenant validation: the gate every tenant action passes (`ensure_ready`), the
     │                    read-only connection preflight (embedded PowerShell, GET-only, run with `-File` and a JSON
-    │                    input), and the command that connects a clone to Intune. Runs and removal are still to come
+    │                    input), and the command that connects a clone to Intune
+    ├─ tenant/run.rs     the run (one Yardstick command, temporary override staged and restored), removal of the
+    │                    one test app a run recorded, and the informational `tenant-validated.json` ledger
     ├─ git.rs            git clone/fetch/pull (ff-only) and ahead/behind status; finds git after a PATH refresh
     ├─ update.rs         self-update: latest GitHub release, SHA-256-verified MSI download, install-and-relaunch helper
     ├─ plugin.rs         plugins: plugin.yaml manifest + validation, zip install/update/uninstall with integrity
@@ -81,6 +85,9 @@ dispatches on `JobKind`:
 - plugin step jobs read their `result.json` into the work item's record (or into the catalog
   page); plugin agent jobs record what the agent changed, what stopped it and whether it wrote
   the files the task expects. Both release the work item's lock;
+- tenant jobs (`TenantCheck`, `TenantRun`, `TenantRemove`) block every other run through `workflow::busy`. A
+  finished run puts the staged overrides back, records the result in the tenant ledger, and, when the user chose
+  *Remove it after the run*, opens the removal dialog or starts the removal; a finished removal marks the ledger;
 - git fetch/pull jobs refresh the ahead/behind status (a pull also rescans recipes and reloads an
   unedited open recipe); shared-sync jobs rescan icons and re-lint.
 - git switch jobs (from the footer's branch menu) do the same as a pull; git push jobs refresh
@@ -326,6 +333,34 @@ Enforcement:
   clean filter can rewrite a recipe as it is committed). Yardstick's required `Recipe
   evidence` check rejects a recipe whose evidence is missing, unvalidated or for other
   contents, unless a maintainer labels the pull request `evidence-waived`.
+- **Tenant validation (optional, off by default).** *Run on tenant* on a recipe's Test tab runs the real
+  `Yardstick.ps1` for one recipe against the user's own tenant. Every layer is enforced in core
+  (`tenant::ensure_ready`, `tenant::run`), not in the UI:
+  1. The clone must be a **trusted** development folder that is a full instance (`developmentOnly: false`;
+     `Workspace::tenant_connected`). Production, development-only and unconfigured clones are refused, and the
+     development-only setup is refused on a connected clone so it cannot switch the connection off.
+  2. The user names the tenant (a GUID); the clone's stored credential and the connected organization must both
+     match it (and the name, if given). A preflight also fails on `syncSharedContent: true` (the temporary override
+     would sync to the share) and on a scheduled task that runs Yardstick from the clone (it would deploy every
+     recipe there, Development included).
+  3. A per-run consent dialog, never persisted and never part of batch or workflow automation. It names the
+     tenant, the test app, the groups and what happens afterwards.
+  4. One fixed command, `Yardstick.ps1 -ApplicationId <id> -NoEmail -NoDelete` (`-Force` only on request). Never
+     `-All`, `-Group` or `-Repair`; asserted by a test on the script.
+  5. **Isolation.** A temporary entry for the recipe in `Local\recipeOverrides.yaml` renames the app
+     `YDS TEST - <name>` (Yardstick matches versions by exact display name, so it cannot reach a real app's
+     versions, assignments or supersedence; the prefix has no brackets because `-like` reads them as a character
+     class), forces `defaultDeploymentGroups` to the test groups (or none), and turns supersedence and
+     auto-update off. The original file is backed up byte for byte, restored when the run ends, and restored at the
+     next start if the Studio died mid-run; an edit made since is never overwritten. The script refuses to run
+     Yardstick unless that override is in place.
+  6. **Removal** is a separate script that deletes exactly one app: the id a Studio run recorded. It re-reads the
+     app and refuses unless it is a Win32 app, its name still starts with `YDS TEST - `, and it was created when the
+     run recorded. It never searches or deletes by name.
+  7. Results go in their own ledger (`_studio\tenant-validated.json`) and the Test tab, Publish dialog and recipe
+     badge. They never change `Tests/RecipeEvidence/<id>.json` or Yardstick's CI gate: validating on a tenant stays
+     optional.
+  Agents remain forbidden from `Yardstick.ps1`, Graph and `git push`; none of this is reachable from an agent run.
 - **Agent guardrails.** Agents run in the development workspace only, and their file
   tools are confined to it (`--add-dir`, no `--allow-all-paths`). The shell tool may not
   run `Yardstick.ps1`, `Invoke-Yardstick`, `Publish-Yardstick.ps1` or `git push`. Review
