@@ -521,6 +521,7 @@ fn confirm_modal(app: &mut StudioApp, ctx: &egui::Context) {
     let ids: Vec<String> = app.promote.selected.iter().cloned().collect();
     let incomplete = ids.iter().any(|id| !app.completion(id).is_complete());
     let base = app.promote.repo.as_ref().and_then(|(_, r, _)| r.as_ref().ok()).map(|r| r.base.clone()).unwrap_or_else(|| "main".into());
+    let tenant_lines = super::tenant::publish_lines(app, &ids);
     let mut go = false;
     let mut cancel = false;
     let mut save_settings = false;
@@ -594,6 +595,17 @@ fn confirm_modal(app: &mut StudioApp, ctx: &egui::Context) {
                     }
                 }
             });
+        }
+        if !tenant_lines.is_empty() {
+            ui.add_space(8.0);
+            ui.label(RichText::new("Tenant validation (optional)").strong());
+            ui.label(RichText::new("For your information only: publishing does not need it, and the pull request does not mention it.").small().weak());
+            for (id, text) in &tenant_lines {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(id).monospace());
+                    ui.label(text);
+                });
+            }
         }
         ui.add_space(6.0);
         ui.horizontal(|ui| {

@@ -157,6 +157,8 @@ pub enum JobKind {
     /// A real Yardstick run of one recipe on the tenant. `dir` holds the staged
     /// overrides to put back when it ends; `result` is the report it writes.
     TenantRun { recipe_id: String, dir: PathBuf, result: PathBuf },
+    /// Removal of the one test app a tenant run recorded.
+    TenantRemove { recipe_id: String, result: PathBuf },
     /// A plugin step; `dir` is its work item, or the plugin's work root.
     PluginStep { plugin: String, dir: PathBuf, step: String, result: PathBuf, risk: ystudio_core::plugin::Risk, purpose: views::plugin_page::Purpose },
     /// An agent task of a plugin, working in a work item's folder.
@@ -1374,6 +1376,7 @@ impl StudioApp {
             JobKind::InstallTool => views::tools::install_finished(self, ok),
             JobKind::TenantCheck { result } => views::tenant::check_finished(self, ok, &result),
             JobKind::TenantRun { recipe_id, dir, result } => views::tenant::run_finished(self, &recipe_id, &dir, &result, ok, started),
+            JobKind::TenantRemove { recipe_id, result } => views::tenant::remove_finished(self, &recipe_id, ok, &result),
             JobKind::PluginStep { plugin, dir, step, result, purpose, .. } => {
                 views::plugin_page::step_finished(self, id, &plugin, &dir, &step, &result, purpose);
             }
@@ -2024,6 +2027,7 @@ impl StudioApp {
         views::batch::modals(self, &ctx);
         views::testbench::live_modal(self, &ctx);
         views::tenant::run_modal(self, &ctx);
+        views::tenant::remove_dialog(self, &ctx);
         views::promote::modals(self, &ctx);
         crate::workflow::modal(self, &ctx);
         views::plugin_page::modals(self, &ctx);

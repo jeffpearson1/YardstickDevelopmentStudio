@@ -33,6 +33,17 @@ pub struct TenantState {
     modal: Option<RunModal>,
     /// The last run's result for each recipe, this session.
     last: BTreeMap<String, RunResult>,
+    /// The confirmation in front of removing a test app from Intune.
+    remove_modal: Option<RemoveModal>,
+    /// The most recent removal job.
+    remove_job: Option<u64>,
+}
+
+/// The confirmation for removing one test app.
+struct RemoveModal {
+    id: String,
+    app_name: String,
+    app_id: String,
 }
 
 /// The consent dialog for one tenant run.
@@ -355,6 +366,26 @@ pub fn status_badge(app: &StudioApp, ui: &mut Ui, id: &str) {
     }
 }
 
+/// One line per recipe about its tenant run, for the Publish dialog. Empty when
+/// the feature is off. Purely informational.
+pub fn publish_lines(app: &StudioApp, ids: &[String]) -> Vec<(String, String)> {
+    if !app.settings.tenant.enabled {
+        return Vec::new();
+    }
+    ids.iter()
+        .map(|id| {
+            let text = match status(app, id) {
+                None | Some(TenantStatus::NotRun) => "Not run on the tenant.".to_string(),
+                Some(TenantStatus::Passed(r)) => format!("Passed on the tenant on {}.", r.tested),
+                Some(TenantStatus::Failed(r)) => format!("The last tenant run found a problem: {}", r.problem),
+                Some(TenantStatus::Changed(r)) => format!("Ran on the tenant on {}, but has changed since.", r.tested),
+                Some(TenantStatus::Removed(r)) => format!("Passed on the tenant on {}; the test app was removed.", r.tested),
+            };
+            (id.clone(), text)
+        })
+        .collect()
+}
+
 fn running(app: &StudioApp) -> bool {
     app.tenant_ui.job.and_then(|j| app.job(j)).is_some_and(|j| j.proc.is_running())
 }
@@ -460,7 +491,11 @@ pub fn run_modal(app: &mut StudioApp, ctx: &egui::Context) {
                 ("Tenant", tenant_label),
                 ("App in Intune", run::test_display_name(&m.name)),
                 ("Assigned to", assigned),
-                ("Afterwards", "The app stays in Intune until you remove it.".to_string()),
+                ("Afterwards", match (t.after_run, t.ask_before_remove) {
+                    (TenantAfterRun::Remove, true) => "You will be asked, then the test app is removed.",
+                    (TenantAfterRun::Remove, false) => "The test app is removed as soon as the run ends.",
+                    _ => "The app stays in Intune until you remove it.",
+                }.to_string()),
             ] {
                 ui.label(label);
                 ui.add(egui::Label::new(RichText::new(value).semibold()).wrap());
@@ -570,10 +605,87 @@ pub fn run_finished(app: &mut StudioApp, recipe_id: &str, dir: &Path, result_pat
     }
     app.tenant_ui.last.insert(key, result);
     refresh_status(app);
+    // "Remove it after the run": clean up whatever app the run created, pass or fail.
+    if app.settings.tenant.after_run == TenantAfterRun::Remove && let Some(record) = app.tenant_ui.ledger.get(recipe_id).filter(|r| !r.app_id.is_empty() && !r.removed).cloned() {
+        if app.settings.tenant.ask_before_remove {
+            app.tenant_ui.remove_modal = Some(RemoveModal { id: recipe_id.to_string(), app_name: record.app_name, app_id: record.app_id });
+        } else {
+            start_remove(app, recipe_id);
+        }
+    }
+}
+
+/// Starts removing the test app the last run of `id` recorded. Callers have the
+/// user's confirmation: the removal dialog, or the "remove after the run"
+/// choice they confirmed in the run dialog.
+fn start_remove(app: &mut StudioApp, id: &str) {
+    let Some(ws) = app.ws.clone() else { return };
+    let Some(record) = app.tenant_ui.ledger.get(id).cloned() else { return app.error(format!("No tenant run of {id} is recorded, so there is nothing to remove.")) };
+    let prepared = match run::remove_spec(&ws, &app.settings.tenant, &record, TenantConsent::Confirmed, &app.pwsh(), &tenant::work_dir()) {
+        Ok(p) => p,
+        Err(e) => return app.error(format!("{e:#}")),
+    };
+    let kind = JobKind::TenantRemove { recipe_id: id.to_string(), result: prepared.result };
+    if let Some(job) = app.start_job(prepared.spec, kind) {
+        app.tenant_ui.remove_job = Some(job);
+        app.console_open = true;
+        app.notify(format!("Removing {} from Intune…", record.app_name));
+    }
+}
+
+/// A removal ended: record it, or say why nothing was removed.
+pub fn remove_finished(app: &mut StudioApp, recipe_id: &str, ok: bool, result_path: &Path) {
+    let result = run::RemoveResult::read(result_path);
+    let _ = std::fs::remove_file(result_path);
+    match result {
+        Ok(r) if r.removed() => {
+            if app.tenant_ui.ledger.mark_removed(recipe_id)
+                && let Err(e) = app.tenant_ui.ledger.save()
+            {
+                app.error(format!("The test app was removed, but recording it failed: {e:#}"));
+            }
+            refresh_status(app);
+            app.notify(r.summary());
+        }
+        Ok(r) => app.error(format!("Nothing was removed: {}", r.summary())),
+        Err(e) if ok => app.error(format!("{e:#}")),
+        Err(_) => app.error("The removal stopped before it could report. Check Intune for the test app."),
+    }
+}
+
+/// The confirmation in front of removing a test app.
+pub fn remove_dialog(app: &mut StudioApp, ctx: &egui::Context) {
+    let Some(m) = &app.tenant_ui.remove_modal else { return };
+    let (id, app_name, app_id) = (m.id.clone(), m.app_name.clone(), m.app_id.clone());
+    let who = {
+        let t = &app.settings.tenant;
+        if t.tenant_name.trim().is_empty() { t.tenant_id.trim().to_string() } else { t.tenant_name.trim().to_string() }
+    };
+    let busy = crate::workflow::busy(app);
+    let mut remove = false;
+    let mut cancel = false;
+    egui::Modal::new(egui::Id::unique("tenant-remove-modal")).show(ctx, |ui| {
+        ui.set_max_width(520.0);
+        ui.label(RichText::new("\u{E74D}  Remove the test app?").heading().color(theme::red()));
+        ui.label(format!("This deletes {app_name} from {who}. It removes only that app and nothing else; its recipe is not touched."));
+        ui.label(RichText::new(format!("Intune app id {app_id}")).small().monospace().weak());
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            remove = ui.add_enabled(!busy, egui::Button::new(RichText::new("Remove from Intune").color(theme::red()))).clicked();
+            cancel = ui.button("Keep it").clicked();
+        });
+    });
+    if cancel {
+        app.tenant_ui.remove_modal = None;
+    }
+    if remove {
+        app.tenant_ui.remove_modal = None;
+        start_remove(app, &id);
+    }
 }
 
 /// The latest tenant run of `id`: what it found, and the app it left behind.
-pub fn result_card(app: &StudioApp, ui: &mut Ui, id: &str) {
+pub fn result_card(app: &mut StudioApp, ui: &mut Ui, id: &str) {
     if !app.settings.tenant.enabled {
         return;
     }
@@ -583,6 +695,11 @@ pub fn result_card(app: &StudioApp, ui: &mut Ui, id: &str) {
     if last.is_none() && record.is_none() {
         return;
     }
+    // A test app that is still in Intune can be removed, if nothing else is running.
+    let removable = record.filter(|r| !r.app_id.is_empty() && !r.removed).map(|r| (r.app_name.clone(), r.app_id.clone()));
+    let can_remove = removable.is_some() && !crate::workflow::busy(app) && app.ws.as_ref().is_some_and(|w| tenant::ensure_ready(w, &app.settings.tenant, "remove a test app").is_ok());
+    let removed = record.is_some_and(|r| r.removed);
+    let mut remove = false;
     theme::card(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Latest tenant run").semibold());
@@ -593,6 +710,17 @@ pub fn result_card(app: &StudioApp, ui: &mut Ui, id: &str) {
                 (None, Some(r)) if r.passed => theme::badge(ui, "Passed", theme::green()),
                 (None, _) => theme::badge(ui, "Failed", theme::red()),
             };
+            if removed {
+                theme::badge(ui, "Test app removed", theme::grey());
+            }
+            if removable.is_some() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    remove = ui
+                        .add_enabled(can_remove, egui::Button::new("\u{E74D}  Remove from tenant…"))
+                        .on_hover_text("Deletes this test app from Intune. Only the app this run created can be removed.")
+                        .clicked();
+                });
+            }
         });
         let (name, version, app_id, groups, problems): (String, String, String, Vec<String>, Vec<String>) = match (last, record) {
             (Some(r), _) => {
@@ -623,14 +751,14 @@ pub fn result_card(app: &StudioApp, ui: &mut Ui, id: &str) {
             });
         }
     });
+    if remove && let Some((app_name, app_id)) = removable {
+        app.tenant_ui.remove_modal = Some(RemoveModal { id: id.to_string(), app_name, app_id });
+    }
 }
 
-/// The most recent job for the Test tab's log: a check or a tenant run.
+/// The most recent job for the Test tab's log: a check, a tenant run or a removal.
 pub fn latest_job(app: &StudioApp, harness_job: Option<u64>) -> Option<u64> {
-    match (harness_job, app.tenant_ui.job) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (a, b) => a.or(b),
-    }
+    [harness_job, app.tenant_ui.job, app.tenant_ui.remove_job].into_iter().flatten().max()
 }
 
 #[cfg(test)]
@@ -796,6 +924,81 @@ mod tests {
         app.recipe.as_mut().unwrap().text.push_str("# edit\n");
         assert!(super::run_readiness(&app).unwrap_err().contains("Save the recipe"));
         render(&mut app, "tenant-bench-card-dirty", 1400, 900);
+    }
+
+    /// A finished run's result, written where the job would have left it.
+    fn finished_run(app: &mut crate::app::StudioApp, dir: &tempfile::TempDir) {
+        let run_dir = dir.path().join("run-dir");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let result = run_dir.join("result.json");
+        std::fs::write(&result, PASSED).unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        super::run_finished(app, "app", &run_dir, &result, true, later);
+    }
+
+    #[test]
+    fn remove_after_the_run_asks_first_or_goes_straight_to_the_removal() {
+        let (dir, mut app) = fake_app();
+        connect(&dir, &mut app);
+        app.settings.tenant.after_run = ystudio_core::settings::TenantAfterRun::Remove;
+        // Asking: the dialog opens, nothing starts.
+        app.settings.tenant.ask_before_remove = true;
+        finished_run(&mut app, &dir);
+        assert!(app.tenant_ui.ledger.get("app").is_some_and(|r| r.passed && !r.app_id.is_empty()));
+        let modal = app.tenant_ui.remove_modal.as_ref().expect("asks before removing");
+        assert_eq!((modal.app_name.as_str(), modal.id.as_str()), ("YDS TEST - App", "app"));
+        assert!(app.jobs.is_empty());
+        render(&mut app, "tenant-remove-dialog", 1400, 900);
+        app.tenant_ui.remove_modal = None;
+        // Not asking: the removal starts at once. This clone has no Yardstick modules,
+        // so the script's own checks stop it before anything is sent to Intune.
+        app.settings.tenant.ask_before_remove = false;
+        finished_run(&mut app, &dir);
+        let job = app.tenant_ui.remove_job.expect("removal started");
+        assert!(crate::workflow::busy(&app), "a removal blocks other runs");
+        finish(&mut app, job);
+        assert!(!app.tenant_ui.ledger.get("app").unwrap().removed, "a refused removal removes nothing");
+        assert!(app.tenant_ui.remove_modal.is_none());
+    }
+
+    #[test]
+    fn a_leave_it_run_never_offers_removal_and_a_removal_is_recorded() {
+        let (dir, mut app) = fake_app();
+        connect(&dir, &mut app);
+        app.settings.tenant.after_run = ystudio_core::settings::TenantAfterRun::LeaveInTestGroup;
+        finished_run(&mut app, &dir);
+        assert!(app.tenant_ui.remove_modal.is_none() && app.jobs.is_empty());
+        // The result card offers it by hand.
+        app.open_recipe(&dir.path().join(r"Recipes\Development\app.yaml"));
+        app.view = View::TestBench;
+        render(&mut app, "tenant-result-removable", 1400, 900);
+        // A "Removed" report marks the ledger and the badge.
+        let report = dir.path().join("removed.json");
+        std::fs::write(&report, r#"{"status": "Removed", "appId": "0f9c1c4e-1111-4222-8333-444455556666", "appName": "YDS TEST - App", "problems": []}"#).unwrap();
+        super::remove_finished(&mut app, "app", true, &report);
+        assert!(app.tenant_ui.ledger.get("app").unwrap().removed);
+        assert!(matches!(super::status(&app, "app"), Some(ystudio_core::tenant::run::TenantStatus::Removed(_))));
+        render(&mut app, "tenant-result-removed", 1400, 900);
+        // A refusal is reported and changes nothing.
+        let mut other = fake_app();
+        connect(&other.0, &mut other.1);
+        finished_run(&mut other.1, &other.0);
+        let refused = other.0.path().join("refused.json");
+        std::fs::write(&refused, r#"{"status": "Refused", "problems": ["The app is now called 'x', which is not a test app, so it was not removed."]}"#).unwrap();
+        super::remove_finished(&mut other.1, "app", false, &refused);
+        assert!(!other.1.tenant_ui.ledger.get("app").unwrap().removed);
+    }
+
+    #[test]
+    fn publish_lists_tenant_state_only_when_the_feature_is_on() {
+        let (dir, mut app) = fake_app();
+        connect(&dir, &mut app);
+        let ids = vec!["app".to_string()];
+        assert_eq!(super::publish_lines(&app, &ids)[0].1, "Not run on the tenant.");
+        finished_run(&mut app, &dir);
+        assert!(super::publish_lines(&app, &ids)[0].1.starts_with("Passed on the tenant"));
+        app.settings.tenant.enabled = false;
+        assert!(super::publish_lines(&app, &ids).is_empty());
     }
 
     #[test]
