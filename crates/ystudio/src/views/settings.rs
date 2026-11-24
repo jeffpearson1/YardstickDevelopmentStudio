@@ -12,7 +12,7 @@ use ystudio_core::process::which;
 use ystudio_core::settings::Settings;
 
 use crate::app::StudioApp;
-use crate::theme;
+use crate::theme::{self, FluentText as _};
 
 pub struct SettingsState {
     production_text: String,
@@ -352,6 +352,59 @@ pub fn downloads_checkbox(app: &mut StudioApp, ui: &mut Ui) {
     let r = ui.checkbox(&mut app.settings.agent_downloads, "Allow the agent to download and inspect installers").on_hover_text(hover);
     if r.changed() {
         app.save_settings();
+    }
+}
+
+/// One quiet line naming how the next run will go ("Copilot CLI · CLI default ·
+/// live tests · 5 attempts"); clicking it opens the options for this run. The
+/// agent choices are the saved defaults Settings shows; `workflow` adds the
+/// session's test options (live tests, attempts).
+pub fn run_options(app: &mut StudioApp, ui: &mut Ui, salt: &str, workflow: bool) {
+    let mut parts = vec![app.settings.agent_backend.label().to_string()];
+    let model = app.settings.agent_model.trim();
+    parts.push(if model.is_empty() { "CLI default".into() } else { model.to_string() });
+    if app.settings.agent_backend.supports_multi_agent() && app.settings.agent_multi {
+        parts.push(format!("{} at once", app.settings.agent_parallel));
+    }
+    if workflow {
+        let o = &app.workflow.options;
+        parts.push(if o.live { "live tests".into() } else { "safe checks only".into() });
+        parts.push(format!("{} attempt{}", o.attempts, if o.attempts == 1 { "" } else { "s" }));
+    }
+    let summary = format!("\u{E713}  {}", parts.join(" · "));
+    let button = ui.add(egui::Button::new(RichText::new(summary).small()).frame(false))
+        .on_hover_text("Agent and test options for this run. Agent defaults are kept in Settings.");
+    let popup_id = egui::Id::unique(("run-options", salt));
+    // Choosing from a dropdown inside the popover opens another popup layer,
+    // which egui counts as a click outside; close only on clicks that land on
+    // the page itself.
+    let shown = egui::Popup::from_toggle_button_response(&button)
+        .id(popup_id)
+        .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
+        .layout(egui::Layout::top_down(egui::Align::Min))
+        .frame(egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(12)))
+        .show(|ui| {
+            ui.set_min_width(360.0);
+            ui.label(RichText::new("Agent").semibold());
+            agent_picker(app, ui, salt);
+            downloads_checkbox(app, ui);
+            if workflow {
+                ui.add_space(6.0);
+                ui.label(RichText::new("Tests").semibold());
+                crate::workflow::configure(&mut app.workflow.options, ui, true);
+            }
+        });
+    if let Some(shown) = shown {
+        let rect = shown.response.rect;
+        let outside = ui.ctx().input(|i| {
+            i.pointer.any_click() && i.pointer.interact_pos().is_some_and(|p| !rect.contains(p) && !button.rect.contains(p))
+        });
+        let on_page = ui.ctx().input(|i| i.pointer.interact_pos())
+            .and_then(|p| ui.ctx().layer_id_at(p))
+            .is_none_or(|layer| matches!(layer.order, egui::Order::Background | egui::Order::Middle));
+        if outside && on_page {
+            egui::Popup::close_id(ui.ctx(), popup_id);
+        }
     }
 }
 
