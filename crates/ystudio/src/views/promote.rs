@@ -90,9 +90,6 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     }
     super::production_banner(app, ui);
     theme::page_title(ui, "Publish");
-    ui.label(RichText::new(
-        "Each selected recipe goes to GitHub as a pull request. Production picks it up once the pull request is merged.",
-    ).weak());
     ui.add_space(6.0);
     let repo = repo(app);
     poll_pull_requests(app);
@@ -175,7 +172,11 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             1 => "\u{E898}  Open pull request…".to_string(),
             n => format!("\u{E898}  Open {n} pull requests…"),
         };
-        if theme::primary(ui, ready, label).on_disabled_hover_text("Select development recipes in a writable clone of the GitHub repository.").clicked() {
+        if theme::primary(ui, ready, label)
+            .on_hover_text("Each selected recipe goes to GitHub as a pull request. Production picks it up once the pull request is merged.")
+            .on_disabled_hover_text("Select development recipes in a writable clone of the GitHub repository.")
+            .clicked()
+        {
             app.refresh_runs();
             app.promote.modal = true;
         }

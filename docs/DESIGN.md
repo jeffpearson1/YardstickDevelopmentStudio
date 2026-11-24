@@ -102,6 +102,13 @@ the open recipe has unsaved edits, never forces, and warns about uncommitted tra
 `Recipes\Development` is git-ignored, so work there stays put. Branch names are validated before
 they reach git, so a name can never be read as an option.
 
+**Status bar.** Besides the branch, the status bar carries what no page needs to repeat: the
+workspace's kind and path (its menu opens another folder or a recent one, reloads, shows the
+folder in Explorer, runs the shared-content sync, and trusts a full install as development),
+and, away from the recipe tabs, the open recipe (amber with `●` when it has unsaved edits),
+which returns to it. Home therefore shows only what blocks work (production, not set up, no
+agent skill) above its three actions and a recipe search.
+
 Plugin work-item stages are written as `Running` before their external process starts. If that
 state cannot be saved, nothing runs. When a plugin work root is first opened in a new Studio
 session, a persisted `Running` stage without a matching live job is reconciled to `Interrupted`;
