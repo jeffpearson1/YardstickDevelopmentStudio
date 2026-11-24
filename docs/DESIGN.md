@@ -350,7 +350,9 @@ Enforcement:
   5. **Isolation.** A temporary entry for the recipe in `Local\recipeOverrides.yaml` renames the app
      `YDS TEST - <name>` (Yardstick matches versions by exact display name, so it cannot reach a real app's
      versions, assignments or supersedence; the prefix has no brackets because `-like` reads them as a character
-     class), forces `defaultDeploymentGroups` to the test groups (or none), and turns supersedence and
+     class), forces `defaultDeploymentGroups` to the test groups' ids (or none: Yardstick hands the list to Graph as
+     group ids, so *Run on tenant* first runs the read-only connection check, which resolves each configured name to
+     exactly one group, and stages only those ids; `run::resolved_group_ids` refuses anything unresolved), and turns supersedence and
      auto-update off. The original file is backed up byte for byte, restored when the run ends, and restored at the
      next start if the Studio died mid-run; an edit made since is never overwritten. The script refuses to run
      Yardstick unless that override is in place.

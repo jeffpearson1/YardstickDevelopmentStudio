@@ -92,6 +92,7 @@ pub fn run_spec(
     tenant: &TenantSettings,
     recipe_id: &str,
     options: RunOptions,
+    resolved_groups: &[GroupInfo],
     consent: TenantConsent,
     pwsh: &Path,
     base: &Path,
@@ -113,10 +114,11 @@ pub fn run_spec(
     };
     let app_name = test_display_name(&display_name);
     let assign = tenant.after_run.assigns();
-    let groups: Vec<String> = if assign { tenant.test_groups.iter().map(|g| g.trim().to_string()).filter(|g| !g.is_empty()).collect() } else { Vec::new() };
-    if assign && groups.is_empty() {
+    if assign && tenant.test_groups.iter().all(|g| g.trim().is_empty()) {
         bail!("Name at least one test group under Settings → Tenant validation, or choose to upload without assignments.");
     }
+    // Yardstick assigns `defaultDeploymentGroups` by id; Graph refuses a name.
+    let groups = if assign { resolved_group_ids(tenant, resolved_groups)? } else { Vec::new() };
 
     let stamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis());
     let dir = base.join("runs").join(format!("run-{stamp}-{recipe_id}"));
@@ -151,6 +153,31 @@ pub fn run_spec(
         .arg(result.to_string_lossy())
         .env("NO_COLOR", "1");
     Ok(PreparedRun { spec, result, dir, app_name })
+}
+
+fn is_guid(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.iter().map(|p| p.len()).eq([8, 4, 4, 4, 12]) && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// The configured test groups as the ids the connection check resolved them to.
+/// Yardstick passes `defaultDeploymentGroups` straight to Graph as group ids, so
+/// a run is staged only with ids, and only when every configured group (a
+/// display name or an id) resolved to exactly one group.
+pub fn resolved_group_ids(tenant: &TenantSettings, resolved: &[GroupInfo]) -> Result<Vec<String>> {
+    let mut ids: Vec<String> = Vec::new();
+    for wanted in tenant.test_groups.iter().map(|g| g.trim()).filter(|g| !g.is_empty()) {
+        let Some(group) = resolved.iter().find(|g| g.input.trim().eq_ignore_ascii_case(wanted) || g.id.eq_ignore_ascii_case(wanted)) else {
+            bail!("The test group '{wanted}' was not resolved to a group id, so nothing was uploaded. Check the tenant connection in Settings.");
+        };
+        if !is_guid(&group.id) {
+            bail!("The test group '{wanted}' resolved to '{}', which is not a group id.", group.id);
+        }
+        if !ids.iter().any(|id| id.eq_ignore_ascii_case(&group.id)) {
+            ids.push(group.id.clone());
+        }
+    }
+    Ok(ids)
 }
 
 // ---- the temporary override ----------------------------------------------------
@@ -613,8 +640,15 @@ mod tests {
         TenantSettings { enabled: true, tenant_id: TENANT.into(), test_groups: vec!["Intune App Testers".into()], ..Default::default() }
     }
 
+    const GROUP_ID: &str = "0b0e2f1c-7b1a-4e33-9d43-6f0f6f1a2b3c";
+
+    /// What the connection check reports for `enabled()`'s test group.
+    fn resolved() -> Vec<GroupInfo> {
+        vec![GroupInfo { input: "Intune App Testers".into(), id: GROUP_ID.into(), name: "Intune App Testers".into() }]
+    }
+
     fn run(ws: &Workspace, t: &TenantSettings, base: &Path, consent: TenantConsent) -> Result<PreparedRun> {
-        run_spec(ws, t, "app", RunOptions::default(), consent, Path::new("pwsh.exe"), base)
+        run_spec(ws, t, "app", RunOptions::default(), &resolved(), consent, Path::new("pwsh.exe"), base)
     }
 
     fn overrides(ws: &Workspace) -> String {
@@ -628,8 +662,8 @@ mod tests {
         let err = |r: Result<PreparedRun>| format!("{:#}", r.err().expect("should refuse"));
         assert!(err(run(&ws, &enabled(), base.path(), TenantConsent::None)).contains("explicit confirmation"));
         assert!(err(run(&ws, &TenantSettings { enabled: false, ..enabled() }, base.path(), TenantConsent::Confirmed)).contains("switched off"));
-        assert!(err(run_spec(&ws, &enabled(), "Bad Id", RunOptions::default(), TenantConsent::Confirmed, Path::new("pwsh"), base.path())).contains("not a valid recipe id"));
-        assert!(err(run_spec(&ws, &enabled(), "nope", RunOptions::default(), TenantConsent::Confirmed, Path::new("pwsh"), base.path())).contains("Recipes\\Development"));
+        assert!(err(run_spec(&ws, &enabled(), "Bad Id", RunOptions::default(), &resolved(), TenantConsent::Confirmed, Path::new("pwsh"), base.path())).contains("not a valid recipe id"));
+        assert!(err(run_spec(&ws, &enabled(), "nope", RunOptions::default(), &resolved(), TenantConsent::Confirmed, Path::new("pwsh"), base.path())).contains("Recipes\\Development"));
         assert!(err(run(&ws, &TenantSettings { test_groups: vec![], ..enabled() }, base.path(), TenantConsent::Confirmed)).contains("test group"));
         // Refusals touch nothing.
         assert!(!overrides_path(&ws).exists());
@@ -646,6 +680,30 @@ mod tests {
     }
 
     #[test]
+    fn an_assigned_run_is_staged_only_with_resolved_group_ids() {
+        let (_d, ws) = connected();
+        let base = tempfile::tempdir().unwrap();
+        let err = |r: Result<PreparedRun>| format!("{:#}", r.err().expect("should refuse"));
+        let with = |groups: &[GroupInfo]| run_spec(&ws, &enabled(), "app", RunOptions::default(), groups, TenantConsent::Confirmed, Path::new("pwsh"), base.path());
+        // Nothing resolved, another group resolved, or something that is not an id.
+        assert!(err(with(&[])).contains("not resolved"));
+        assert!(err(with(&[GroupInfo { input: "Other".into(), id: GROUP_ID.into(), name: "Other".into() }])).contains("not resolved"));
+        assert!(err(with(&[GroupInfo { input: "Intune App Testers".into(), id: "Intune App Testers".into(), name: String::new() }])).contains("not a group id"));
+        assert!(!overrides_path(&ws).exists());
+        // Names match case-insensitively, and a configured id matches itself.
+        let ids = resolved_group_ids(
+            &TenantSettings { test_groups: vec!["intune app testers".into(), GROUP_ID.to_uppercase()], ..enabled() },
+            &[GroupInfo { input: "Intune App Testers".into(), id: GROUP_ID.into(), name: String::new() }],
+        )
+        .unwrap();
+        assert_eq!(ids, vec![GROUP_ID.to_string()]);
+        // An unassigned run needs no groups at all.
+        let unassigned = TenantSettings { after_run: TenantAfterRun::LeaveUnassigned, ..enabled() };
+        let u = run_spec(&ws, &unassigned, "app", RunOptions::default(), &[], TenantConsent::Confirmed, Path::new("pwsh"), base.path()).unwrap();
+        restore_overrides(&u.dir).unwrap();
+    }
+
+    #[test]
     fn the_command_line_is_fixed_and_carries_no_recipe_or_tenant_text() {
         let (_d, ws) = connected();
         let base = tempfile::tempdir().unwrap();
@@ -658,10 +716,10 @@ mod tests {
         assert_eq!(input["testDisplayName"], "YDS TEST - 7-Zip");
         assert_eq!(input["assign"], true);
         assert_eq!(input["force"], false);
-        assert_eq!(input["groups"][0], "Intune App Testers");
+        assert_eq!(input["groups"][0], GROUP_ID);
         assert_eq!(std::fs::read_to_string(prepared.dir.join(RUN_FILE)).unwrap(), RUN_SCRIPT);
         // -Force only when asked, and the unassigned modes send no groups.
-        let forced = run_spec(&ws, &enabled(), "app", RunOptions { force_reupload: true }, TenantConsent::Confirmed, Path::new("pwsh"), base.path()).unwrap();
+        let forced = run_spec(&ws, &enabled(), "app", RunOptions { force_reupload: true }, &resolved(), TenantConsent::Confirmed, Path::new("pwsh"), base.path()).unwrap();
         let forced_input: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(forced.dir.join("input.json")).unwrap()).unwrap();
         assert_eq!(forced_input["force"], true);
         restore_overrides(&forced.dir).unwrap();
@@ -685,7 +743,8 @@ mod tests {
         let staged: Value = serde_yaml::from_str(&overrides(&ws)).unwrap();
         let app = &staged["app"];
         assert_eq!(app["displayName"], "YDS TEST - 7-Zip");
-        assert_eq!(app["defaultDeploymentGroups"][0], "Intune App Testers");
+        // Yardstick hands these to Graph as group ids; a display name is refused there.
+        assert_eq!(app["defaultDeploymentGroups"][0], GROUP_ID);
         assert_eq!(app["supersedence"], false);
         assert_eq!(app["autoUpdateOnAssignment"], false);
         // The user's own fields and other recipes survive the run.

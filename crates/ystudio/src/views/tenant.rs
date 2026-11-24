@@ -37,6 +37,9 @@ pub struct TenantState {
     remove_modal: Option<RemoveModal>,
     /// The most recent removal job.
     remove_job: Option<u64>,
+    /// A confirmed run (recipe id, -Force) waiting for the connection check that
+    /// resolves its test groups to ids.
+    pending_run: Option<(String, bool)>,
 }
 
 /// The confirmation for removing one test app.
@@ -290,13 +293,18 @@ pub fn check_finished(app: &mut StudioApp, ok: bool, result: &Path) {
         Err(e) => CheckState::Failed(format!("{e:#}")),
     };
     let _ = std::fs::remove_file(result);
-    if let CheckState::Done(report) = &app.tenant_ui.check {
-        let summary = report.summary();
-        if report.passed() {
-            app.notify(summary);
-        } else {
-            app.error(summary);
-        }
+    let pending = app.tenant_ui.pending_run.take();
+    let (passed, summary, groups) = match &app.tenant_ui.check {
+        CheckState::Done(report) => (report.passed(), report.summary(), report.groups.clone()),
+        CheckState::Failed(why) => (false, why.clone(), Vec::new()),
+        _ => (false, String::new(), Vec::new()),
+    };
+    match pending {
+        // A confirmed run was waiting for this check.
+        Some((id, force)) if passed => start_run(app, &id, force, &groups),
+        Some(_) => app.error(format!("The tenant connection check did not pass, so nothing was uploaded: {summary}")),
+        None if passed => app.notify(summary),
+        None => app.error(summary),
     }
 }
 
@@ -531,13 +539,25 @@ pub fn run_modal(app: &mut StudioApp, ctx: &egui::Context) {
         app.tenant_ui.modal = None;
     }
     if start && let Some(m) = app.tenant_ui.modal.take() {
-        start_run(app, &m.id, m.force);
+        // Yardstick assigns test groups by id, so the read-only connection check
+        // runs first and resolves them; the run starts when it passes.
+        app.tenant_ui.pending_run = Some((m.id, m.force));
+        start_check(app);
+        match &app.tenant_ui.check {
+            CheckState::Running => app.notify("Checking the tenant connection and test groups before uploading…"),
+            CheckState::Failed(why) => {
+                let why = format!("The tenant connection check could not start, so nothing was uploaded: {why}");
+                app.tenant_ui.pending_run = None;
+                app.error(why);
+            }
+            _ => app.tenant_ui.pending_run = None,
+        }
     }
 }
 
-fn start_run(app: &mut StudioApp, id: &str, force: bool) {
+fn start_run(app: &mut StudioApp, id: &str, force: bool, groups: &[tenant::GroupInfo]) {
     let Some(ws) = app.ws.clone() else { return };
-    let prepared = match run::run_spec(&ws, &app.settings.tenant, id, RunOptions { force_reupload: force }, TenantConsent::Confirmed, &app.pwsh(), &tenant::work_dir()) {
+    let prepared = match run::run_spec(&ws, &app.settings.tenant, id, RunOptions { force_reupload: force }, groups, TenantConsent::Confirmed, &app.pwsh(), &tenant::work_dir()) {
         Ok(p) => p,
         Err(e) => return app.error(format!("{e:#}")),
     };
@@ -843,6 +863,13 @@ mod tests {
         app.refresh_recipes();
     }
 
+    const TESTERS_ID: &str = "0b0e2f1c-7b1a-4e33-9d43-6f0f6f1a2b3c";
+
+    /// What the connection check reports for `connect`'s test group.
+    fn testers() -> Vec<ystudio_core::tenant::GroupInfo> {
+        vec![ystudio_core::tenant::GroupInfo { input: "Testers".into(), id: TESTERS_ID.into(), name: "Testers".into() }]
+    }
+
     fn finish(app: &mut crate::app::StudioApp, job: u64) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
         while app.job(job).unwrap().proc.is_running() && std::time::Instant::now() < deadline {
@@ -865,7 +892,7 @@ mod tests {
         // A Yardstick.ps1 that would leave a trace if the run ever reached it.
         std::fs::write(dir.path().join("Yardstick.ps1"), "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'ran.txt') -Value ran").unwrap();
 
-        super::start_run(&mut app, "app", false);
+        super::start_run(&mut app, "app", false, &testers());
         let job = app.tenant_ui.job.expect("the run should have started");
         assert!(crate::workflow::busy(&app), "a tenant run blocks other runs");
         // While it runs, the overrides hold the temporary test entry.
@@ -883,6 +910,33 @@ mod tests {
         assert!(ystudio_core::tenant::run::recover_interrupted(&ystudio_core::tenant::work_dir()).is_empty(), "nothing is left to recover");
     }
 
+    /// A confirmed run waits for the connection check, and starts only when it
+    /// passes, with the group ids it resolved rather than the names in Settings.
+    #[test]
+    fn a_confirmed_run_waits_for_the_check_and_stages_group_ids() {
+        let (dir, mut app) = fake_app();
+        connect(&dir, &mut app);
+        let overrides = dir.path().join("Local").join("recipeOverrides.yaml");
+        let report = dir.path().join("check.json");
+        // A failed check: nothing starts and the pending run is dropped.
+        app.tenant_ui.pending_run = Some(("app".into(), false));
+        std::fs::write(&report, r#"{"ok": false, "tenant": null, "groups": [], "checks": [{"id": "groups", "level": "Fail", "detail": "0 group(s) match 'Testers'"}]}"#).unwrap();
+        super::check_finished(&mut app, true, &report);
+        assert!(app.jobs.is_empty() && !overrides.exists() && app.tenant_ui.pending_run.is_none());
+        // A passed check: the run starts with the resolved id staged.
+        app.tenant_ui.pending_run = Some(("app".into(), false));
+        let passed = format!(
+            r#"{{"ok": true, "tenant": {{"id": "11111111-2222-3333-4444-555555555555", "name": "Contoso"}}, "groups": [{{"input": "Testers", "id": "{TESTERS_ID}", "name": "Testers"}}], "checks": []}}"#
+        );
+        std::fs::write(&report, passed).unwrap();
+        super::check_finished(&mut app, true, &report);
+        let job = app.tenant_ui.job.expect("the run should have started after the check");
+        let staged = std::fs::read_to_string(&overrides).unwrap();
+        assert!(staged.contains(TESTERS_ID) && !staged.contains("- Testers"), "{staged}");
+        finish(&mut app, job);
+        assert!(!overrides.exists(), "the overrides are put back");
+    }
+
     #[test]
     fn a_run_is_refused_without_consent_before_anything_changes() {
         let (dir, mut app) = fake_app();
@@ -890,12 +944,12 @@ mod tests {
         let overrides = dir.path().join("Local").join("recipeOverrides.yaml");
         // Feature off: start_run goes through the same gate and starts nothing.
         app.settings.tenant.enabled = false;
-        super::start_run(&mut app, "app", false);
+        super::start_run(&mut app, "app", false, &testers());
         assert!(app.jobs.is_empty() && !overrides.exists());
         // Production: the same.
         app.settings.tenant.enabled = true;
         app.ws = Some(Workspace::open(dir.path(), &[dir.path().to_path_buf()], &[]).unwrap());
-        super::start_run(&mut app, "app", false);
+        super::start_run(&mut app, "app", false, &testers());
         assert!(app.jobs.is_empty() && !overrides.exists());
     }
 
