@@ -863,6 +863,14 @@ mod tests {
         app.refresh_recipes();
     }
 
+    /// Tenant runs share the process-wide work folder, so tests that start one
+    /// (and check that nothing is left to recover) take turns.
+    static RUNS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn one_run_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        RUNS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     const TESTERS_ID: &str = "0b0e2f1c-7b1a-4e33-9d43-6f0f6f1a2b3c";
 
     /// What the connection check reports for `connect`'s test group.
@@ -884,6 +892,7 @@ mod tests {
     /// before anything reaches the tenant, which is exactly what must be safe.
     #[test]
     fn a_run_that_a_guard_stops_uploads_nothing_and_restores_the_overrides() {
+        let _turn = one_run_at_a_time();
         let (dir, mut app) = fake_app();
         connect(&dir, &mut app);
         let overrides = dir.path().join("Local").join("recipeOverrides.yaml");
@@ -914,6 +923,7 @@ mod tests {
     /// passes, with the group ids it resolved rather than the names in Settings.
     #[test]
     fn a_confirmed_run_waits_for_the_check_and_stages_group_ids() {
+        let _turn = one_run_at_a_time();
         let (dir, mut app) = fake_app();
         connect(&dir, &mut app);
         let overrides = dir.path().join("Local").join("recipeOverrides.yaml");
