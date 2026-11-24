@@ -87,6 +87,7 @@ fn strip_bom(bytes: &[u8]) -> &[u8] {
 
 /// Builds the run: checks every gate, stages the overrides, writes the script
 /// and its input, and returns the process. `base` is [`super::work_dir`].
+#[allow(clippy::too_many_arguments)]
 pub fn run_spec(
     ws: &Workspace,
     tenant: &TenantSettings,
