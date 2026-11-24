@@ -487,7 +487,7 @@ pub fn build_command(
             spec = claude_stream(spec).args(["-p", &prompt, "--add-dir", &root, "--permission-mode", "acceptEdits", "--allowedTools", &allowed]);
             spec = spec.arg("--disallowedTools").arg(denied.join(" "));
         }
-        AgentBackend::Codex => spec = spec.args(codex_args(&prompt, &root, task.writes(), model, options)),
+        AgentBackend::Codex => spec = spec.args(codex_args(&prompt, &root, task.writes(), model, options)).stderr_is_progress(),
     }
     if !model.trim().is_empty() && backend != AgentBackend::Codex {
         spec = spec.args(["--model", model.trim()]);
@@ -554,7 +554,7 @@ pub fn build_extract_command(backend: AgentBackend, model: &str, batch_dir: &Pat
             spec = spec.args(["--allowedTools", tools, "--disallowedTools", "Bash Edit"]);
         }
         // Reading a list needs no downloads, so Codex keeps its sandbox.
-        AgentBackend::Codex => spec = spec.args(codex_args(&prompt, &dir, true, model, AgentOptions { downloads: false, ..options })),
+        AgentBackend::Codex => spec = spec.args(codex_args(&prompt, &dir, true, model, AgentOptions { downloads: false, ..options })).stderr_is_progress(),
     }
     if !model.trim().is_empty() && backend != AgentBackend::Codex {
         spec = spec.args(["--model", model.trim()]);
@@ -851,7 +851,7 @@ pub fn build_plugin_command(
             spec = claude_stream(spec).args(["-p", &prompt, "--add-dir", &dir, "--permission-mode", "acceptEdits", "--allowedTools", &allowed]);
             spec = spec.arg("--disallowedTools").arg(blocked.join(" "));
         }
-        AgentBackend::Codex => spec = spec.args(codex_args(&prompt, &dir, true, model, options)),
+        AgentBackend::Codex => spec = spec.args(codex_args(&prompt, &dir, true, model, options)).stderr_is_progress(),
     }
     if !model.trim().is_empty() && backend != AgentBackend::Codex {
         spec = spec.args(["--model", model.trim()]);
@@ -1230,10 +1230,14 @@ mod tests {
         assert!(spec.args.windows(2).any(|w| w == ["-s", "read-only"]), "a review only reads");
         assert!(spec.args.windows(2).any(|w| w == ["-m", "gpt-x"]) && !spec.args.contains(&"--model".to_string()));
         assert!(spec.usage.is_none());
+        // `codex exec` writes its activity to stderr and only the final message to stdout,
+        // so stderr is progress here: dimmed, not painted as an error.
+        assert!(spec.stderr_is_progress, "Codex activity on stderr must not show as errors");
         let prompt = spec.args.last().unwrap();
         assert!(prompt.contains("Hard rules set by the Studio") && !prompt.contains("coordinator"), "Codex gets no coordinator instructions");
         let fix = build_command(&ws, AgentBackend::Codex, "", &[], &AgentTask::Fix { id: "x".into(), evidence: String::new(), notes: String::new() }, AgentOptions::default()).unwrap();
         assert!(fix.args.windows(2).any(|w| w == ["-s", "workspace-write"]));
+        assert!(fix.stderr_is_progress);
 
         let d = tempfile::tempdir().unwrap();
         let (plugin, work) = sample_plugin(d.path());
@@ -1242,6 +1246,7 @@ mod tests {
         assert_eq!(spec.cwd, work);
         assert!(spec.args.windows(2).any(|w| w[0] == "-C" && w[1] == work.to_string_lossy()), "{:?}", spec.args);
         assert!(spec.args.last().unwrap().contains("Only create or modify files inside"));
+        assert!(spec.stderr_is_progress);
     }
 
     #[test]
