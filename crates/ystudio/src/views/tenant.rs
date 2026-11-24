@@ -416,33 +416,30 @@ pub fn bench_card(app: &mut StudioApp, ui: &mut Ui, id: &str) {
     let active = running(app);
     let mut open = false;
     let mut stop = false;
-    theme::card(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("\u{E753}").size(18.0).color(theme::blue()));
-            ui.label(RichText::new("Tenant (optional)").semibold());
-            status_badge(app, ui, id);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if active {
-                    stop = ui.button("\u{E71A}  Stop").on_hover_text("Cancelling mid-upload can leave a partly uploaded app in Intune.").clicked();
-                } else {
-                    open = ui.add_enabled(readiness.is_ok(), egui::Button::new("Run on tenant…")).clicked();
-                }
-            });
-        });
-        ui.label(
-            RichText::new(
-                "Uploads this recipe to your Intune tenant as a test app through a real Yardstick run. \
-                 It is never part of Run all checks, and Publish does not need it.",
-            )
-            .small()
-            .weak(),
+    // A row of the Test tab's checklist, set apart by a rule: optional, and
+    // never part of Run all checks.
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.set_min_height(30.0);
+        ui.label(RichText::new("\u{E753}").size(16.0).color(theme::blue()));
+        ui.label("Tenant (optional)").on_hover_text(
+            "Uploads this recipe to your Intune tenant as a test app through a real Yardstick run. \
+             It is never part of Run all checks, and Publish does not need it.",
         );
-        if let Err(why) = &readiness
-            && !active
-        {
-            ui.label(RichText::new(why).small().color(theme::amber()));
-        }
+        status_badge(app, ui, id);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if active {
+                stop = ui.button("\u{E71A}  Stop").on_hover_text("Cancelling mid-upload can leave a partly uploaded app in Intune.").clicked();
+            } else {
+                open = ui.add_enabled(readiness.is_ok(), egui::Button::new("Run on tenant…")).clicked();
+            }
+        });
     });
+    if let Err(why) = &readiness
+        && !active
+    {
+        ui.label(RichText::new(why).small().color(theme::amber()));
+    }
     if stop && let Some(job) = app.tenant_ui.job.and_then(|j| app.job_mut(j)) {
         job.proc.cancel();
     }

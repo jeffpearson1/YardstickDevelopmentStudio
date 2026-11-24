@@ -336,28 +336,30 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                 ui.add(egui::TextEdit::multiline(&mut st.draft.evidence).code_editor().desired_rows(6).desired_width(ui.available_width()));
             }
             ui.add_space(6.0);
-            ui.label("Agent and model");
-            ui.add_enabled_ui(!running, |ui| {
-                super::settings::agent_picker(app, ui, "agent-tab");
-                super::settings::downloads_checkbox(app, ui);
-            });
-            ui.collapsing("Guardrails", |ui| {
-                ui.label(RichText::new(
-                    "The agent prefers vendor internet downloads; software dropbox is a last resort. It may only write \
-                     inside this workspace and run safe checks. Studio owns live tests, requires consent, and sends \
-                     recipe failures back for bounded repairs. Production, publishing and git push remain denied.",
-                ).small());
-            });
             let st = &mut app.agent;
             let task = st.task();
             let can_verify = task.as_ref().ok().and_then(crate::workflow::task_id).is_some();
             if can_verify {
                 ui.add_enabled(!running, egui::Checkbox::new(&mut st.auto_test, "Test and repair automatically"));
-                if st.auto_test {
-                    ui.add_enabled_ui(!running, |ui| crate::workflow::configure(&mut app.workflow.options, ui, true));
-                }
             }
-            ui.checkbox(&mut st.show_prompt, "Show the full prompt");
+            let with_tests = can_verify && app.agent.auto_test;
+            ui.add_enabled_ui(!running, |ui| super::settings::run_options(app, ui, "agent-tab", with_tests));
+            ui.add_space(6.0);
+            if let Err(why) = &task {
+                ui.label(RichText::new(*why).weak());
+            }
+            let can_run = task.is_ok() && app.writable() && !running;
+            let start = theme::primary(ui, can_run, RichText::new("\u{E99A}  Start agent")).on_hover_text(
+                "The agent prefers vendor internet downloads; software dropbox is a last resort. It may only write \
+                 inside this workspace and run safe checks. Studio owns live tests, requires consent, and sends \
+                 recipe failures back for bounded repairs. Production, publishing and git push remain denied.",
+            );
+            let st = &mut app.agent;
+            ui.add_space(4.0);
+            let toggle = if st.show_prompt { "Hide the full prompt" } else { "Show the full prompt" };
+            if ui.add(egui::Button::new(RichText::new(toggle).small()).frame(false)).clicked() {
+                st.show_prompt = !st.show_prompt;
+            }
             if st.show_prompt
                 && let Ok(t) = &task
             {
@@ -365,12 +367,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                 // `&mut &str` is a read-only buffer that can still be selected and copied.
                 ui.add(egui::TextEdit::multiline(&mut prompt.as_str()).code_editor().desired_rows(10).desired_width(ui.available_width()));
             }
-            ui.add_space(6.0);
-            if let Err(why) = &task {
-                ui.label(RichText::new(*why).weak());
-            }
-            let can_run = task.is_ok() && app.writable() && !running;
-            if theme::primary(ui, can_run, RichText::new("\u{E99A}  Start agent")).clicked() {
+            if start.clicked() {
                 let task = task.unwrap();
                 // The prompt goes to History, then the form is ready for the next one.
                 remember_prompt(app);
