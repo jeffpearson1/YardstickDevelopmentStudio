@@ -741,26 +741,27 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui, tab: u16) {
     let m = &c.plugin.manifest;
     let host_actions = m.page.effective_host_actions();
     ui.horizontal(|ui| {
-        theme::page_title(ui, &m.name);
-        ui.label(RichText::new(format!("{} · {}", m.version, m.publisher)).weak());
+        // What the plugin is for is on the title; the page itself is for doing it.
+        let title = theme::page_title(ui, &m.name);
+        if !m.description.is_empty() {
+            title.on_hover_text(&m.description);
+        }
+        ui.label(RichText::new(format!("{} · {}", m.version, m.publisher)).small().weak());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if host_actions.contains(&HostAction::Settings)
-                && ui.button("\u{E713}  Plugin settings").on_hover_text("Open this plugin in Yardstick Development Studio Settings").clicked()
+                && ui.button("\u{E713}").on_hover_text("Plugin settings").clicked()
             {
                 open_plugin_settings(app, &id);
             }
             if host_actions.contains(&HostAction::WorkFolder)
                 && let Some(root) = &c.root
-                && ui.button("\u{E838}  Work folder").clicked()
+                && ui.button("\u{E838}").on_hover_text("Open the work folder").clicked()
             {
                 let _ = std::fs::create_dir_all(root);
                 super::open_in_explorer(root);
             }
         });
     });
-    if !m.description.is_empty() {
-        ui.label(RichText::new(&m.description).weak());
-    }
     ui.add_space(6.0);
     let health = match &c.plugin.health {
         Health::Ok => None,
@@ -1041,35 +1042,32 @@ fn item_detail(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem) {
     recipe_work_panels(app, ui, c, item);
     theme::section_heading(ui, "Pipeline");
     if m.agent.as_ref().is_some_and(|a| !a.tasks.is_empty()) {
-        egui::CollapsingHeader::new("Agent options").id_salt(("plugin-agent-options", &id)).default_open(false).show(ui, |ui| {
-            let agent_available = if has_private_workspace(app, &id) { !isolated_agent_conflict(app, &id) } else { !crate::workflow::busy(app) };
-            ui.add_enabled_ui(agent_available, |ui| {
-                super::settings::agent_picker(app, ui, &format!("plugin-{id}"));
-                super::settings::downloads_checkbox(app, ui);
-            });
-        });
+        let agent_available = if has_private_workspace(app, &id) { !isolated_agent_conflict(app, &id) } else { !crate::workflow::busy(app) };
+        ui.add_enabled_ui(agent_available, |ui| super::settings::run_options(app, ui, &format!("plugin-{id}"), false));
+        ui.add_space(4.0);
     }
     let busy_elsewhere = if has_private_workspace(app, &id) { isolated_agent_conflict(app, &id) } else { crate::workflow::busy(app) };
     if m.has_automatic_stages() {
         automation_controls(app, ui, c, item, running.is_some(), busy_elsewhere);
         ui.add_space(8.0);
     }
+    // A row per stage rather than a card: what a stage does is on its name;
+    // what it did (the summary and outputs) stays visible under it.
     for stage in m.pipeline() {
         let rec = item.step(stage.id());
         let state = if running.as_ref().is_some_and(|(_, s)| s == stage.id()) { StepState::Running } else { rec.state };
-        theme::card(ui, |ui| {
+        ui.separator();
+        ui.scope(|ui| {
             // Wide enough, the button sits at the right of the heading; otherwise under it.
             if ui.available_width() > 520.0 {
                 ui.horizontal(|ui| {
+                    ui.set_min_height(30.0);
                     stage_heading(ui, stage, state);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| stage_button(app, ui, c, item, stage, state, running.is_some(), busy_elsewhere));
                 });
             } else {
                 ui.horizontal_wrapped(|ui| stage_heading(ui, stage, state));
                 ui.horizontal(|ui| stage_button(app, ui, c, item, stage, state, running.is_some(), busy_elsewhere));
-            }
-            if !stage.description().is_empty() {
-                ui.label(RichText::new(stage.description()).weak());
             }
             if !rec.summary.is_empty() {
                 let color = match rec.state {
@@ -1390,15 +1388,15 @@ fn routing_panels(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem, it
             && (!completed.is_empty() || (!active.is_empty() && (active.len() > 1 || !routed.is_empty())));
         let mut action = None;
 
-        theme::section_heading(ui, "Product routing");
-        ui.label(
-            RichText::new(format!(
+        theme::section_heading_about(
+            ui,
+            "Product routing",
+            &format!(
                 "Keep products that belong in {} here. Send reusable applications to Recipe Builder before this workflow continues.",
                 c.plugin.manifest.name
-            ))
-            .weak(),
+            ),
         );
-        ui.add_space(6.0);
+        ui.add_space(2.0);
         if needs_review {
             theme::banner(ui, theme::amber(), |ui| {
                 ui.horizontal_wrapped(|ui| {
@@ -1571,15 +1569,15 @@ fn recipe_work_panels(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkItem
             Ok(rows) if !rows.is_empty() => rows,
             _ => continue,
         };
-        theme::section_heading(ui, "Recipe Builder work");
-        ui.label(
-            RichText::new(format!(
+        theme::section_heading_about(
+            ui,
+            "Recipe Builder work",
+            &format!(
                 "Recipe Builder owns research, recipe authoring and safe checks. {} receives the checked recipe and then continues its specialist workflow.",
                 c.plugin.manifest.name
-            ))
-            .weak(),
+            ),
         );
-        ui.add_space(6.0);
+        ui.add_space(2.0);
         for row in rows {
             let product_id = routed_product_id(&row);
             let name = Some(row_field(&row, &["name", "title", "app"])).filter(|value| !value.is_empty()).unwrap_or_else(|| product_id.clone());
@@ -1632,22 +1630,32 @@ fn automation_controls(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkIte
     let default_note = "Runs stages the plugin explicitly marks safe, one at a time. Stops before approvals, installs, tenant changes and manual work.";
     let mut start = false;
     let mut pause = false;
-    theme::banner(ui, color, |ui| {
+    // Idle, it is just the action; a coloured bar only once there is a state to report.
+    let quiet = record.state == AutomationState::Idle && record.note.is_empty();
+    let body = |ui: &mut Ui, start: &mut bool, pause: &mut bool| {
         ui.horizontal_wrapped(|ui| {
             if record.state == AutomationState::Running && item_running {
                 ui.spinner();
-                ui.label(if record.note.is_empty() { "Running safe stagesâ€¦" } else { &record.note });
-                pause = ui.button("Pause after this stage").clicked();
+                ui.label(if record.note.is_empty() { "Running safe stages…" } else { &record.note });
+                *pause = ui.button("Pause after this stage").clicked();
             } else {
                 let label = if record.state == AutomationState::Idle { "Run safe stages" } else { "Continue safe stages" };
                 let can_start = !item_running && !busy_elsewhere;
-                start = theme::primary(ui, can_start, format!("\u{E768}  {label}"))
+                *start = theme::primary(ui, can_start, format!("\u{E768}  {label}"))
+                    .on_hover_text(default_note)
                     .on_disabled_hover_text(if item_running { "Wait for the current stage to finish." } else { "Another agent or test is running." })
                     .clicked();
-                ui.label(if record.note.is_empty() { default_note } else { &record.note });
+                if !record.note.is_empty() {
+                    ui.label(&record.note);
+                }
             }
         });
-    });
+    };
+    if quiet {
+        body(ui, &mut start, &mut pause);
+    } else {
+        theme::banner(ui, color, |ui| body(ui, &mut start, &mut pause));
+    }
     if pause {
         set_automation(
             app,
@@ -1667,7 +1675,10 @@ fn automation_controls(app: &mut StudioApp, ui: &mut Ui, c: &Ctx, item: &WorkIte
 /// A pipeline row's state, name, risk and gate.
 fn stage_heading(ui: &mut Ui, stage: Stage<'_>, state: StepState) {
     state_badge(ui, state);
-    ui.label(RichText::new(stage.label()).semibold());
+    let name = ui.label(RichText::new(stage.label()).semibold());
+    if !stage.description().is_empty() {
+        name.on_hover_text(stage.description());
+    }
     match stage {
         Stage::Task(_) => {
             theme::badge(ui, "Agent", theme::blue());
