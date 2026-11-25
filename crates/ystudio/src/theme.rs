@@ -522,6 +522,16 @@ pub fn section_heading(ui: &mut Ui, text: &str) {
     ui.add_space(4.0);
 }
 
+/// A section heading whose explanation waits behind an info mark, for
+/// sections people see every day rather than once.
+pub fn section_heading_about(ui: &mut Ui, text: &str, about: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(text).heading());
+        ui.label(RichText::new("\u{E946}").color(palette().info)).on_hover_text(about);
+    });
+    ui.add_space(4.0);
+}
+
 /// An accent (primary) button. Disabled accent buttons fall back to the
 /// neutral disabled look, as in WinUI.
 pub fn primary(ui: &mut Ui, enabled: bool, text: impl Into<WidgetText>) -> Response {
