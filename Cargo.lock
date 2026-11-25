@@ -4498,7 +4498,7 @@ dependencies = [
 
 [[package]]
 name = "ystudio"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -4521,7 +4521,7 @@ dependencies = [
 
 [[package]]
 name = "ystudio-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "calamine",
