@@ -402,9 +402,12 @@ Enforcement:
 5. **Recipe Builder.** Its persistent left-hand working list holds existing recipes, new recipe
    drafts and every software item from imported batches. Add existing recipes through the
    Library, compose one inline, or import/paste a request list; opening another list offers
-   append or save/replace. Selecting an existing recipe keeps the working list visible and opens
-   its Design, YAML, Test, Icon and Agent tabs in the right pane; *Batch overview* returns without
-   losing progress. Complete all remaining recipes, a checked subset, or one recipe, and pause a
+   append or save/replace. The list is the page's only navigation: its first row is the list's
+   overview (name and how many are left), and selecting an existing recipe keeps the list visible
+   and opens its Design, YAML, Test, Icon and Agent tabs in the right pane without losing
+   progress. Saving, opening, reporting and clearing the list live in its `⋯` menu, and the
+   agent and test options for a run open from a one-line summary under the actions (the agent
+   defaults are the ones Settings keeps). Complete all remaining recipes, a checked subset, or one recipe, and pause a
    running batch after its active recipe to inspect or repair work manually. Removing the open
    recipe closes its editor; dirty edits require Save, Discard, Keep in editor, or Cancel. Save and Load preserve the complete session. Review extracted items
    (optionally *Extract with agent*) → find missing icons → *Run agent on N selected* →
