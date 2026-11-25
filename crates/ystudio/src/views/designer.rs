@@ -77,52 +77,43 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         });
     }
 
-    // Stepper.
+    // The steps run down the side column, each marked with its problems; the
+    // form keeps the full width.
     let diags = r.diagnostics.clone();
-    ui.horizontal_wrapped(|ui| {
-        for (i, s) in Section::ALL.iter().enumerate() {
-            let errs = diags.iter().filter(|d| d.severity == Severity::Error && section_of(d) == Some(*s)).count();
-            let warns = diags.iter().filter(|d| d.severity == Severity::Warning && section_of(d) == Some(*s)).count();
-            let mark = if errs > 0 {
-                RichText::new(format!("{}. {} \u{EA39}", i + 1, s.title())).color(theme::red())
-            } else if warns > 0 {
-                RichText::new(format!("{}. {} \u{E7BA}", i + 1, s.title())).color(theme::amber())
-            } else {
-                RichText::new(format!("{}. {}", i + 1, s.title()))
-            };
-            if ui.add(egui::Button::selectable(r.section == i, mark.size(14.5))).clicked() {
-                r.section = i;
-            }
-            if i + 1 < Section::ALL.len() {
-                ui.label(RichText::new("›").weak());
-            }
-        }
-    });
-    ui.add_space(4.0);
     let section = Section::ALL[r.section.min(Section::ALL.len() - 1)];
-
-    egui::Panel::right("designer-guide").resizable(true).default_size(300.0).frame(theme::pane_frame()).show(ui, |ui| {
+    egui::Panel::right("designer-guide").resizable(true).default_size(260.0).size_range(200.0..=420.0).frame(theme::pane_frame()).show(ui, |ui| {
         egui::ScrollArea::vertical().id_salt("guide-scroll").show(ui, |ui| {
-            theme::section_heading(ui, section.title());
-            ui.label(section.guidance());
-            ui.add_space(8.0);
+            for (i, s) in Section::ALL.iter().enumerate() {
+                let errs = diags.iter().filter(|d| d.severity == Severity::Error && section_of(d) == Some(*s)).count();
+                let warns = diags.iter().filter(|d| d.severity == Severity::Warning && section_of(d) == Some(*s)).count();
+                let mut step = egui::Button::selectable(r.section == i, format!("{}. {}", i + 1, s.title()))
+                    .min_size(egui::vec2(ui.available_width(), 28.0));
+                if errs > 0 {
+                    step = step.right_text(RichText::new(format!("\u{EA39} {errs}")).color(theme::red()));
+                } else if warns > 0 {
+                    step = step.right_text(RichText::new(format!("\u{E7BA} {warns}")).color(theme::amber()));
+                }
+                if ui.add(step).clicked() {
+                    r.section = i;
+                }
+            }
+            ui.add_space(12.0);
+            ui.label(RichText::new(section.guidance()).small().weak());
             let here: Vec<&Diagnostic> = diags.iter().filter(|d| section_of(d) == Some(section)).collect();
             let general: Vec<&Diagnostic> = diags.iter().filter(|d| section_of(d).is_none()).collect();
             if !here.is_empty() {
+                ui.add_space(8.0);
                 ui.label(RichText::new("Problems in this step").semibold());
                 for d in here {
                     diag_line(ui, d);
                 }
             }
             if !general.is_empty() {
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 ui.label(RichText::new("Recipe-wide").semibold());
                 for d in general {
                     diag_line(ui, d);
                 }
-            }
-            if diags.is_empty() {
-                ui.colored_label(theme::green(), "\u{E73E}  No problems found by the Studio linter.");
             }
         });
     });
@@ -133,12 +124,12 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     let editor = EditorOpts { icons: &icons, font_size, dark, line_numbers, can_rename };
     theme::pane(ui, |ui| {
         egui::ScrollArea::vertical().id_salt(("designer-fields", r.section)).auto_shrink(false).show(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.checkbox(&mut r.show_all_fields, "Show all fields in this step");
+        let has_scripts = fields::fields_in(section).any(|s| matches!(s.kind, FieldKind::Script | FieldKind::Complex));
+        if has_scripts {
             ui.checkbox(&mut line_numbers, "Line numbers");
-            ui.label(RichText::new("Blank fields are removed so they inherit from preferences.yaml.").small().weak());
-        });
-        ui.add_space(4.0);
+            ui.add_space(4.0);
+        }
+        let mut hidden = 0;
         ui.add_enabled_ui(!locked, |ui| {
             for spec in fields::fields_in(section) {
                 let present = doc.contains(spec.name);
@@ -148,7 +139,11 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                 };
                 let catalog_required = is_required(spec.name, &doc);
                 let required = catalog_required && set_by.is_none();
-                if !(spec.common || r.show_all_fields || present || catalog_required || set_by.is_some()) {
+                let essential = spec.common || present || catalog_required || set_by.is_some();
+                if !essential {
+                    hidden += 1;
+                }
+                if !(essential || r.show_all_fields) {
                     continue;
                 }
                 let buf = r.designer_bufs.entry(spec.name.to_string()).or_default();
@@ -171,6 +166,20 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                 }
             }
         });
+        if hidden > 0 {
+            let text = if r.show_all_fields {
+                "Show only the usual fields".to_string()
+            } else {
+                format!("Show {hidden} more field{}", if hidden == 1 { "" } else { "s" })
+            };
+            if ui
+                .add(egui::Button::new(RichText::new(text).small()).frame(false))
+                .on_hover_text("Less common fields for this step. Blank fields are removed, so they inherit from preferences.yaml.")
+                .clicked()
+            {
+                r.show_all_fields = !r.show_all_fields;
+            }
+        }
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             if r.section > 0 && ui.button("← Back").clicked() {
@@ -285,20 +294,16 @@ struct FieldState<'a> {
 
 fn field_editor(ui: &mut Ui, spec: &FieldSpec, buf: &mut String, state: FieldState, diags: &[&Diagnostic], opts: &EditorOpts) -> bool {
     let mut changed = false;
-    let worst = diags.iter().map(|d| d.severity).min();
-    let frame_color = worst.map(theme::severity_color).unwrap_or(ui.visuals().widgets.noninteractive.bg_stroke.color);
     // A value only a script sets has nothing to edit here. When the YAML also has
     // one it stays editable: scripts commonly read it first (e.g. a landing-page url).
     let script_only = state.set_by.is_some() && !state.present;
-    egui::Frame::new()
-        .stroke(egui::Stroke::new(1.0, frame_color))
-        .corner_radius(6)
-        .inner_margin(egui::Margin::same(8))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
+    // Plain rows rather than a box per field: spacing separates them, and a
+    // field's own problems are listed under its input.
+    ui.scope(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(spec.name).monospace().strong());
-                if state.required {
+                // Only worth saying while there is nothing in it.
+                if state.required && buf.trim().is_empty() {
                     ui.label(RichText::new("required").small().color(theme::red()));
                 }
                 if let Some(script) = state.set_by {
@@ -322,7 +327,7 @@ fn field_editor(ui: &mut Ui, spec: &FieldSpec, buf: &mut String, state: FieldSta
                 ui.label(RichText::new(format!("{} {}", theme::severity_icon(d.severity), d.message)).color(theme::severity_color(d.severity)));
             }
         });
-    ui.add_space(4.0);
+    ui.add_space(14.0);
     changed
 }
 
@@ -355,15 +360,21 @@ fn field_input(ui: &mut Ui, spec: &FieldSpec, buf: &mut String, width: f32, opts
             });
         }
         FieldKind::Text if spec.name == "id" => {
-            changed |= ui.add(egui::TextEdit::singleline(buf).desired_width(width)).changed();
-            if opts.can_rename
-                && ui
-                    .button("\u{E8AC}  Rename file and id\u{2026}")
-                    .on_hover_text("The id must equal the file name; this renames both, and the icon when it is named after the recipe.")
-                    .clicked()
-            {
-                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique(RENAME), true));
-            }
+            // The id must equal the file name; Rename sits on the same row rather
+            // than as another line under every Identity step.
+            ui.horizontal(|ui| {
+                let rename = opts.can_rename;
+                let w = if rename { width - 96.0 } else { width };
+                changed |= ui.add(egui::TextEdit::singleline(buf).desired_width(w.max(120.0))).changed();
+                if rename
+                    && ui
+                        .button("\u{E8AC}  Rename\u{2026}")
+                        .on_hover_text("Renames the file and the id together, and the icon when it is named after the recipe.")
+                        .clicked()
+                {
+                    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique(RENAME), true));
+                }
+            });
         }
         FieldKind::Text | FieldKind::Int => {
             changed |= ui.add(egui::TextEdit::singleline(buf).desired_width(width)).changed();

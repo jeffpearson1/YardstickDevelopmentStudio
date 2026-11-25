@@ -29,7 +29,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         });
     }
 
-    egui::Panel::left("bench-steps").resizable(true).default_size(420.0).frame(theme::pane_frame()).show(ui, |ui| {
+    egui::Panel::left("bench-steps").resizable(true).default_size(360.0).frame(theme::pane_frame()).show(ui, |ui| {
         egui::ScrollArea::vertical().id_salt("bench-steps-scroll").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if theme::primary(ui, writable && !busy, RichText::new("\u{E768}  Run all checks"))
@@ -52,48 +52,47 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                     app.bench.queue.clear();
                 }
             });
-            ui.add_space(6.0);
+            ui.add_space(10.0);
+            // A checklist rather than a card per step: what each step runs is on hover.
             for step in Step::ALL {
                 let state = app.step_state(&id, step);
-                theme::card(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let (icon, color) = match state {
-                            None => ("\u{EA3A}", theme::grey()),
-                            Some(StepState::Running) => ("\u{F16A}", theme::blue()),
-                            Some(StepState::Pass) => ("\u{E73E}", theme::green()),
-                            Some(StepState::Warn) => ("\u{E7BA}", theme::amber()),
-                            Some(StepState::Fail) => ("\u{E711}", theme::red()),
-                        };
-                        ui.label(RichText::new(icon).color(color).size(18.0));
-                        let mut title = RichText::new(step.title()).semibold();
-                        if step == Step::Live {
-                            title = title.color(theme::red());
-                        }
-                        ui.label(title);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let enabled = !busy && (writable || step == Step::Lint);
-                            let label = if step == Step::Live { "Run live…" } else { "Run" };
-                            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
-                                if step == Step::Live {
-                                    app.run_steps(&[Step::Live]);
-                                } else {
-                                    app.bench.queue.clear();
-                                    app.bench.queue_recipe = Some(id.clone());
-                                    app.run_step(step);
-                                }
+                ui.horizontal(|ui| {
+                    ui.set_min_height(30.0);
+                    let (icon, color) = match state {
+                        None => ("\u{EA3A}", theme::grey()),
+                        Some(StepState::Running) => ("\u{F16A}", theme::blue()),
+                        Some(StepState::Pass) => ("\u{E73E}", theme::green()),
+                        Some(StepState::Warn) => ("\u{E7BA}", theme::amber()),
+                        Some(StepState::Fail) => ("\u{E711}", theme::red()),
+                    };
+                    ui.label(RichText::new(icon).color(color).size(16.0));
+                    let mut title = RichText::new(step.title());
+                    if step == Step::Live {
+                        title = title.color(theme::red());
+                    }
+                    let mut hover = step.detail().to_string();
+                    if step == Step::Live {
+                        hover += "\n\nA recipe is Validated only when every phase passes in one live run. A dry run proves the \
+                                  scripts, download and detection inputs, but not the installer itself.";
+                    }
+                    ui.label(title).on_hover_text(hover);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let enabled = !busy && (writable || step == Step::Lint);
+                        let label = if step == Step::Live { "Run live…" } else { "Run" };
+                        if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                            if step == Step::Live {
+                                app.run_steps(&[Step::Live]);
+                            } else {
+                                app.bench.queue.clear();
+                                app.bench.queue_recipe = Some(id.clone());
+                                app.run_step(step);
                             }
-                        });
+                        }
                     });
-                    ui.label(RichText::new(step.detail()).small().weak());
                 });
-                ui.add_space(2.0);
             }
+            ui.add_space(8.0);
             super::tenant::bench_card(app, ui, &id);
-            ui.add_space(6.0);
-            ui.label(RichText::new(
-                "A recipe is Validated only when every phase passes in one live run. A dry run proves the scripts, \
-                 download and detection inputs, but not the installer itself.",
-            ).small().weak());
         });
     });
 
