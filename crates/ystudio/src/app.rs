@@ -1577,36 +1577,29 @@ impl StudioApp {
             }
         }
         ui.spacing_mut().item_spacing.y = 6.0;
+    }
+
+    /// Away from the recipe tabs, the status bar names the open recipe (and
+    /// whether it has unsaved edits or lint errors) and goes back to it.
+    fn open_recipe_chip(&mut self, ui: &mut Ui) {
         let Some(r) = &self.recipe else { return };
-        let mut show_recipe = false;
-        ui.add_space(8.0);
+        if matches!(self.view, View::Designer | View::Editor | View::TestBench | View::Agent) {
+            return;
+        }
+        let errors = lint::count(&r.diagnostics, lint::Severity::Error);
+        let mut text = RichText::new(format!("{}  {}{}", theme::icon::EDIT, r.id, if r.dirty() { " ●" } else { "" }));
+        if r.dirty() {
+            text = text.color(theme::amber());
+        } else if errors > 0 {
+            text = text.color(theme::red());
+        }
+        let hover = match (r.dirty(), errors) {
+            (true, _) => "Back to this recipe - it has unsaved edits".to_string(),
+            (false, 0) => "Back to the open recipe".to_string(),
+            (false, n) => format!("Back to the open recipe - {n} lint error(s)"),
+        };
         ui.separator();
-        ui.add_space(8.0);
-        pad.show(ui, |ui| {
-            ui.label(RichText::new("Open recipe").small().weak());
-            let mut t = RichText::new(&r.id).semibold();
-            if r.dirty() {
-                t = RichText::new(format!("{} ●", r.id)).semibold().color(theme::amber());
-            }
-            if ui.link(t).on_hover_text("Back to this recipe").clicked() {
-                show_recipe = true;
-            }
-            let errors = lint::count(&r.diagnostics, lint::Severity::Error);
-            let warnings = lint::count(&r.diagnostics, lint::Severity::Warning);
-            ui.horizontal_wrapped(|ui| {
-                if errors > 0 {
-                    theme::badge(ui, format!("{errors} error(s)"), theme::red());
-                }
-                if warnings > 0 {
-                    theme::badge(ui, format!("{warnings} warning(s)"), theme::amber());
-                }
-                if errors == 0 && warnings == 0 {
-                    theme::badge(ui, "lint clean", theme::green());
-                }
-                views::recipe_status_badge(self, ui, &r.id);
-            });
-        });
-        if show_recipe && !matches!(self.view, View::Designer | View::Editor | View::TestBench | View::Agent) {
+        if ui.selectable_label(false, text).on_hover_text(hover).clicked() {
             self.view = View::Designer;
         }
     }
@@ -1615,21 +1608,23 @@ impl StudioApp {
         // Every item uses the Caption style so the row shares one baseline.
         ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 24.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
             ui.style_mut().override_text_style = Some(egui::TextStyle::Small);
-            match &self.ws {
-                Some(ws) => {
-                    let color = match ws.kind {
-                        WorkspaceKind::Development => theme::green(),
-                        WorkspaceKind::Unconfigured => theme::amber(),
-                        WorkspaceKind::Production { .. } => theme::red(),
-                    };
-                    theme::badge(ui, ws.kind.label(), color);
-                    ui.label(RichText::new(ws.root.display().to_string()).weak());
-                }
-                None => {
-                    theme::badge(ui, "No workspace", theme::grey());
-                }
-            }
+            let workspace = self.ws.as_ref().map(|ws| {
+                let color = match ws.kind {
+                    WorkspaceKind::Development => theme::green(),
+                    WorkspaceKind::Unconfigured => theme::amber(),
+                    WorkspaceKind::Production { .. } => theme::red(),
+                };
+                (ws.kind.label().to_string(), color, ws.root.display().to_string())
+            });
+            let (label, color, path) = workspace.unwrap_or_else(|| ("No workspace".into(), theme::grey(), "Open…".into()));
+            theme::badge(ui, label, color);
+            // The folder's own actions live behind its path, so no page needs a workspace card.
+            egui::containers::menu::MenuButton::from_button(egui::Button::new(RichText::new(path).weak()).frame_when_inactive(false))
+                .ui(ui, |ui| views::home::workspace_menu(self, ui))
+                .0
+                .on_hover_text("Open another folder, reload, or show this one in Explorer");
             views::branches::chip(self, ui);
+            self.open_recipe_chip(ui);
             ui.separator();
             let running = self.running_jobs();
             let console_label = if running > 0 { format!("{}  Console ({running} running)", theme::icon::CONSOLE) } else { format!("{}  Console", theme::icon::CONSOLE) };

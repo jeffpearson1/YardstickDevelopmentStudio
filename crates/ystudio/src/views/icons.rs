@@ -404,7 +404,6 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     } else {
         ui.horizontal_wrapped(|ui| {
             theme::page_title(ui, "Icons");
-            ui.label(RichText::new("find, clean up and share recipe icons: installer resources · Wikidata · Chocolatey · vendor site · image search").weak());
         });
         egui::Panel::left("icons-missing").resizable(true).default_size(260.0).frame(theme::pane_frame()).show(ui, |ui| missing_panel(app, ui));
     }
@@ -605,7 +604,10 @@ fn query_form(app: &mut StudioApp, ui: &mut Ui) {
                 st.stop();
                 st.status = "Cancelled.".into();
             }
-        } else if theme::primary(ui, can, RichText::new("\u{E721}  Search")).clicked() {
+        } else if theme::primary(ui, can, RichText::new("\u{E721}  Search"))
+            .on_hover_text("Searches installer resources, Wikidata, Chocolatey, the vendor site and image search")
+            .clicked()
+        {
             st.start(waker);
         }
         ui.checkbox(&mut st.offline, "Installers only (offline)");

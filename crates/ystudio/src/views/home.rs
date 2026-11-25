@@ -55,9 +55,12 @@ const GROUP_GAP: f32 = 12.0;
 pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         theme::page_title(ui, "Yardstick Development Studio");
-        ui.label(RichText::new("Design, test and agentically author Yardstick recipes - without ever touching production.").weak());
-        ui.add_space(20.0);
+        ui.add_space(16.0);
         super::tools::banner(app, ui);
+        // Only what blocks work here; the workspace itself is in the status bar.
+        if workspace_notices(app, ui) {
+            ui.add_space(theme::CARD_GAP);
+        }
         if plugin_activity_card(app, ui) {
             ui.add_space(theme::CARD_GAP);
         }
@@ -65,8 +68,10 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             launcher(app, ui);
             ui.add_space(theme::CARD_GAP);
         }
-        workspace_card(app, ui);
-        ui.add_space(theme::CARD_GAP);
+        if app.ws.is_none() {
+            no_workspace(app, ui);
+            ui.add_space(theme::CARD_GAP);
+        }
         if app.writable() {
             egui::CollapsingHeader::new("Create another development workspace").id_salt("home-create").show(ui, |ui| {
                 theme::card(ui, |ui| {
@@ -185,12 +190,10 @@ fn recent_requests(app: &mut StudioApp) -> &[Recent] {
     &app.home.recent.as_ref().unwrap().1
 }
 
-const ACTIONS: [(&str, &str, &str); 5] = [
-    (theme::icon::INBOX, "Continue", "Pick up a request where you left off."),
-    (theme::icon::UPLOAD, "Import requests", "A ticket export, spreadsheet, email or pasted list. The Studio finds the software in it and matches existing recipes."),
-    (theme::icon::ROBOT, "New recipe", "Name the app: the agent researches, writes, tests and repairs it. Or start from a template yourself."),
-    (theme::icon::EDIT, "Edit a recipe", ""),
-    (theme::icon::LIBRARY, "Update several recipes", "Re-test, repair or bring a set of recipes up to date together - for example after a vendor changes its downloads."),
+const ACTIONS: [(&str, &str, &str); 3] = [
+    (theme::icon::INBOX, "Continue", ""),
+    (theme::icon::UPLOAD, "Import requests", "A ticket export, spreadsheet, email or pasted list."),
+    (theme::icon::ROBOT, "New recipe", "The agent researches, writes, tests and repairs it."),
 ];
 
 fn action_title(ui: &mut Ui, i: usize) {
@@ -259,30 +262,10 @@ fn launcher(app: &mut StudioApp, ui: &mut Ui) {
             }
         },
     );
+    // Opening one recipe needs no card: a search field under the actions. The
+    // Library (and its Update several…) is a click away in the sidebar.
     ui.add_space(theme::CARD_GAP);
-    theme::card_row(
-        ui,
-        app,
-        "home-actions-2",
-        2,
-        |app, i, ui| {
-            action_title(ui, i + 3);
-            if i == 0 {
-                edit_body(app, ui);
-            }
-        },
-        |app, i, ui| {
-            ui.add_space(GROUP_GAP - 4.0);
-            if i == 0 {
-                if ui.button("Browse all recipes").clicked() {
-                    app.view = View::Recipes;
-                }
-            } else if ui.add_enabled(app.writable(), egui::Button::new("Choose recipes…")).clicked() {
-                app.library.selecting = true;
-                app.view = View::Recipes;
-            }
-        },
-    );
+    edit_body(app, ui);
 }
 
 fn continue_body(app: &mut StudioApp, ui: &mut Ui) {
@@ -313,7 +296,7 @@ fn continue_body(app: &mut StudioApp, ui: &mut Ui) {
 
 fn edit_body(app: &mut StudioApp, ui: &mut Ui) {
     ui.add_space(4.0);
-    let resp = ui.add(egui::TextEdit::singleline(&mut app.home.edit_filter).hint_text("Find a recipe by id or name…").desired_width(f32::INFINITY));
+    let resp = ui.add(egui::TextEdit::singleline(&mut app.home.edit_filter).hint_text("\u{E721}  Open a recipe by id or name…").desired_width(f32::INFINITY));
     let needle = app.home.edit_filter.trim().to_lowercase();
     if needle.is_empty() {
         return;
@@ -348,100 +331,135 @@ fn edit_body(app: &mut StudioApp, ui: &mut Ui) {
     }
 }
 
-fn workspace_card(app: &mut StudioApp, ui: &mut Ui) {
+/// What stops work in this workspace (production, not set up, no agent skill),
+/// as info bars. Returns whether anything was shown.
+fn workspace_notices(app: &mut StudioApp, ui: &mut Ui) -> bool {
+    let Some(ws) = &app.ws else { return false };
+    let mut shown = false;
+    let mut setup = false;
+    match &ws.kind {
+        WorkspaceKind::Production { .. } => {
+            super::production_banner(app, ui);
+            shown = true;
+        }
+        WorkspaceKind::Unconfigured => {
+            theme::banner(ui, theme::amber(), |ui| {
+                ui.label(RichText::new("Not set up for testing yet").semibold().color(theme::amber()));
+                ui.label(
+                    "This clone has no Local\\preferences.yaml yet. Setup marks it development-only (no Intune \
+                     connection) and installs what the recipe harness needs.",
+                );
+                if ui.button("\u{E768}  Set up this clone…").clicked() {
+                    setup = true;
+                }
+            });
+            shown = true;
+        }
+        WorkspaceKind::Development => {}
+    }
+    if !app.ws_cache.has_skill {
+        if shown {
+            ui.add_space(GROUP_GAP - 6.0);
+        }
+        theme::banner(ui, theme::amber(), |ui| {
+            ui.label("This folder has no .claude\\skills\\yardstick-recipes skill - pull the latest Yardstick to use the agent.");
+        });
+        shown = true;
+    }
+    if setup {
+        super::setup::open(app, super::setup::Step::Yardstick);
+    }
+    shown
+}
+
+/// With no workspace open, Home leads with opening one.
+fn no_workspace(app: &mut StudioApp, ui: &mut Ui) {
+    let mut open = None;
     theme::card(ui, |ui| {
-        theme::section_heading(ui, "Workspace");
-        let mut open = None;
-        let mut setup = false;
-        match &app.ws {
-            Some(ws) => {
-                ui.horizontal(|ui| {
-                    let color = match ws.kind {
-                        WorkspaceKind::Development => theme::green(),
-                        WorkspaceKind::Unconfigured => theme::amber(),
-                        WorkspaceKind::Production { .. } => theme::red(),
-                    };
-                    theme::badge(ui, ws.kind.label(), color);
-                    ui.label(RichText::new(ws.root.display().to_string()).monospace());
-                });
-                let dev = app.recipes.iter().filter(|r| r.location == ystudio_core::workspace::RecipeLocation::Development).count();
-                ui.label(RichText::new(format!("{} recipes ({dev} in development), {} icons.", app.recipes.len(), app.ws_cache.icons.len())).weak());
-                match &ws.kind {
-                    WorkspaceKind::Production { .. } => {
-                        ui.add_space(GROUP_GAP - 6.0);
-                        super::production_banner(app, ui);
-                    }
-                    WorkspaceKind::Unconfigured => {
-                        ui.add_space(GROUP_GAP - 6.0);
-                        theme::banner(ui, theme::amber(), |ui| {
-                            ui.label(RichText::new("Not set up for testing yet").semibold().color(theme::amber()));
-                            ui.label(
-                                "This clone has no Local\\preferences.yaml yet. Setup marks it development-only (no Intune \
-                                 connection) and installs what the recipe harness needs.",
-                            );
-                            if ui.button("\u{E768}  Set up this clone…").clicked() {
-                                setup = true;
-                            }
-                        });
-                    }
-                    WorkspaceKind::Development => {}
-                }
-                if !app.ws_cache.has_skill {
-                    ui.add_space(GROUP_GAP - 6.0);
-                    theme::banner(ui, theme::amber(), |ui| {
-                        ui.label("This folder has no .claude\\skills\\yardstick-recipes skill - pull the latest Yardstick to use the agent.");
-                    });
-                }
-            }
-            None => {
-                if let Some(e) = &app.ws_error {
-                    ui.colored_label(theme::red(), e);
-                }
-                ui.label(RichText::new("Open a Yardstick folder, or create a development clone below.").weak());
-            }
+        theme::section_heading(ui, "Open a Yardstick folder");
+        if let Some(e) = &app.ws_error {
+            ui.colored_label(theme::red(), e);
         }
-        ui.add_space(GROUP_GAP - 6.0);
-        if app.ws.is_some() {
-            super::git_bar(app, ui);
-        }
+        ui.label(RichText::new("Open an existing clone, or create a development clone below.").weak());
+        ui.add_space(GROUP_GAP - 4.0);
         ui.horizontal_wrapped(|ui| {
-            if ui.button("\u{E838}  Open folder…").clicked()
+            if theme::primary(ui, true, "\u{E838}  Open folder…").clicked()
                 && let Some(p) = rfd::FileDialog::new().set_title("Open a Yardstick folder").pick_folder()
             {
                 open = Some(p);
             }
-            if let Some(ws) = &app.ws {
-                if ui.button("\u{E72C}  Reload").clicked() {
-                    open = Some(ws.root.clone());
-                }
-                if ui.button("\u{E8A7}  Show in Explorer").clicked() {
-                    super::open_in_explorer(&ws.root);
-                }
-                if !ws.is_writable() && ui.button("Trust as development…").on_hover_text("Only for full installs you are certain are scratch machines.").clicked() {
-                    app.settings_ui.add_trusted(&ws.root);
-                    app.view = View::Settings;
+            for p in app.settings.recent_workspaces.iter() {
+                if ui.link(p.display().to_string()).clicked() {
+                    open = Some(p.clone());
                 }
             }
         });
-        let current = app.ws.as_ref().map(|w| w.root.clone());
-        let recent: Vec<PathBuf> = app.settings.recent_workspaces.iter().filter(|p| current.as_ref() != Some(*p)).cloned().collect();
-        if !recent.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Recent").weak());
-                for p in recent {
-                    if ui.link(p.display().to_string()).clicked() {
-                        open = Some(p);
-                    }
-                }
-            });
-        }
-        if setup {
-            super::setup::open(app, super::setup::Step::Yardstick);
-        }
-        if let Some(p) = open {
-            app.open_workspace(&p);
-        }
     });
+    if let Some(p) = open {
+        app.open_workspace(&p);
+    }
+}
+
+/// The status bar's workspace menu: everything about the folder itself, so no
+/// page has to carry a workspace card.
+pub fn workspace_menu(app: &mut StudioApp, ui: &mut Ui) {
+    let mut open = None;
+    let mut sync = false;
+    if ui.button("\u{E838}  Open folder…").clicked() {
+        ui.close();
+        if let Some(p) = rfd::FileDialog::new().set_title("Open a Yardstick folder").pick_folder() {
+            open = Some(p);
+        }
+    }
+    let current = app.ws.as_ref().map(|w| w.root.clone());
+    let recent: Vec<PathBuf> = app.settings.recent_workspaces.iter().filter(|p| current.as_ref() != Some(*p)).cloned().collect();
+    if !recent.is_empty() {
+        ui.menu_button("\u{E81C}  Recent", |ui| {
+            for p in recent {
+                if ui.button(p.display().to_string()).clicked() {
+                    open = Some(p);
+                    ui.close();
+                }
+            }
+        });
+    }
+    if let Some(ws) = &app.ws {
+        ui.separator();
+        let dev = app.recipes.iter().filter(|r| r.location == ystudio_core::workspace::RecipeLocation::Development).count();
+        ui.label(RichText::new(format!("{} recipes ({dev} in development) · {} icons", app.recipes.len(), app.ws_cache.icons.len())).small().weak());
+        if ui.button("\u{E72C}  Reload").clicked() {
+            open = Some(ws.root.clone());
+            ui.close();
+        }
+        if ui.button("\u{E8A7}  Show in Explorer").clicked() {
+            super::open_in_explorer(&ws.root);
+            ui.close();
+        }
+        let syncing = app.jobs.iter().any(|j| matches!(j.kind, JobKind::SyncShared) && j.proc.is_running());
+        if ws.is_writable()
+            && ws.sync_shared_content
+            && ui
+                .add_enabled(!syncing, egui::Button::new("\u{E895}  Sync icons & overrides"))
+                .on_hover_text("Yardstick's shared-content sync (SharedIcons / SharedRecipeOverrides in preferences.yaml)")
+                .clicked()
+        {
+            sync = true;
+            ui.close();
+        }
+        if !ws.is_writable()
+            && ui.button("Trust as development…").on_hover_text("Only for full installs you are certain are scratch machines.").clicked()
+        {
+            app.settings_ui.add_trusted(&ws.root);
+            app.view = View::Settings;
+            ui.close();
+        }
+    }
+    if sync {
+        app.start_shared_sync(true);
+    }
+    if let Some(p) = open {
+        app.open_workspace(&p);
+    }
 }
 
 pub(crate) fn create_body(app: &mut StudioApp, ui: &mut Ui) {

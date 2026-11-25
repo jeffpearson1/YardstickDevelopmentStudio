@@ -72,7 +72,7 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
             });
         });
     }
-    super::git_bar(app, ui);
+    ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add(egui::TextEdit::singleline(&mut app.library.filter).hint_text("Filter by id…").desired_width(240.0));
         ui.selectable_value(&mut app.library.location, LocationFilter::All, "All");
@@ -133,18 +133,24 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                 // Both paths come from the same directory listing, so a plain comparison suffices.
                 let is_open = open_path == Some(r.path.as_path());
                 let in_builder = super::batch::contains_recipe(app, &r.id);
-                if ui.selectable_label(is_open || in_builder, RichText::new(&r.id).monospace().strong()).clicked() {
+                let hover = if selecting { "Select" } else { "Open in Recipe Builder" };
+                if ui.selectable_label(is_open || in_builder, RichText::new(&r.id).monospace().strong()).on_hover_text(hover).clicked() {
                     if selecting {
                         toggle = Some((r.id.clone(), !app.library.picked.contains(&r.id)));
                     } else {
                         add_to_builder = Some(r.id.clone());
                     }
                 }
+                // Development is where work happens, so only shipped recipes are marked.
                 match &r.location {
-                    RecipeLocation::Development => theme::badge(ui, "development", theme::amber()),
-                    RecipeLocation::Shipped(None) => theme::badge(ui, "shipped", theme::grey()),
-                    RecipeLocation::Shipped(Some(sub)) => theme::badge(ui, format!("shipped/{sub}"), theme::grey()),
-                };
+                    RecipeLocation::Development => {}
+                    RecipeLocation::Shipped(None) => {
+                        theme::badge(ui, "shipped", theme::grey());
+                    }
+                    RecipeLocation::Shipped(Some(sub)) => {
+                        theme::badge(ui, format!("shipped/{sub}"), theme::grey());
+                    }
+                }
                 for g in &r.groups {
                     theme::badge(ui, g, theme::blue());
                 }
@@ -163,8 +169,6 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
                         } else if ui.small_button("Add").clicked() {
                             add_to_builder = Some(r.id.clone());
                         }
-                    } else if ui.small_button("Open in Builder").clicked() {
-                        add_to_builder = Some(r.id.clone());
                     }
                 });
             });

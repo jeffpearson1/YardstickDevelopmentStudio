@@ -108,7 +108,6 @@ pub(super) fn form_row<R>(ui: &mut Ui, label: &str, hover: Option<&str>, field: 
 pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         theme::page_title(ui, "Settings");
-        ui.label(RichText::new(format!("Changes are saved as you make them, in {}.", Settings::default_path().display())).weak());
         ui.add_space(16.0);
         let plugin_focused = app.plugins_ui.open_settings.is_some();
         if plugin_focused {
@@ -139,6 +138,8 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
         });
         ui.add_space(theme::CARD_GAP);
         troubleshooting_card(app, ui);
+        ui.add_space(12.0);
+        ui.label(RichText::new(format!("Changes are saved as you make them, in {}.", Settings::default_path().display())).small().weak());
         ui.add_space(8.0);
     });
 }

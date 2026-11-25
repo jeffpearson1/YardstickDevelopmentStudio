@@ -23,6 +23,7 @@ enum HistoryView {
     #[default]
     RecipeTests,
     PluginWork,
+    Credits,
 }
 
 #[derive(Default, PartialEq, Clone, Copy)]
@@ -82,11 +83,13 @@ pub fn show(app: &mut StudioApp, ui: &mut Ui) {
     ui.horizontal_wrapped(|ui| {
         ui.selectable_value(&mut app.runs_ui.view, HistoryView::RecipeTests, "Recipe tests");
         ui.selectable_value(&mut app.runs_ui.view, HistoryView::PluginWork, "Plugin work");
+        ui.selectable_value(&mut app.runs_ui.view, HistoryView::Credits, "Agent credits");
     });
     ui.add_space(8.0);
     match app.runs_ui.view {
         HistoryView::RecipeTests => recipe_history(app, ui),
         HistoryView::PluginWork => plugin_history(app, ui),
+        HistoryView::Credits => super::usage::card(app, ui),
     }
 }
 
@@ -196,7 +199,6 @@ fn recipe_history(app: &mut StudioApp, ui: &mut Ui) {
             super::open_in_explorer(&ws.layout.harness_artifacts);
         }
     });
-    egui::CollapsingHeader::new("Agent credits by model").id_salt("runs-usage").default_open(true).show(ui, |ui| super::usage::card(app, ui));
     ui.separator();
 
     egui::Panel::left("runs-list").resizable(true).default_size(330.0).frame(theme::pane_frame()).show(ui, |ui| {
